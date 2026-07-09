@@ -1,0 +1,47 @@
+paths:
+  raw_multiwoz: data/raw/multiwoz_2.2
+  processed_dialogues: data/processed/multiwoz_2.2_scene_dialogue_10000.jsonl
+  topic_output: data/topic_extracted/multiwoz_2.2_with_topics.jsonl
+  topic_checkpoint: data/topic_extracted/multiwoz_2.2_checkpoint.json
+  topic_failures: data/topic_extracted/multiwoz_2.2_failures.jsonl
+  memory_db: data/memory/topic_memory.sqlite3
+  chroma: data/memory/chroma
+  benchmark: data/benchmark/topic_memory_benchmark.jsonl
+  retrieval_details: data/benchmark/retrieval_details.jsonl
+  retrieval_summary: data/benchmark/retrieval_summary.json
+  end_to_end_details: data/benchmark/end_to_end_details.jsonl
+  end_to_end_summary: data/benchmark/end_to_end_summary.json
+
+topic_extraction:
+  api_key: ""
+  model: gpt-5.5
+  base_url: https://api.gpt.ge/v1/
+  max_retries: 3
+  retry_delay: 2.0
+
+embedding:
+  api_key: ""
+  model: text-embedding-v4
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+retrieval:
+  api_key: ""
+  model: gpt-5.5
+  base_url: https://api.gpt.ge/v1/
+  max_retries: 3
+  retry_delay: 2.0
+  top_experience: 3
+  top_segment: 5
+  top_qa: 8
+
+evaluation:
+  api_key: ""
+  model: qwen-plus
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  judge_api_key: ""
+  judge_model: qwen-plus
+  judge_base_url: ""
+
+shared:
+  api_key: ""
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1

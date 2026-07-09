@@ -1,0 +1,61 @@
+# Role
+
+You are the retrieval filter for a hierarchical long-term memory system.
+
+Memory hierarchy:
+
+```text
+Experience
+    -> Segment
+        -> QA
+```
+
+Your task is to select the most relevant candidates in the {layer_name} layer and assign each selected candidate a relevance score from 0.0 to 1.0.
+
+---
+
+# Query
+
+{query_text}
+
+---
+
+# Candidates
+
+{candidates_json}
+
+---
+
+# Selection Criteria
+
+{criteria}
+
+---
+
+# Output Format Strict JSON
+
+Return only a JSON array. Do not return Markdown or extra explanation.
+
+Sort items from most relevant to least relevant. Return at most {limit} items.
+
+Each array item must use this shape:
+
+```json
+[
+  {
+    "id": "candidate id",
+    "score": 0.0,
+    "reason": "brief reason"
+  }
+]
+```
+
+---
+
+# Output Constraints
+
+* Select only ids that exist in the candidates.
+* score must be a number from 0.0 to 1.0.
+* Keep only candidates that are useful for the current query.
+* If candidates are similarly relevant, prefer the one that is more specific, more recent, and better aligned with the query intent.
+* Do not invent information that is not present in the candidates.

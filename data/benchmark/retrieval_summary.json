@@ -1,0 +1,62 @@
+{
+  "overall": {
+    "cases": 100,
+    "experience_hit": 1.0,
+    "segment_hit": 1.0,
+    "qa_hit": 0.97,
+    "qa_mrr": 0.6618333333333334,
+    "experience_cache_hit": 0.73,
+    "segment_cache_hit": 0.27,
+    "retrieved_tokens": 343.27,
+    "latency_p50_ms": 18260.086199999932,
+    "latency_p95_ms": 35706.593599999906
+  },
+  "cold_start": {
+    "cases": 15,
+    "experience_hit": 1.0,
+    "segment_hit": 1.0,
+    "qa_hit": 0.8666666666666667,
+    "qa_mrr": 0.8666666666666667,
+    "experience_cache_hit": 0.06666666666666667,
+    "segment_cache_hit": 0.06666666666666667,
+    "retrieved_tokens": 334.8,
+    "latency_p50_ms": 28821.22060000256,
+    "latency_p95_ms": 40821.785099993576
+  },
+  "same_experience_new_intent": {
+    "cases": 46,
+    "experience_hit": 1.0,
+    "segment_hit": 1.0,
+    "qa_hit": 1.0,
+    "qa_mrr": 0.6166666666666667,
+    "experience_cache_hit": 1.0,
+    "segment_cache_hit": 0.0,
+    "retrieved_tokens": 336.1304347826087,
+    "latency_p50_ms": 21425.6144999963,
+    "latency_p95_ms": 32613.765900001454
+  },
+  "same_experience_same_intent": {
+    "cases": 26,
+    "experience_hit": 1.0,
+    "segment_hit": 1.0,
+    "qa_hit": 0.9615384615384616,
+    "qa_mrr": 0.4544871794871795,
+    "experience_cache_hit": 1.0,
+    "segment_cache_hit": 1.0,
+    "retrieved_tokens": 411.2692307692308,
+    "latency_p50_ms": 13355.034300002444,
+    "latency_p95_ms": 23476.1084999991
+  },
+  "topic_switch": {
+    "cases": 13,
+    "experience_hit": 1.0,
+    "segment_hit": 1.0,
+    "qa_hit": 1.0,
+    "qa_mrr": 1.0,
+    "experience_cache_hit": 0.0,
+    "segment_cache_hit": 0.0,
+    "retrieved_tokens": 242.30769230769232,
+    "latency_p50_ms": 18386.9343999977,
+    "latency_p95_ms": 72216.22330000537
+  }
+}

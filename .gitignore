@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.idea/
+__MACOSX/
+
+.env
+.env.*
+*.log
+
+# Local generated memory/vector stores
+data/memory/
+
+# Generated checkpoints and temporary outputs
+data/topic_extracted/*checkpoint*.json
+data/topic_extracted/*failures*.jsonl
+data/topic_extracted/permission_probe.tmp
+results/
+
+# Local test cache files
+tests/__pycache__/
+scripts/__pycache__/
+configs/__pycache__/
+memory/__pycache__/
