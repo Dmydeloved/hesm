@@ -12,7 +12,7 @@ from .embedder import (
     build_segment_embedding_text,
 )
 from .storage import MemoryStorage
-from .summarizer import TemplateSummarizer
+from .summarizer import SummarizerProtocol, TemplateSummarizer
 from .vector_store import ChromaVectorStore
 
 
@@ -28,7 +28,7 @@ class MemoryManager:
         storage: MemoryStorage,
         vector_store: ChromaVectorStore,
         embedder: TextEmbedder,
-        summarizer: TemplateSummarizer | None = None,
+        summarizer: SummarizerProtocol | None = None,
         segment_summary_qa_threshold: int = 5,
         experience_summary_segment_threshold: int = 5,
     ) -> None:

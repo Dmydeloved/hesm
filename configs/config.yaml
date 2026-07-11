@@ -34,6 +34,13 @@ retrieval:
   top_segment: 5
   top_qa: 8
 
+summarization:
+  api_key: ""
+  model: gpt-5.5
+  base_url: https://api.gpt.ge/v1/
+  max_retries: 3
+  retry_delay: 2.0
+
 evaluation:
   api_key: ""
   model: qwen-plus
