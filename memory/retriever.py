@@ -296,6 +296,7 @@ class HybridRetriever:
 
         query_entities = [str(item) for item in entities or [] if str(item).strip()]
         query_text = build_query_text(topic, core_entity, intent, query_entities)
+        query_embedding = self._embed_query(query_text)
         retrieval_cache = self._load_retrieval_cache(state_key) if use_cache else {}
         experience_cache_hit = False
         segment_cache_hit = False
@@ -310,7 +311,7 @@ class HybridRetriever:
             experience_count = len(experiences)
         else:
             experience_vector_ids = self._vector_candidate_ids(
-                "experience", query_text, max(20, top_experience * 8)
+                "experience", query_embedding, max(20, top_experience * 8)
             )
             experiences, experience_count = self._recall_experiences(
                 topic, core_entity, intent, query_text, experience_vector_ids, top_experience
@@ -326,13 +327,15 @@ class HybridRetriever:
             segment_count = len(segments)
         else:
             segment_vector_ids = self._vector_candidate_ids(
-                "segment", query_text, max(20, top_segment * 8)
+                "segment", query_embedding, max(20, top_segment * 8)
             )
             segments, segment_count = self._recall_segments(
                 experiences, intent, query_text, segment_vector_ids, top_segment
             )
 
-        qa_vector_ids = self._vector_candidate_ids("qa", query_text, max(20, top_qa * 8))
+        qa_vector_ids = self._vector_candidate_ids(
+            "qa", query_embedding, max(20, top_qa * 8)
+        )
         qas, qa_count = self._recall_qas(
             segments, query_text, qa_vector_ids, top_qa
         )
@@ -491,14 +494,28 @@ class HybridRetriever:
             self.storage.rollback()
             logger.exception("Failed to update retrieval cache")
 
-    def _vector_candidate_ids(
-        self, memory_type: str, query_text: str, top_k: int
-    ) -> set[str]:
+    def _embed_query(self, query_text: str) -> list[float] | None:
         if self.vector_store is None or self.embedder is None:
+            return None
+        try:
+            return self.embedder.embed(query_text)
+        except Exception:
+            logger.exception(
+                "Query embedding failed, continuing with structured candidates"
+            )
+            return None
+
+    def _vector_candidate_ids(
+        self,
+        memory_type: str,
+        query_embedding: list[float] | None,
+        top_k: int,
+    ) -> set[str]:
+        if self.vector_store is None or query_embedding is None:
             return set()
         try:
             items = self.vector_store.query(
-                query_embedding=self.embedder.embed(query_text),
+                query_embedding=query_embedding,
                 memory_type=memory_type,
                 top_k=top_k,
             )
