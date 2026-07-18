@@ -2,14 +2,18 @@
 LLM-as-a-Judge evaluation.
 
 Uses the topic_extraction LLM to score each predicted answer against the
-ground truth on a 0 / 1 / 2 scale:
-  0 = Wrong          (completely incorrect or irrelevant)
-  1 = Partially Correct (some correct info but incomplete or with errors)
-  2 = Correct        (accurate and complete)
+ground truth on a binary 0 / 1 scale:
+  0 = WRONG   (factually incorrect, missing key info, extra unsupported facts,
+               wrong temporal/entity info, or unjustified inferences)
+  1 = CORRECT (factually accurate, all essential facts present, paraphrases ok)
+
+The LLM returns a JSON object:
+  {"reason": "...", "label": "CORRECT" | "WRONG"}
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -21,24 +25,43 @@ import openai
 logger = logging.getLogger(__name__)
 
 _JUDGE_PROMPT = """\
-You are an expert evaluator assessing the quality of an AI assistant's answer.
+You are an impartial evaluator for long-term memory question answering.
+
+You will receive:
+
+1. Question
+2. Ground Truth
+3. Predicted Answer
+
+Evaluation Rules:
+
+- Compare the predicted answer with the ground truth based on factual correctness.
+- Ignore wording differences and paraphrases.
+- The predicted answer must contain all essential facts required to answer the question.
+- Missing key information should be judged as WRONG.
+- Additional unsupported facts should be judged as WRONG.
+- Temporal information and named entities must be correct.
+- Do not infer facts that are not explicitly stated.
 
 Question: {question}
-Ground Truth Answer: {ground_truth}
+Ground Truth: {ground_truth}
 Predicted Answer: {prediction}
 
-Score the predicted answer on the following scale:
-0 = Wrong: The answer is completely incorrect, irrelevant, or says "Unknown" when the answer is in the ground truth.
-1 = Partially Correct: The answer contains some correct information but is incomplete, imprecise, or contains errors.
-2 = Correct: The answer is accurate and sufficiently complete relative to the ground truth.
+Output JSON only:
 
-Respond with ONLY the integer score (0, 1, or 2). Do not include any explanation."""
+{{
+  "reason": "...",
+  "label": "CORRECT" | "WRONG"
+}}"""
 
 
 class LLMJudge:
     """
     Calls the LLM to score (question, ground_truth, prediction) triples.
     Reads API settings from the topic_extraction section of configs/config.yaml.
+
+    Returns 1 (CORRECT) or 0 (WRONG). Returns -1 on total failure (excluded
+    from averages by the aggregator).
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
@@ -59,8 +82,8 @@ class LLMJudge:
         """
         Score a single (question, ground_truth, prediction) triple.
 
-        Returns 0, 1, or 2. Returns -1 on total failure (excluded from averages
-        by the aggregator).
+        Returns 1 (CORRECT) or 0 (WRONG).
+        Returns -1 on total failure (excluded from averages by the aggregator).
         """
         prompt = _JUDGE_PROMPT.format(
             question=question,
@@ -73,7 +96,7 @@ class LLMJudge:
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
-                    max_tokens=8,
+                    max_tokens=200,
                 )
                 raw = resp.choices[0].message.content.strip()
                 score = self._parse_score(raw)
@@ -90,8 +113,32 @@ class LLMJudge:
 
     @staticmethod
     def _parse_score(text: str) -> int | None:
-        """Extract 0/1/2 from LLM response; returns None if not parseable."""
-        m = re.search(r"\b([012])\b", text)
-        if m:
-            return int(m.group(1))
+        """
+        Parse CORRECT/WRONG label from LLM JSON response.
+
+        Expected format:  {"reason": "...", "label": "CORRECT"}
+        Fallback:         plain text containing CORRECT or WRONG keyword.
+
+        Returns 1 for CORRECT, 0 for WRONG, None if unparseable.
+        """
+        # Primary: parse as JSON and extract "label"
+        try:
+            # Strip markdown code fence if present
+            cleaned = re.sub(r"^```[a-z]*\n?", "", text.strip(), flags=re.IGNORECASE)
+            cleaned = re.sub(r"\n?```$", "", cleaned.strip())
+            obj = json.loads(cleaned)
+            label = str(obj.get("label", "")).strip().upper()
+            if label == "CORRECT":
+                return 1
+            if label == "WRONG":
+                return 0
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+
+        # Fallback: keyword scan in raw text
+        upper = text.upper()
+        if "CORRECT" in upper:
+            return 1
+        if "WRONG" in upper:
+            return 0
         return None

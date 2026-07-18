@@ -607,6 +607,9 @@ class HybridRetriever:
             "confidence": clamp01(float(item.get("confidence") or 0.0)),
             "vector_recalled": item["qa_id"] in vector_candidate_ids,
             "reasoning": item.get("reasoning", ""),
+            # tools is deserialized by _row_to_dict (tools_json → tools);
+            # carried through so callers can extract dia_ids for retrieval metrics.
+            "tools": item.get("tools") or [],
         }
 
     def _select_candidates_with_llm(

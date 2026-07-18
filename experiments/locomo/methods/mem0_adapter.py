@@ -99,8 +99,8 @@ class Mem0Memory(MemorySystem):
         try:
             results = self._memory.search(
                 query=question,
-                user_id=self._user_id,
-                limit=top_k,
+                filters={"user_id": self._user_id},
+                top_k=top_k,
             )
         except Exception as exc:
             logger.warning("[Mem0] search failed: %s", exc)

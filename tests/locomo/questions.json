@@ -1,0 +1,262 @@
+{
+  "conv_id": "conv-26",
+  "speaker_a": "Caroline",
+  "speaker_b": "Melanie",
+  "max_per_category": 5,
+  "questions": [
+    {
+      "conv_id": "conv-26",
+      "question": "What did Caroline research?",
+      "answer": "Adoption agencies",
+      "evidence": [
+        "D2:8"
+      ],
+      "category": 1,
+      "q_index": 3
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "What is Caroline's identity?",
+      "answer": "Transgender woman",
+      "evidence": [
+        "D1:5"
+      ],
+      "category": 1,
+      "q_index": 4
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "What is Caroline's relationship status?",
+      "answer": "Single",
+      "evidence": [
+        "D3:13",
+        "D2:14"
+      ],
+      "category": 1,
+      "q_index": 7
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "Where did Caroline move from 4 years ago?",
+      "answer": "Sweden",
+      "evidence": [
+        "D3:13",
+        "D4:3"
+      ],
+      "category": 1,
+      "q_index": 11
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "What career path has Caroline decided to persue?",
+      "answer": "counseling or mental health for Transgender people",
+      "evidence": [
+        "D4:13",
+        "D1:11"
+      ],
+      "category": 1,
+      "q_index": 13
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "When did Caroline go to the LGBTQ support group?",
+      "answer": "7 May 2023",
+      "evidence": [
+        "D1:3"
+      ],
+      "category": 2,
+      "q_index": 0
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "When did Melanie paint a sunrise?",
+      "answer": "2022",
+      "evidence": [
+        "D1:12"
+      ],
+      "category": 2,
+      "q_index": 1
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "When did Melanie run a charity race?",
+      "answer": "The sunday before 25 May 2023",
+      "evidence": [
+        "D2:1"
+      ],
+      "category": 2,
+      "q_index": 5
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "When is Melanie planning on going camping?",
+      "answer": "June 2023",
+      "evidence": [
+        "D2:7"
+      ],
+      "category": 2,
+      "q_index": 6
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "When did Caroline give a speech at a school?",
+      "answer": "The week before 9 June 2023",
+      "evidence": [
+        "D3:1"
+      ],
+      "category": 2,
+      "q_index": 8
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "What fields would Caroline be likely to pursue in her educaton?",
+      "answer": "Psychology, counseling certification",
+      "evidence": [
+        "D1:9",
+        "D1:11"
+      ],
+      "category": 3,
+      "q_index": 2
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "Would Caroline still want to pursue counseling as a career if she hadn't received support growing up?",
+      "answer": "Likely no",
+      "evidence": [
+        "D4:15",
+        "D3:5"
+      ],
+      "category": 3,
+      "q_index": 14
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "Would Caroline likely have Dr. Seuss books on her bookshelf?",
+      "answer": "Yes, since she collects classic children's books",
+      "evidence": [
+        "D6:9"
+      ],
+      "category": 3,
+      "q_index": 22
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "Would Caroline pursue writing as a career option?",
+      "answer": "LIkely no; though she likes reading, she wants to be a counselor",
+      "evidence": [
+        "D7:5",
+        "D7:9"
+      ],
+      "category": 3,
+      "q_index": 27
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "Would Melanie be considered a member of the LGBTQ community?",
+      "answer": "Likely no, she does not refer to herself as part of it",
+      "evidence": [],
+      "category": 3,
+      "q_index": 30
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "What did the charity race raise awareness for?",
+      "answer": "mental health",
+      "evidence": [
+        "D2:2"
+      ],
+      "category": 4,
+      "q_index": 82
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "What did Melanie realize after the charity race?",
+      "answer": "self-care is important",
+      "evidence": [
+        "D2:3"
+      ],
+      "category": 4,
+      "q_index": 83
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "How does Melanie prioritize self-care?",
+      "answer": "by carving out some me-time each day for activities like running, reading, or playing the violin",
+      "evidence": [
+        "D2:5"
+      ],
+      "category": 4,
+      "q_index": 84
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "What are Caroline's plans for the summer?",
+      "answer": "researching adoption agencies",
+      "evidence": [
+        "D2:8"
+      ],
+      "category": 4,
+      "q_index": 85
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "What type of individuals does the adoption agency Caroline is considering support?",
+      "answer": "LGBTQ+ individuals",
+      "evidence": [
+        "D2:12"
+      ],
+      "category": 4,
+      "q_index": 86
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "What did Caroline realize after her charity race?",
+      "answer": "",
+      "evidence": [
+        "D2:3"
+      ],
+      "category": 5,
+      "q_index": 152
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "What are Melanie's plans for the summer with respect to adoption?",
+      "answer": "",
+      "evidence": [
+        "D2:8"
+      ],
+      "category": 5,
+      "q_index": 153
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "What type of individuals does the adoption agency Melanie is considering support?",
+      "answer": "",
+      "evidence": [
+        "D2:12"
+      ],
+      "category": 5,
+      "q_index": 154
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "Why did Melanie choose the adoption agency?",
+      "answer": "",
+      "evidence": [
+        "D2:12"
+      ],
+      "category": 5,
+      "q_index": 155
+    },
+    {
+      "conv_id": "conv-26",
+      "question": "What is Melanie excited about in her adoption process?",
+      "answer": "",
+      "evidence": [
+        "D2:14"
+      ],
+      "category": 5,
+      "q_index": 156
+    }
+  ]
+}
