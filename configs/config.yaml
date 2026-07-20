@@ -4,8 +4,8 @@ paths:
   topic_output: data/topic_extracted/multiwoz_2.2_with_topics.jsonl
   topic_checkpoint: data/topic_extracted/multiwoz_2.2_checkpoint.json
   topic_failures: data/topic_extracted/multiwoz_2.2_failures.jsonl
-  memory_db: data/memory/topic_memory.sqlite3
-  chroma: data/memory/chroma
+  memory_db: outputs/locomo/memory/hesm_conv-26/memory.sqlite3
+  chroma: outputs/locomo/memory/hesm_conv-26/chroma
   benchmark: data/benchmark/topic_memory_benchmark.jsonl
   retrieval_details: data/benchmark/retrieval_details.jsonl
   retrieval_summary: data/benchmark/retrieval_summary.json
@@ -30,8 +30,8 @@ retrieval:
   base_url: https://api.gpt.ge/v1/
   max_retries: 3
   retry_delay: 2.0
-  top_experience: 3
-  top_segment: 5
+  top_experience: 2
+  top_segment: 3
   top_qa: 8
 
 summarization:

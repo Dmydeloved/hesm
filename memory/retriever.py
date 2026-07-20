@@ -231,18 +231,18 @@ def build_context_text(
             ]
         )
 
-    lines.append("【原始问答 QA】")
-    if not qas:
-        lines.append("未找到相关原始问答。")
-    for index, qa in enumerate(qas, 1):
-        lines.extend(
-            [
-                f"{index}. 时间: {qa['timestamp']}",
-                f"用户: {qa['user_input']}",
-                f"助手: {qa['assistant_output']}",
-                "",
-            ]
-        )
+    # lines.append("【原始问答 QA】")
+    # if not qas:
+    #     lines.append("未找到相关原始问答。")
+    # for index, qa in enumerate(qas, 1):
+    #     lines.extend(
+    #         [
+    #             f"{index}. 时间: {qa['timestamp']}",
+    #             f"用户: {qa['user_input']}",
+    #             f"助手: {qa['assistant_output']}",
+    #             "",
+    #         ]
+    #     )
     return "\n".join(lines).rstrip()
 
 class HybridRetriever:
@@ -333,11 +333,11 @@ class HybridRetriever:
                 experiences, intent, query_text, segment_vector_ids, top_segment
             )
 
-        qa_vector_ids = self._vector_candidate_ids(
-            "qa", query_embedding, max(20, top_qa * 8)
-        )
+        # qa_vector_ids = self._vector_candidate_ids(
+        #     "qa", query_embedding, max(20, top_qa * 8)
+        # )
         qas, qa_count = self._recall_qas(
-            segments, query_text, qa_vector_ids, top_qa
+            segments, query_text, set(), top_qa
         )
 
         debug = {
@@ -346,15 +346,15 @@ class HybridRetriever:
             "qa_candidates": qa_count,
             "vector_experience_candidates": len(experience_vector_ids),
             "vector_segment_candidates": len(segment_vector_ids),
-            "vector_qa_candidates": len(qa_vector_ids),
+            "vector_qa_candidates": 0,
             "experience_cache_hit": experience_cache_hit,
             "segment_cache_hit": segment_cache_hit,
         }
         logger.info(
-            "閸掑棗鐪伴崣顒€娲栫€瑰本鍨?experience=%s/%s segment=%s/%s qa=%s/%s vectors=%s/%s/%s cache=%s/%s",
+            "检索结果：experience=%s/%s segment=%s/%s qa=%s/%s vectors=%s/%s/%s cache=%s/%s",
             len(experiences), experience_count, len(segments), segment_count,
             len(qas), qa_count, len(experience_vector_ids), len(segment_vector_ids),
-            len(qa_vector_ids), experience_cache_hit, segment_cache_hit,
+            0, experience_cache_hit, segment_cache_hit,
         )
         if use_cache:
             self._store_retrieval_cache(
@@ -372,7 +372,7 @@ class HybridRetriever:
             "qas": qas,
             "context_text": build_context_text(experiences, segments, qas),
             "debug": debug,
-            "results": [{"qa": qa, "score": qa["score"]} for qa in qas],
+            # "results": [{"qa": qa, "score": qa["score"]} for qa in qas],
         }
 
     def _cache_signature(
@@ -677,7 +677,7 @@ class HybridRetriever:
         ranked = self._select_candidates_with_llm(
             "experience", query_text, prepared, "experience_id", limit
         )
-        logger.info("Experience 閸婃瑩鈧鏆熼柌?%s 閸氭垿鍣洪崐娆撯偓澶嬫殶闁?%s", len(candidates), len(vector_candidate_ids))
+        logger.info("Experience 候选个数%s  向量检索个数% 被选中的Experience如下%s 已经被选中的Experience如下%s", len(candidates), len(vector_candidate_ids), ranked)
         return ranked, len(candidates)
 
     def _recall_segments(
@@ -694,7 +694,7 @@ class HybridRetriever:
         ranked = self._select_candidates_with_llm(
             "segment", query_text, prepared, "segment_id", limit
         )
-        logger.info("Segment 閸婃瑩鈧鏆熼柌?%s 閸氭垿鍣洪崐娆撯偓澶嬫殶闁?%s", len(candidates), len(vector_candidate_ids))
+        logger.info("Segment 候选个数%s 向量检索候选个数%s 被挑选的Segment %s", len(candidates), len(vector_candidate_ids), ranked)
         return ranked, len(candidates)
 
     def _recall_qas(
@@ -706,11 +706,12 @@ class HybridRetriever:
     ) -> tuple[list[dict[str, Any]], int]:
         segment_ids = [item["segment_id"] for item in segments]
         candidates = self.storage.list_qas_by_segment_ids(segment_ids)
+        candidates.sort(key=lambda item: item["timestamp"])
         prepared = [self._prepare_qa(item, vector_candidate_ids) for item in candidates]
-        ranked = self._select_candidates_with_llm("qa", query_text, prepared, "qa_id", limit)
-        ranked.sort(key=lambda item: item["timestamp"])
-        logger.info("QA 閸婃瑩鈧鏆熼柌?%s 閸氭垿鍣洪崐娆撯偓澶嬫殶闁?%s", len(candidates), len(vector_candidate_ids))
-        return ranked, len(candidates)
+        # ranked = self._select_candidates_with_llm("qa", query_text, prepared, "qa_id", limit)
+        # ranked.sort(key=lambda item: item["timestamp"])
+        # logger.info("QA 閸婃瑩鈧鏆熼柌?%s 閸氭垿鍣洪崐娆撯偓澶嬫殶闁?%s", len(candidates), len(vector_candidate_ids))
+        return prepared, len(candidates)
 
 
 class StructuredRetriever(HybridRetriever):

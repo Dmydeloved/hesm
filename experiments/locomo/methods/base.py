@@ -108,13 +108,25 @@ _QA_PROMPT = """\
 You are a helpful assistant with access to memory notes from a long-term \
 conversation between {speaker_a} and {speaker_b}.
 
-Using ONLY the information in the memory context below, answer the question \
-concisely and accurately. If the answer is not in the context, say "Unknown".
+Answer the question using ONLY the information explicitly provided in the \
+memory context below.
+
+Requirements:
+1. Do not use any information that is not present in the memory context.
+2. If the answer cannot be directly inferred from the memory context, answer "Unknown".
+3. Do not use ambiguous references or relative expressions such as "yesterday", \
+"today", "tomorrow", "last week", "recently", "that person", "this place", \
+or similar expressions.
+4. When answering, replace any implicit references with explicit names, dates, \
+events, or descriptions from the memory context whenever possible.
+5. Keep the answer concise and factual.
 
 Memory Context:
 {context}
 
-Question: {question}
+Question:
+{question}
+
 Answer:"""
 
 

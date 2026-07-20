@@ -31,6 +31,8 @@ class MemoryManager:
         summarizer: SummarizerProtocol | None = None,
         segment_summary_qa_threshold: int = 5,
         experience_summary_segment_threshold: int = 5,
+        experience_similarity_threshold: float = 0.82,
+        min_segment_qas: int = 2,
     ) -> None:
         self.storage = storage
         self.summarizer = summarizer or TemplateSummarizer()
@@ -38,6 +40,9 @@ class MemoryManager:
         self.embedder = embedder
         self.segment_summary_qa_threshold = segment_summary_qa_threshold
         self.experience_summary_segment_threshold = experience_summary_segment_threshold
+        # Semantic routing thresholds
+        self.experience_similarity_threshold = experience_similarity_threshold
+        self.min_segment_qas = min_segment_qas
 
     def add_qa(
         self,
@@ -77,17 +82,25 @@ class MemoryManager:
 
             action = "append_segment"
 
-            # Experience 是长期聚合键。只要 topic/core_entity 变了，就先沉淀旧状态，
-            # 再去库里找目标 Experience，避免不同长期记忆串线。
-            if not self._same_experience(current_experience, topic, core_entity):
+            # ── Experience 路由 ────────────────────────────────────────────────
+            # 快速路径：当前 Experience 的 topic 与新 topic 完全一致，直接复用。
+            # 慢速路径：topic 不同时，先沉淀旧状态，再用向量相似度检索库中已有
+            # Experience（阈值=experience_similarity_threshold）。只有低于阈值时
+            # 才新建 Experience，避免 LLM 措辞微小变化导致重复创建。
+            # core_entity 不再参与路由键，仅作为 Experience 的附属属性存储。
+            if not self._same_experience(current_experience, topic):
                 if current_segment:
                     self._summarize_segment(current_segment, timestamp, reason="experience_switch")
                 if current_experience:
                     self._summarize_experience(current_experience, timestamp, reason="experience_switch")
 
-                current_experience = self.storage.find_experience(topic, core_entity)
+                current_experience = self._find_experience_by_vector(topic, core_entity)
                 if current_experience:
-                    logger.info("命中已有 Experience experience_id=%s", current_experience["experience_id"])
+                    logger.info(
+                        "向量命中已有 Experience id=%s topic=%s",
+                        current_experience["experience_id"],
+                        current_experience["topic"],
+                    )
                     current_segment = self.storage.find_latest_segment(current_experience["experience_id"])
                     action = "switch_experience"
                 else:
@@ -95,9 +108,11 @@ class MemoryManager:
                     current_segment = None
                     action = "new_experience"
 
-            # Segment 是同一 Experience 内的意图聚合。intent 不同就切 Segment；
-            # intent 相同则继续追加 QA。
-            if not current_segment or current_segment["intent"] != intent:
+            # ── Segment 边界检测 ───────────────────────────────────────────────
+            # 语义漂移检测：intent 切换时，只有当当前 Segment 已积累了足够多的
+            # QA（>= min_segment_qas）才实际切断，避免生成大量 1-2 条的碎片
+            # Segment。少量 QA 时继续追加到当前 Segment，保证聚合度。
+            if not current_segment or self._should_cut_segment(current_segment, intent):
                 if current_segment:
                     self._summarize_segment(current_segment, timestamp, reason="intent_switch")
                 current_segment = self._create_segment(current_experience, topic, core_entity, intent, timestamp)
@@ -359,13 +374,95 @@ class MemoryManager:
         logger.debug("QA 向量已写入 id=%s", qa_id)
 
     def _same_experience(
-        self, experience: dict[str, Any] | None, topic: str, core_entity: str
+        self, experience: dict[str, Any] | None, topic: str
     ) -> bool:
-        return bool(
-            experience
-            and experience["topic"] == topic
-            and experience["core_entity"] == core_entity
-        )
+        """快速路径：当前 in-memory Experience 的 topic 与新 topic 完全一致时复用。
+
+        core_entity 不再作为路由键，避免同一主题不同说话人被分到不同 Experience。
+        """
+        return bool(experience and experience["topic"] == topic)
+
+    def _find_experience_by_vector(
+        self, topic: str, core_entity: str
+    ) -> dict[str, Any] | None:
+        """向量相似度检索：在所有已有 Experience 中找与当前 topic 最相似的。
+
+        查询文本格式与 build_experience_embedding_text 前两行对齐，保证余弦距离
+        有意义。相似度超过 experience_similarity_threshold 时才返回命中，否则返回
+        None（表示需新建 Experience）。
+
+        embedding 失败时回退到旧的精确 topic 字符串匹配。
+        """
+        query_text = f"主题：{topic}\n核心实体：{core_entity}"
+        try:
+            query_embedding = self.embedder.embed(query_text)
+        except Exception:
+            logger.warning("Experience 向量检索嵌入失败，回退到 topic 精确匹配", exc_info=True)
+            return self.storage.find_experience_by_topic(topic)
+
+        results = self.vector_store.query(query_embedding, memory_type="experience", top_k=5)
+        for item in results:
+            if item["similarity"] < self.experience_similarity_threshold:
+                break  # results are sorted by similarity desc; no point checking rest
+            exp_id = item["metadata"].get("experience_id", "")
+            if not exp_id:
+                continue
+            experience = self.storage.get_experience(exp_id)
+            if experience:
+                logger.info(
+                    "Experience 向量命中 id=%s sim=%.3f stored_topic=%s",
+                    exp_id,
+                    item["similarity"],
+                    experience["topic"],
+                )
+                return experience
+        return None
+
+    def _should_cut_segment(self, segment: dict[str, Any], intent: str) -> bool:
+        """判断是否应该切断当前 Segment，开启新 Segment。
+
+        三个条件必须同时满足才切：
+        1. intent 字符串不完全相同
+        2. 当前 intent 与 segment intent 的 token 余弦相似度 < 0.8
+           （措辞不同但语义相近时保留，避免碎片化）
+        3. 当前 Segment 已积累了足够的 QA（>= min_segment_qas）
+        """
+        if segment["intent"] == intent:
+            return False
+
+        if self._intent_similarity(segment["intent"], intent) >= 0.8:
+            return False
+
+        if len(segment.get("qa_ids") or []) < self.min_segment_qas:
+            return False
+
+        return True
+
+    @staticmethod
+    def _intent_similarity(a: str, b: str) -> float:
+        """本地 token bag-of-words 余弦相似度，无 API 调用。"""
+        from .embedder import tokenize
+        import math
+
+        tokens_a = tokenize(a)
+        tokens_b = tokenize(b)
+        if not tokens_a or not tokens_b:
+            return 0.0
+
+        freq_a: dict[str, int] = {}
+        freq_b: dict[str, int] = {}
+        for t in tokens_a:
+            freq_a[t] = freq_a.get(t, 0) + 1
+        for t in tokens_b:
+            freq_b[t] = freq_b.get(t, 0) + 1
+
+        vocab = set(freq_a) | set(freq_b)
+        dot  = sum(freq_a.get(t, 0) * freq_b.get(t, 0) for t in vocab)
+        norm_a = math.sqrt(sum(v * v for v in freq_a.values()))
+        norm_b = math.sqrt(sum(v * v for v in freq_b.values()))
+        if not norm_a or not norm_b:
+            return 0.0
+        return dot / (norm_a * norm_b)
 
     def _required_text(self, value: dict[str, Any], key: str) -> str:
         text = str(value.get(key) or "").strip()

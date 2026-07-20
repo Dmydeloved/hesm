@@ -94,7 +94,7 @@ def aggregate(
     Skips judge_score == -1 entries when averaging the judge score.
     """
     if k_values is None:
-        k_values = [1, 3, 5]
+        k_values = [2, 3, 5]
 
     m = MethodMetrics(method_name=method_name, num_questions=len(qa_records))
     if not qa_records:

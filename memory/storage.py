@@ -390,6 +390,21 @@ class MemoryStorage:
         ).fetchone()
         return self._row_to_dict(row)
 
+    def find_experience_by_topic(self, topic: str) -> dict[str, Any] | None:
+        """topic 精确匹配回退查询（向量检索嵌入失败时使用）。
+        不依赖 core_entity，避免同一主题不同说话人造成匹配失败。
+        """
+        row = self.connection.execute(
+            """
+            SELECT * FROM experience_memory
+            WHERE topic = ?
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (topic,),
+        ).fetchone()
+        return self._row_to_dict(row)
+
     def find_experiences(
         self, topic: str, core_entity: str, limit: int
     ) -> list[dict[str, Any]]:

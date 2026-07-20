@@ -21,7 +21,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Any
-
+import json
 from experiments.locomo.data.loader import Session
 from experiments.locomo.evaluation.token_metrics import count_tokens
 from experiments.locomo.methods.base import MemorySystem, RetrievalResult
@@ -101,13 +101,15 @@ class HESMMemory(MemorySystem):
         total_turns = sum(len(s.turns) for s in sessions)
         processed = 0
         recent_turns: list[str] = []  # rolling window for extractor context
-
+        count = 0
         for session in sessions:
             for turn in session.turns:
                 if not turn.text.strip():
                     continue
                 user_input = f"[{turn.speaker}]: {turn.text}"
-                context = "\n".join(recent_turns[-_CONTEXT_WINDOW:])
+                window_turns = recent_turns[-_CONTEXT_WINDOW:]
+                str_list = [json.dumps(turn, ensure_ascii=False) for turn in window_turns]
+                context = "\n".join(str_list)
 
                 try:
                     topic_result = self._extractor.extract(
@@ -116,24 +118,38 @@ class HESMMemory(MemorySystem):
                     )
                     # Normalise: TopicExtractor can return list or dict
                     if isinstance(topic_result, list):
-                        topic_result = topic_result[0] if topic_result else {}
-
-                    self._manager.add_qa(
-                        topic_result=topic_result,
-                        user_input=user_input,
-                        assistant_output="",
-                        # Store dia_id in tools field for later retrieval
-                        tools=[{"dia_id": turn.dia_id}] if turn.dia_id else [],
-                        timestamp=turn.timestamp,
-                        state_key="default",
-                    )
+                        for item in topic_result:
+                            self._manager.add_qa(
+                                topic_result=item,
+                                user_input=user_input,
+                                assistant_output="",
+                                # Store dia_id in tools field for later retrieval
+                                tools=[{"dia_id": turn.dia_id}] if turn.dia_id else [],
+                                timestamp=turn.timestamp,
+                                state_key="default",
+                            )
+                    else:
+                        self._manager.add_qa(
+                            topic_result=topic_result,
+                            user_input=user_input,
+                            assistant_output="",
+                            # Store dia_id in tools field for later retrieval
+                            tools=[{"dia_id": turn.dia_id}] if turn.dia_id else [],
+                            timestamp=turn.timestamp,
+                            state_key="default",
+                        )
                     processed += 1
                 except Exception as exc:
                     logger.warning(
                         "[HESM] %s turn %s failed: %s", conv_id, turn.dia_id, exc
                     )
-
-                recent_turns.append(user_input)
+                tmp_turn = {
+                    "user_input": user_input,
+                    "extractor_result": topic_result
+                }
+                recent_turns.append(tmp_turn)
+                count += 1
+                print(f"========================count : {count}")
 
         logger.info(
             "[HESM] %s: processed %d/%d turns", conv_id, processed, total_turns
@@ -231,6 +247,12 @@ class HESMMemory(MemorySystem):
             ),
             experience_summary_segment_threshold=int(
                 self._cfg.get("experience_segment_threshold", 5)
+            ),
+            experience_similarity_threshold=float(
+                self._cfg.get("experience_similarity_threshold", 0.82)
+            ),
+            min_segment_qas=int(
+                self._cfg.get("min_segment_qas", 2)
             ),
         )
 
@@ -490,7 +512,7 @@ class HESMAblationMemory(MemorySystem):
                 top_segment=int(cfg.get("top_segment", 5)),
                 top_qa=int(cfg.get("top_qa", top_k)),
                 state_key="default",
-                use_cache=False,
+                use_cache=True,
             )
         except Exception as exc:
             return RetrievalResult("", [], 0, {"error": str(exc)})

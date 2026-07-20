@@ -53,8 +53,8 @@ methods:
 hesm:
   segment_qa_threshold: 5       # trigger segment summary every N new QAs
   experience_segment_threshold: 5  # trigger experience summary every N new segments
-  top_experience: 3
-  top_segment: 5
+  top_experience: 2
+  top_segment: 3
   top_qa: 8
   use_llm_summarizer: true      # true=LLMSummarizer; false=TemplateSummarizer
   use_llm_reranker: true        # true=LLMRetrievalReranker; false=vector-only
