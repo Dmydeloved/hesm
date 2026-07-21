@@ -183,6 +183,7 @@ class HESMMemory(MemorySystem):
                 core_entity=core_entity,
                 intent=intent,
                 entities=entities,
+                query=question,
                 top_experience=int(cfg.get("top_experience", 3)),
                 top_segment=int(cfg.get("top_segment", 5)),
                 top_qa=int(cfg.get("top_qa", top_k)),

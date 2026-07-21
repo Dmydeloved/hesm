@@ -188,6 +188,7 @@ def build_query_text(
     core_entity: str,
     intent: str | None = None,
     entities: list[str] | None = None,
+    query: str | None = None
 ) -> str:
     return "\n".join(
         [
@@ -195,6 +196,7 @@ def build_query_text(
             f"核心实体: {core_entity}",
             f"用户意图: {intent or ''}",
             f"相关实体: {'、'.join(entities or [])}",
+            f"问题: {query}",
         ]
     )
 
@@ -231,18 +233,18 @@ def build_context_text(
             ]
         )
 
-    # lines.append("【原始问答 QA】")
-    # if not qas:
-    #     lines.append("未找到相关原始问答。")
-    # for index, qa in enumerate(qas, 1):
-    #     lines.extend(
-    #         [
-    #             f"{index}. 时间: {qa['timestamp']}",
-    #             f"用户: {qa['user_input']}",
-    #             f"助手: {qa['assistant_output']}",
-    #             "",
-    #         ]
-    #     )
+    lines.append("【原始问答 QA】")
+    if not qas:
+        lines.append("未找到相关原始问答。")
+    for index, qa in enumerate(qas, 1):
+        lines.extend(
+            [
+                f"{index}. 时间: {qa['timestamp']}",
+                f"用户: {qa['user_input']}",
+                f"助手: {qa['assistant_output']}",
+                "",
+            ]
+        )
     return "\n".join(lines).rstrip()
 
 class HybridRetriever:
@@ -282,6 +284,7 @@ class HybridRetriever:
         core_entity: str,
         intent: str | None = None,
         entities: list[str] | None = None,
+        query: str | None = None,
         top_experience: int = 3,
         top_segment: int = 5,
         top_qa: int = 8,
@@ -295,7 +298,7 @@ class HybridRetriever:
             raise ValueError("top_experience, top_segment and top_qa must be positive")
 
         query_entities = [str(item) for item in entities or [] if str(item).strip()]
-        query_text = build_query_text(topic, core_entity, intent, query_entities)
+        query_text = build_query_text(topic, core_entity, intent, query_entities, query)
         query_embedding = self._embed_query(query_text)
         retrieval_cache = self._load_retrieval_cache(state_key) if use_cache else {}
         experience_cache_hit = False
@@ -333,11 +336,11 @@ class HybridRetriever:
                 experiences, intent, query_text, segment_vector_ids, top_segment
             )
 
-        # qa_vector_ids = self._vector_candidate_ids(
-        #     "qa", query_embedding, max(20, top_qa * 8)
-        # )
+        qa_vector_ids = self._vector_candidate_ids(
+            "qa", query_embedding, max(20, top_qa * 8)
+        )
         qas, qa_count = self._recall_qas(
-            segments, query_text, set(), top_qa
+            segments, query_text, qa_vector_ids, top_qa
         )
 
         debug = {
@@ -346,7 +349,7 @@ class HybridRetriever:
             "qa_candidates": qa_count,
             "vector_experience_candidates": len(experience_vector_ids),
             "vector_segment_candidates": len(segment_vector_ids),
-            "vector_qa_candidates": 0,
+            "vector_qa_candidates": len(qa_vector_ids),
             "experience_cache_hit": experience_cache_hit,
             "segment_cache_hit": segment_cache_hit,
         }
@@ -354,7 +357,7 @@ class HybridRetriever:
             "检索结果：experience=%s/%s segment=%s/%s qa=%s/%s vectors=%s/%s/%s cache=%s/%s",
             len(experiences), experience_count, len(segments), segment_count,
             len(qas), qa_count, len(experience_vector_ids), len(segment_vector_ids),
-            0, experience_cache_hit, segment_cache_hit,
+            len(qa_vector_ids), experience_cache_hit, segment_cache_hit,
         )
         if use_cache:
             self._store_retrieval_cache(
@@ -557,9 +560,9 @@ class HybridRetriever:
         ):
             if key in item:
                 candidate[key] = item[key]
-        for key in ("summary", "state", "user_input", "assistant_output", "reasoning"):
+        for key in ("summary", "state", "user_input", "assistant_output"):
             if key in item:
-                candidate[key] = self._truncate_for_prompt(item[key])
+                candidate[key] = item[key]
         return candidate
 
     def _prepare_experience(
@@ -677,7 +680,7 @@ class HybridRetriever:
         ranked = self._select_candidates_with_llm(
             "experience", query_text, prepared, "experience_id", limit
         )
-        logger.info("Experience 候选个数%s  向量检索个数% 被选中的Experience如下%s 已经被选中的Experience如下%s", len(candidates), len(vector_candidate_ids), ranked)
+        logger.info("Experience 候选个数%s  向量检索个数%s 已经被选中的Experience如下%s", len(candidates), len(vector_candidate_ids), ranked)
         return ranked, len(candidates)
 
     def _recall_segments(
@@ -708,10 +711,10 @@ class HybridRetriever:
         candidates = self.storage.list_qas_by_segment_ids(segment_ids)
         candidates.sort(key=lambda item: item["timestamp"])
         prepared = [self._prepare_qa(item, vector_candidate_ids) for item in candidates]
-        # ranked = self._select_candidates_with_llm("qa", query_text, prepared, "qa_id", limit)
+        ranked = self._select_candidates_with_llm("qa", query_text, prepared, "qa_id", limit)
         # ranked.sort(key=lambda item: item["timestamp"])
-        # logger.info("QA 閸婃瑩鈧鏆熼柌?%s 閸氭垿鍣洪崐娆撯偓澶嬫殶闁?%s", len(candidates), len(vector_candidate_ids))
-        return prepared, len(candidates)
+        logger.info("QA 候选个数%s 向量检索个数%s ", len(candidates), len(vector_candidate_ids))
+        return ranked, len(candidates)
 
 
 class StructuredRetriever(HybridRetriever):

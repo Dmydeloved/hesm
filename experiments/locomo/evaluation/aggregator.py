@@ -157,7 +157,13 @@ def aggregate(
     return m
 
 
+# def _mean(values: list[float]) -> float:
+#     if not values:
+#         return 0.0
+#     return sum(values) / len(values)
 def _mean(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    return sum(values) / len(values)
+    # 过滤 None
+    valid = [v for v in values if v is not None]
+    if not valid:
+        return 0.0  # 或者返回 None，根据你指标逻辑选择
+    return sum(valid) / len(valid)
