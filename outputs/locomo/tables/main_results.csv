@@ -1,2 +1,2 @@
 method,avg_f1,avg_judge_score,accuracy@1,accuracy@3,accuracy@5,recall@1,recall@3,recall@5,precision@1,precision@3,precision@5,f1@1,f1@3,f1@5,avg_retrieved_tokens,avg_compression_ratio
-amem,9.27%,0.2969,23.12%,37.19%,41.71%,21.65%,33.58%,37.56%,23.12%,12.40%,8.44%,22.06%,17.79%,13.54%,112.3,109.58
+hesm,14.14%,0.3719,37.69%,45.23%,46.23%,34.21%,41.46%,42.21%,37.69%,16.25%,9.95%,35.29%,22.80%,15.80%,2833.1,24.22

@@ -98,6 +98,9 @@ class HESMMemory(MemorySystem):
         self._conv_id = conv_id
         self._setup_components(conv_id)
 
+        if self._has_existing_memory(sessions):
+            return
+
         total_turns = sum(len(s.turns) for s in sessions)
         processed = 0
         recent_turns: list[str] = []  # rolling window for extractor context
@@ -111,6 +114,7 @@ class HESMMemory(MemorySystem):
                 str_list = [json.dumps(turn, ensure_ascii=False) for turn in window_turns]
                 context = "\n".join(str_list)
 
+                topic_result: Any = {}
                 try:
                     topic_result = self._extractor.extract(
                         user_input=user_input,
@@ -154,6 +158,80 @@ class HESMMemory(MemorySystem):
         logger.info(
             "[HESM] %s: processed %d/%d turns", conv_id, processed, total_turns
         )
+
+    def _has_existing_memory(self, sessions: list[Session]) -> bool:
+        """
+        Return True when the per-conversation HESM store already has usable data.
+
+        The runner calls build_memory() before QA, so this check lets us attach the
+        existing SQLite/Chroma components and skip re-ingesting turns.
+        """
+        if self._storage is None or self._vector_store is None:
+            return False
+
+        try:
+            qa_count = int(
+                self._storage.connection.execute(
+                    "SELECT COUNT(*) FROM qa_memory"
+                ).fetchone()[0]
+            )
+            vector_count = int(self._vector_store.count())
+        except Exception as exc:
+            logger.warning(
+                "[HESM] %s: failed to inspect existing memory, rebuilding: %s",
+                self._conv_id,
+                exc,
+            )
+            return False
+
+        if qa_count <= 0 or vector_count <= 0:
+            return False
+
+        expected_dia_ids = {
+            turn.dia_id
+            for session in sessions
+            for turn in session.turns
+            if turn.text.strip() and turn.dia_id
+        }
+        stored_dia_ids = self._stored_dia_ids()
+        missing_count = len(expected_dia_ids - stored_dia_ids)
+        if missing_count:
+            logger.warning(
+                "[HESM] %s: reusing existing memory with %d missing dia_ids "
+                "(qa=%d, vectors=%d)",
+                self._conv_id,
+                missing_count,
+                qa_count,
+                vector_count,
+            )
+        else:
+            logger.info(
+                "[HESM] %s: existing memory found (qa=%d, vectors=%d), skipping build",
+                self._conv_id,
+                qa_count,
+                vector_count,
+            )
+        return True
+
+    def _stored_dia_ids(self) -> set[str]:
+        if self._storage is None:
+            return set()
+
+        rows = self._storage.connection.execute(
+            "SELECT tools_json FROM qa_memory"
+        ).fetchall()
+        dia_ids: set[str] = set()
+        for row in rows:
+            try:
+                tools = json.loads(row["tools_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(tools, list):
+                continue
+            for tool in tools:
+                if isinstance(tool, dict) and tool.get("dia_id"):
+                    dia_ids.add(str(tool["dia_id"]))
+        return dia_ids
 
     def retrieve(
         self,
