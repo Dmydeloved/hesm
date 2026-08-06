@@ -114,8 +114,24 @@ class QARunner:
         ckpt = Checkpoint(self.output_dir, method_name, conv.conv_id)
 
         if ckpt.is_complete():
-            logger.info("[%s] %s: checkpoint complete, skipping", method_name, conv.conv_id)
-            return ckpt.load_all_records_ordered(len(conv.questions))
+            all_answered = all(
+                ckpt.is_answered(index, qa_item.question)
+                for index, qa_item in enumerate(conv.questions)
+            )
+            if all_answered:
+                logger.info(
+                    "[%s] %s: answers file already contains all %d answers, skipping",
+                    method_name,
+                    conv.conv_id,
+                    len(conv.questions),
+                )
+                return ckpt.load_all_records_ordered(len(conv.questions))
+            logger.warning(
+                "[%s] %s: checkpoint is marked complete but contains missing or "
+                "mismatched answers; validating questions individually",
+                method_name,
+                conv.conv_id,
+            )
 
         completed_count = ckpt.num_completed()
         if completed_count > 0:
@@ -142,8 +158,26 @@ class QARunner:
         default_top_k = max(self.top_k_values)
 
         for i, qa_item in enumerate(conv.questions):
-            if ckpt.is_done(i):
+            if ckpt.is_answered(i, qa_item.question):
+                logger.info(
+                    "[%s] %s: question %d/%d already answered, skipping: %s",
+                    method_name,
+                    conv.conv_id,
+                    i + 1,
+                    len(conv.questions),
+                    qa_item.question[:100],
+                )
                 continue
+            if ckpt.is_done(i):
+                logger.warning(
+                    "[%s] %s: question %d/%d has an invalid or mismatched saved "
+                    "answer; running again: %s",
+                    method_name,
+                    conv.conv_id,
+                    i + 1,
+                    len(conv.questions),
+                    qa_item.question[:100],
+                )
 
             record = self._run_single_qa(
                 qa_item=qa_item,

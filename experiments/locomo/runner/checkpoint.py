@@ -80,6 +80,23 @@ class Checkpoint:
     def is_done(self, question_index: int) -> bool:
         return question_index in self._state.get("completed_indices_set", set())
 
+    def is_answered(
+        self,
+        question_index: int,
+        question: str | None = None,
+    ) -> bool:
+        """Return whether the answers file contains a valid answer for this question."""
+        if not self.is_done(question_index):
+            return False
+        record = self._state.get("records", {}).get(question_index)
+        if not isinstance(record, dict) or record.get("prediction") is None:
+            return False
+        if question is not None:
+            saved_question = str(record.get("question") or "").strip()
+            if saved_question != str(question).strip():
+                return False
+        return True
+
     def load_records(self) -> list[dict[str, Any]]:
         """Return all completed QA records in question order."""
         return list(self._state.get("records", {}).values())

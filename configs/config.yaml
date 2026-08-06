@@ -26,7 +26,7 @@ embedding:
 
 retrieval:
   api_key: "sk-RFUNAF0b6zfJWCVz9dA1Aa244aEa43Dc974693370b8d4338"
-  model: gpt-5.5
+  model: gpt-5.4-nano-high
   base_url: https://api.gpt.ge/v1/
   max_retries: 3
   retry_delay: 2.0
@@ -43,11 +43,11 @@ summarization:
 
 evaluation:
   api_key: "sk-RFUNAF0b6zfJWCVz9dA1Aa244aEa43Dc974693370b8d4338"
-  model: qwen-plus
-  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-  judge_api_key: ""
-  judge_model: qwen-plus
-  judge_base_url: ""
+  model: gpt-5.4-nano-high
+  base_url: https://api.gpt.ge/v1/
+  judge_api_key: "sk-RFUNAF0b6zfJWCVz9dA1Aa244aEa43Dc974693370b8d4338"
+  judge_model: gpt-5.4-nano-high
+  judge_base_url: https://api.gpt.ge/v1/
 
 shared:
   api_key: "sk-RFUNAF0b6zfJWCVz9dA1Aa244aEa43Dc974693370b8d4338"

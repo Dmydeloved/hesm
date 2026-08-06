@@ -1,21 +1,21 @@
 [
   {
     "method": "hesm",
-    "avg_f1": "14.14%",
-    "avg_judge_score": 0.3719,
-    "avg_retrieved_tokens": 2833.1,
-    "avg_compression_ratio": 24.22,
-    "recall@1": "34.21%",
-    "precision@1": "37.69%",
-    "f1@1": "35.29%",
-    "accuracy@1": "37.69%",
-    "recall@3": "41.46%",
-    "precision@3": "16.25%",
-    "f1@3": "22.80%",
-    "accuracy@3": "45.23%",
-    "recall@5": "42.21%",
-    "precision@5": "9.95%",
-    "f1@5": "15.80%",
-    "accuracy@5": "46.23%"
+    "avg_f1": "14.51%",
+    "avg_judge_score": 0.3673,
+    "avg_retrieved_tokens": 2116.6,
+    "avg_compression_ratio": 229.66,
+    "recall@1": "33.75%",
+    "precision@1": "38.19%",
+    "f1@1": "35.08%",
+    "accuracy@1": "38.19%",
+    "recall@3": "42.96%",
+    "precision@3": "16.92%",
+    "f1@3": "23.64%",
+    "accuracy@3": "47.74%",
+    "recall@5": "42.96%",
+    "precision@5": "10.15%",
+    "f1@5": "16.07%",
+    "accuracy@5": "47.74%"
   }
 ]

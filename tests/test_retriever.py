@@ -40,7 +40,7 @@ def load_query(storage):
 if __name__ == "__main__":
     storage = MemoryStorage(config_path("paths", "memory_db"))
     try:
-        query = load_query(storage)
+        # query = load_query(storage)
         retriever = HybridRetriever(
             storage=storage,
             embedder=BailianEmbedder()
@@ -48,10 +48,11 @@ if __name__ == "__main__":
 
         start = time.perf_counter()
         result = retriever.recall(
-            topic=query["topic"],
-            core_entity=query["core_entity"],
-            intent=query["intent"],
-            entities=query["entities"],
+            topic='人物经历',
+            core_entity='Caroline',
+            intent='时间查询',
+            entities='',
+            query='When did Caroline go to the LGBTQ support group?',
             top_experience=1,
             top_segment=1,
             top_qa=1,
@@ -65,7 +66,6 @@ if __name__ == "__main__":
             json.dumps(
                 {
                     "elapsed_ms": round(elapsed_ms, 3),
-                    "query": query,
                     "result": result,
                 },
                 ensure_ascii=False,
