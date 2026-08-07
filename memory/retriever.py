@@ -135,8 +135,8 @@ Select the best Experience -> Segment -> QA subtree for the query in one pass.
 
 1. Judge the complete path jointly. A QA must directly help answer the query; its
    Segment intent and Experience topic/core_entity must also be compatible.
-2. vector_similarity and keyword_score are complementary recall hints, not final
-   relevance scores.
+2. vector_similarity, relation_score, keyword_score, and retrieval_sources are
+   complementary recall hints, not final relevance scores.
 3. Prefer specific, traceable QA evidence. Use summaries to understand context,
    but do not choose an unrelated QA only because its parent summary is relevant.
 4. Select at most {top_experience} Experiences, {top_segment} Segments globally,
@@ -384,7 +384,7 @@ def build_context_text(
         )
     return "\n".join(lines).rstrip()
 
-class HybridRetriever:
+class _LegacyHybridRetriever:
     """Hierarchical structured-first Experience -> Segment -> QA retriever."""
 
     def __init__(
@@ -436,12 +436,9 @@ class HybridRetriever:
         top_experience: int = 3,
         top_segment: int = 5,
         top_qa: int = 8,
-        top_k: int | None = None,
         state_key: str = "default",
         use_cache: bool = True,
     ) -> dict[str, Any]:
-        if top_k is not None:
-            top_qa = top_k
         if min(top_experience, top_segment, top_qa) <= 0:
             raise ValueError("top_experience, top_segment and top_qa must be positive")
 
@@ -1844,6 +1841,10 @@ class HybridRetriever:
                 "keyword_score": round(
                     float(experience.get("keyword_score") or 0.0), 4
                 ),
+                "relation_score": round(
+                    float(experience.get("relation_score") or 0.0), 4
+                ),
+                "retrieval_sources": experience.get("retrieval_sources", []),
                 "local_score": round(
                     float(experience.get("_candidate_score") or 0.0), 4
                 ),
@@ -1862,6 +1863,7 @@ class HybridRetriever:
                     "keyword_score": round(
                         float(segment.get("keyword_score") or 0.0), 4
                     ),
+                    "retrieval_sources": segment.get("retrieval_sources", []),
                     "local_score": round(
                         float(segment.get("_candidate_score") or 0.0), 4
                     ),
@@ -1885,6 +1887,7 @@ class HybridRetriever:
                         "keyword_score": round(
                             float(qa.get("keyword_score") or 0.0), 4
                         ),
+                        "retrieval_sources": qa.get("retrieval_sources", []),
                         "local_score": round(
                             float(qa.get("_candidate_score") or 0.0), 4
                         ),
@@ -2469,5 +2472,1111 @@ class HybridRetriever:
         return ranked, len(candidates)
 
 
+class HybridRetriever(_LegacyHybridRetriever):
+    """Experience-first hierarchical retriever."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.qa_full_search_confidence_threshold = clamp01(float(config_get(
+            "retrieval", "qa_full_search_confidence_threshold", 0.8
+        )))
+        self.experience_vector_recall_limit = max(1, int(config_get(
+            "retrieval", "experience_vector_recall_limit", 12
+        )))
+        self.experience_relational_recall_limit = max(1, int(config_get(
+            "retrieval", "experience_relational_recall_limit", 12
+        )))
+        self.experience_candidate_limit = max(1, int(config_get(
+            "retrieval", "experience_candidate_limit", 8
+        )))
+        self.scoped_segment_vector_limit = max(1, int(config_get(
+            "retrieval", "scoped_segment_vector_limit", 32
+        )))
+        self.scoped_qa_vector_limit = max(1, int(config_get(
+            "retrieval", "scoped_qa_vector_limit", 64
+        )))
+        self.qa_rescue_vector_limit = max(1, int(config_get(
+            "retrieval", "qa_rescue_vector_limit", 40
+        )))
+        self.qa_rescue_relational_limit = max(1, int(config_get(
+            "retrieval", "qa_rescue_relational_limit", 40
+        )))
+        self.min_retained_experiences = max(1, int(config_get(
+            "retrieval", "min_retained_experiences", 1
+        )))
+        self.min_retained_segments = max(1, int(config_get(
+            "retrieval", "min_retained_segments", 2
+        )))
+        self.summary_soft_experience_chars = max(64, int(config_get(
+            "retrieval", "summary_soft_experience_chars", 800
+        )))
+        self.summary_soft_segment_chars = max(32, int(config_get(
+            "retrieval", "summary_soft_segment_chars", 400
+        )))
+        self.summary_extreme_experience_chars = max(64, int(config_get(
+            "retrieval", "summary_extreme_experience_chars", 300
+        )))
+        self.summary_extreme_segment_chars = max(32, int(config_get(
+            "retrieval", "summary_extreme_segment_chars", 160
+        )))
+        if self.min_retained_segments < self.min_retained_experiences:
+            raise ValueError(
+                "retrieval.min_retained_segments must be >= "
+                "retrieval.min_retained_experiences"
+            )
+
+    def recall(
+        self,
+        topic: str,
+        core_entity: str,
+        intent: str | None = None,
+        entities: list[str] | None = None,
+        query: str | None = None,
+        *,
+        query_confidence: float,
+        top_experience: int = 3,
+        top_segment: int = 5,
+        top_qa: int = 8,
+    ) -> dict[str, Any]:
+        """Recall a bounded, structurally valid Experience -> Segment -> QA tree."""
+        if min(top_experience, top_segment, top_qa) <= 0:
+            raise ValueError(
+                "top_experience, top_segment and top_qa must be positive"
+            )
+        if not 0.0 <= float(query_confidence) <= 1.0:
+            raise ValueError("query_confidence must be between 0.0 and 1.0")
+
+        query_entities = [
+            str(value).strip() for value in entities or [] if str(value).strip()
+        ]
+        query_text = build_query_text(
+            topic, core_entity, intent, query_entities, query
+        )
+        keyword_query_text = chr(10).join(
+            value
+            for value in (
+                str(topic or "").strip(),
+                str(core_entity or "").strip(),
+                str(intent or "").strip(),
+                *query_entities,
+                str(query or "").strip(),
+            )
+            if value
+        )
+        query_embedding = self._embed_query(query_text)
+        low_confidence = (
+            float(query_confidence)
+            < self.qa_full_search_confidence_threshold
+        )
+        logger.info(
+            "Starting Experience-first recall confidence=%.3f threshold=%.3f "
+            "qa_global_rescue=%s",
+            query_confidence,
+            self.qa_full_search_confidence_threshold,
+            low_confidence,
+        )
+
+        candidate_data = self._collect_experience_first_candidates(
+            topic=topic,
+            core_entity=core_entity,
+            intent=intent,
+            query_entities=query_entities,
+            keyword_query_text=keyword_query_text,
+            query_embedding=query_embedding,
+            low_confidence=low_confidence,
+            top_experience=top_experience,
+        )
+        candidate_tree = self._build_prompt_candidate_tree(candidate_data)
+        candidate_tree, tree_fit_debug = self._fit_candidate_tree_to_context(
+            candidate_tree
+        )
+        self._validate_candidate_tree(candidate_tree)
+        fitted_data = self._filter_candidate_data_to_tree(
+            candidate_data, candidate_tree
+        )
+
+        selection: dict[str, Any] = {"experiences": []}
+        llm_calls = 0
+        if (
+            candidate_tree
+            and self.reranker is not None
+            and not tree_fit_debug["context_overflow_unresolved"]
+        ):
+            rerank_hierarchy = getattr(self.reranker, "rerank_hierarchy", None)
+            if callable(rerank_hierarchy):
+                try:
+                    llm_calls = 1
+                    selection = rerank_hierarchy(
+                        query_text=query_text,
+                        candidate_tree=candidate_tree,
+                        top_experience=top_experience,
+                        top_segment=top_segment,
+                        top_qa=top_qa,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Hierarchical LLM rerank failed; using local fallback"
+                    )
+        elif tree_fit_debug["context_overflow_unresolved"]:
+            logger.warning(
+                "Candidate tree remains over budget after all pruning and "
+                "compression stages; skipping LLM rerank"
+            )
+
+        experiences, segments, qas = self._hydrate_hierarchical_selection(
+            selection,
+            fitted_data,
+            top_experience,
+            top_segment,
+            top_qa,
+        )
+        if not qas and fitted_data["qas"]:
+            experiences, segments, qas = self._local_hierarchical_selection(
+                fitted_data, top_experience, top_segment, top_qa
+            )
+        experiences, segments, qas = self._cohere_selected_results(
+            experiences, segments, qas
+        )
+
+        final_counts = {
+            "experience": len(experiences),
+            "segment": len(segments),
+            "qa": len(qas),
+        }
+        logger.info(
+            "Recall complete candidates=%s fitted=%s final=%s tokens=%s/%s",
+            candidate_data["counts"],
+            self._tree_counts(candidate_tree),
+            final_counts,
+            tree_fit_debug["candidate_tokens_final"],
+            self.max_context_tokens,
+        )
+        return {
+            "query": {
+                "topic": topic,
+                "core_entity": core_entity,
+                "intent": intent or "",
+                "entities": query_entities,
+                "confidence": float(query_confidence),
+            },
+            "experiences": experiences,
+            "segments": segments,
+            "qas": qas,
+            "candidate_tree": candidate_tree,
+            "context_text": build_context_text(experiences, segments, qas),
+            "debug": {
+                "strategy": "experience_first_confidence_gated_qa_rescue",
+                "low_confidence_qa_rescue": low_confidence,
+                "source_candidates": candidate_data["source_counts"],
+                "pipeline_counts": {
+                    "before_context_pruning": candidate_data["counts"],
+                    "submitted_to_llm": self._tree_counts(candidate_tree),
+                    "final_selected": final_counts,
+                },
+                "context_budget": tree_fit_debug,
+                "llm_calls": llm_calls,
+            },
+        }
+
+    def _recall_experience_roots(
+        self,
+        *,
+        topic: str,
+        core_entity: str,
+        intent: str | None,
+        query_text: str,
+        query_embedding: list[float] | None,
+        top_experience: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Fuse vector and topic/core_entity relational Experience recall."""
+        vector_hits = self._vector_candidates(
+            "experience",
+            query_embedding,
+            self.experience_vector_recall_limit,
+        )
+        relation_rows = self.storage.search_experiences(
+            topic,
+            core_entity,
+            self.experience_relational_recall_limit,
+        )
+        vector_rows = self.storage.get_experiences(list(vector_hits))
+        rows_by_id: dict[str, dict[str, Any]] = {}
+        for row in [*relation_rows, *vector_rows]:
+            rows_by_id[str(row["experience_id"])] = row
+
+        vector_rank = {
+            memory_id: rank
+            for rank, (memory_id, _) in enumerate(
+                sorted(
+                    vector_hits.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                ),
+                1,
+            )
+        }
+        relation_ids = [str(row["experience_id"]) for row in relation_rows]
+        relation_rank = {
+            memory_id: rank for rank, memory_id in enumerate(relation_ids, 1)
+        }
+        prepared: list[dict[str, Any]] = []
+        rrf_constant = 60.0
+        for experience_id, row in rows_by_id.items():
+            item = self._prepare_experience(row, set(vector_hits))
+            vector_similarity = vector_hits.get(experience_id, 0.0)
+            relation_score = clamp01(float(row.get("relation_score") or 0.0) / 2.0)
+            item["vector_similarity"] = vector_similarity
+            item["keyword_score"] = 0.0
+            item["relation_score"] = relation_score
+            item["retrieval_sources"] = [
+                source
+                for source, present in (
+                    ("experience_vector", experience_id in vector_rank),
+                    ("experience_relational", experience_id in relation_rank),
+                )
+                if present
+            ]
+            vector_rrf = (
+                (rrf_constant + 1.0)
+                / (rrf_constant + vector_rank[experience_id])
+                if experience_id in vector_rank else 0.0
+            )
+            relation_rrf = (
+                (rrf_constant + 1.0)
+                / (rrf_constant + relation_rank[experience_id])
+                if experience_id in relation_rank else 0.0
+            )
+            structure_score = self._score_candidate(
+                item, topic, core_entity, intent, query_text
+            )
+            item["_candidate_score"] = clamp01(
+                0.4 * vector_rrf
+                + 0.4 * relation_rrf
+                + 0.2 * structure_score
+            )
+            prepared.append(item)
+
+        limit = max(top_experience, self.experience_candidate_limit)
+        prepared.sort(
+            key=lambda item: (
+                float(item.get("_candidate_score") or 0.0),
+                str(item.get("updated_at") or ""),
+            ),
+            reverse=True,
+        )
+        selected = prepared[:limit]
+        logger.info(
+            "Experience roots recalled vector=%d relational=%d unique=%d selected=%d",
+            len(vector_rows),
+            len(relation_rows),
+            len(prepared),
+            len(selected),
+        )
+        return selected, {
+            "experience_vector": len(vector_rows),
+            "experience_relational": len(relation_rows),
+        }
+
+    def _load_descendants_for_experiences(
+        self,
+        experiences: list[dict[str, Any]],
+        *,
+        topic: str,
+        core_entity: str,
+        intent: str | None,
+        query_text: str,
+        query_embedding: list[float] | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Batch-load every active Segment and QA below the initial roots."""
+        experience_ids = [str(item["experience_id"]) for item in experiences]
+        segment_rows = self.storage.list_segments_by_experience_ids(experience_ids)
+        segment_ids = {str(row["segment_id"]) for row in segment_rows}
+        qa_rows = self.storage.list_qas_by_segment_ids(list(segment_ids))
+
+        segment_vectors = self._scoped_vector_candidates(
+            "segment",
+            query_embedding,
+            self.scoped_segment_vector_limit,
+            metadata_filter={"experience_id": experience_ids},
+        )
+        qa_vectors = self._scoped_vector_candidates(
+            "qa",
+            query_embedding,
+            self.scoped_qa_vector_limit,
+            metadata_filter={"segment_id": list(segment_ids)},
+        )
+
+        segments: list[dict[str, Any]] = []
+        for row in segment_rows:
+            segment_id = str(row["segment_id"])
+            item = self._prepare_segment(row, set(segment_vectors))
+            item["vector_similarity"] = segment_vectors.get(segment_id, 0.0)
+            item["keyword_score"] = self._candidate_keyword_score(
+                item, query_text, topic, core_entity, intent
+            )
+            item["retrieval_sources"] = ["initial_experience_descendant"]
+            if segment_id in segment_vectors:
+                item["retrieval_sources"].append("scoped_segment_vector")
+            item["_candidate_score"] = self._score_candidate(
+                item, topic, core_entity, intent, query_text
+            )
+            segments.append(item)
+
+        qas: list[dict[str, Any]] = []
+        for row in qa_rows:
+            qa_id = str(row["qa_id"])
+            item = self._prepare_qa(row, set(qa_vectors))
+            item["vector_similarity"] = qa_vectors.get(qa_id, 0.0)
+            item["keyword_score"] = self._candidate_keyword_score(
+                item, query_text, topic, core_entity, intent
+            )
+            item["retrieval_sources"] = ["initial_experience_descendant"]
+            if qa_id in qa_vectors:
+                item["retrieval_sources"].append("scoped_qa_vector")
+            local_score = self._score_candidate(
+                item, topic, core_entity, intent, query_text
+            )
+            # Stored QA confidence measures record quality, not query confidence.
+            item["_candidate_score"] = clamp01(
+                0.95 * local_score
+                + 0.05 * float(item.get("confidence") or 0.0)
+            )
+            qas.append(item)
+
+        logger.info(
+            "Expanded initial Experience roots experiences=%d segments=%d qas=%d",
+            len(experiences),
+            len(segments),
+            len(qas),
+        )
+        return segments, qas
+
+    def _scoped_vector_candidates(
+        self,
+        memory_type: str,
+        query_embedding: list[float] | None,
+        limit: int,
+        *,
+        metadata_filter: dict[str, Any],
+    ) -> dict[str, float]:
+        """Vector-score descendants without opening a global QA search."""
+        if self.vector_store is None or query_embedding is None:
+            return {}
+        if any(isinstance(value, list) and not value for value in metadata_filter.values()):
+            return {}
+        try:
+            items = self.vector_store.query(
+                query_embedding=query_embedding,
+                memory_type=memory_type,
+                top_k=max(1, int(limit)),
+                metadata_filter=metadata_filter,
+            )
+        except Exception:
+            logger.exception(
+                "Scoped %s vector scoring failed filters=%s",
+                memory_type,
+                metadata_filter,
+            )
+            return {}
+        candidates: dict[str, float] = {}
+        for item in items:
+            metadata = item.get("metadata") or {}
+            memory_id = str(
+                metadata.get("memory_id")
+                or metadata.get(f"{memory_type}_id")
+                or ""
+            )
+            if memory_id:
+                candidates[memory_id] = clamp01(
+                    float(item.get("similarity") or 0.0)
+                )
+        logger.debug(
+            "Scoped vector scoring layer=%s filters=%s hits=%d",
+            memory_type,
+            metadata_filter,
+            len(candidates),
+        )
+        return candidates
+
+    def _merge_low_confidence_qa_paths(
+        self,
+        *,
+        experiences: list[dict[str, Any]],
+        segments: list[dict[str, Any]],
+        qas: list[dict[str, Any]],
+        topic: str,
+        core_entity: str,
+        intent: str | None,
+        entities: list[str],
+        query_text: str,
+        query_embedding: list[float] | None,
+    ) -> dict[str, int]:
+        """Add global QA hits and only their real Segment/Experience ancestors."""
+        vector_hits = self._vector_candidates(
+            "qa", query_embedding, self.qa_rescue_vector_limit
+        )
+        relational_rows = self.storage.search_qas(
+            topic=topic,
+            core_entity=core_entity,
+            entities=entities,
+            keywords=self._keyword_terms(query_text),
+            limit=self.qa_rescue_relational_limit,
+        )
+        vector_rows = self.storage.get_qas(list(vector_hits))
+        relational_ids = {
+            str(row["qa_id"]) for row in relational_rows
+        }
+        rows_by_id: dict[str, dict[str, Any]] = {}
+        for row in [*relational_rows, *vector_rows]:
+            if row.get("status") == "active":
+                rows_by_id[str(row["qa_id"])] = row
+
+        qa_by_id = {str(item["qa_id"]): item for item in qas}
+        for qa_id, row in rows_by_id.items():
+            item = self._prepare_qa(row, set(vector_hits))
+            item["vector_similarity"] = vector_hits.get(qa_id, 0.0)
+            item["keyword_score"] = self._candidate_keyword_score(
+                item, query_text, topic, core_entity, intent
+            )
+            item["retrieval_sources"] = [
+                source
+                for source, present in (
+                    ("global_qa_vector", qa_id in vector_hits),
+                    ("global_qa_relational", qa_id in relational_ids),
+                )
+                if present
+            ]
+            local_score = self._score_candidate(
+                item, topic, core_entity, intent, query_text
+            )
+            item["_candidate_score"] = clamp01(
+                0.95 * local_score
+                + 0.05 * float(item.get("confidence") or 0.0)
+            )
+            existing = qa_by_id.get(qa_id)
+            if existing is None or float(item["_candidate_score"]) > float(
+                existing.get("_candidate_score") or 0.0
+            ):
+                qa_by_id[qa_id] = item
+
+        segment_by_id = {
+            str(item["segment_id"]): item for item in segments
+        }
+        missing_segment_ids = {
+            str(qa.get("segment_id") or "")
+            for qa in qa_by_id.values()
+            if str(qa.get("segment_id") or "") not in segment_by_id
+        }
+        missing_segment_ids.discard("")
+        for row in self.storage.get_segments(list(missing_segment_ids)):
+            if row.get("status") == "deleted":
+                continue
+            segment_id = str(row["segment_id"])
+            item = self._prepare_segment(row, set())
+            item["vector_similarity"] = 0.0
+            item["keyword_score"] = self._candidate_keyword_score(
+                item, query_text, topic, core_entity, intent
+            )
+            item["retrieval_sources"] = ["qa_rescue_ancestor"]
+            item["_candidate_score"] = self._score_candidate(
+                item, topic, core_entity, intent, query_text
+            )
+            segment_by_id[segment_id] = item
+
+        experience_by_id = {
+            str(item["experience_id"]): item for item in experiences
+        }
+        missing_experience_ids = {
+            str(segment.get("experience_id") or "")
+            for segment in segment_by_id.values()
+            if str(segment.get("experience_id") or "") not in experience_by_id
+        }
+        missing_experience_ids.discard("")
+        for row in self.storage.get_experiences(list(missing_experience_ids)):
+            experience_id = str(row["experience_id"])
+            item = self._prepare_experience(row, set())
+            item["vector_similarity"] = 0.0
+            item["keyword_score"] = 0.0
+            item["relation_score"] = 0.0
+            item["retrieval_sources"] = ["qa_rescue_ancestor"]
+            item["_candidate_score"] = self._score_candidate(
+                item, topic, core_entity, intent, query_text
+            )
+            experience_by_id[experience_id] = item
+
+        valid_experience_ids = set(experience_by_id)
+        valid_segments = {
+            segment_id: item
+            for segment_id, item in segment_by_id.items()
+            if str(item.get("experience_id") or "") in valid_experience_ids
+        }
+        valid_qas = {
+            qa_id: item
+            for qa_id, item in qa_by_id.items()
+            if str(item.get("segment_id") or "") in valid_segments
+        }
+        experiences[:] = list(experience_by_id.values())
+        segments[:] = list(valid_segments.values())
+        qas[:] = list(valid_qas.values())
+        logger.info(
+            "Low-confidence QA rescue vector=%d relational=%d unique=%d "
+            "added_segments=%d added_experiences=%d",
+            len(vector_rows),
+            len(relational_rows),
+            len(rows_by_id),
+            len(missing_segment_ids),
+            len(missing_experience_ids),
+        )
+        return {
+            "qa_rescue_vector": len(vector_rows),
+            "qa_rescue_relational": len(relational_rows),
+            "qa_rescue_unique": len(rows_by_id),
+        }
+
+    def _collect_experience_first_candidates(
+        self,
+        *,
+        topic: str,
+        core_entity: str,
+        intent: str | None,
+        query_entities: list[str],
+        keyword_query_text: str,
+        query_embedding: list[float] | None,
+        low_confidence: bool,
+        top_experience: int,
+    ) -> dict[str, Any]:
+        experiences, source_counts = self._recall_experience_roots(
+            topic=topic,
+            core_entity=core_entity,
+            intent=intent,
+            query_text=keyword_query_text,
+            query_embedding=query_embedding,
+            top_experience=top_experience,
+        )
+        segments, qas = self._load_descendants_for_experiences(
+            experiences,
+            topic=topic,
+            core_entity=core_entity,
+            intent=intent,
+            query_text=keyword_query_text,
+            query_embedding=query_embedding,
+        )
+        source_counts.update({
+            "initial_descendant_segments": len(segments),
+            "initial_descendant_qas": len(qas),
+            "qa_rescue_vector": 0,
+            "qa_rescue_relational": 0,
+            "qa_rescue_unique": 0,
+        })
+        if low_confidence:
+            source_counts.update(self._merge_low_confidence_qa_paths(
+                experiences=experiences,
+                segments=segments,
+                qas=qas,
+                topic=topic,
+                core_entity=core_entity,
+                intent=intent,
+                entities=query_entities,
+                query_text=keyword_query_text,
+                query_embedding=query_embedding,
+            ))
+
+        # Remove unusable/orphaned nodes once, before the canonical tree is built.
+        experience_ids = {str(item["experience_id"]) for item in experiences}
+        segments = [
+            item for item in segments
+            if str(item.get("experience_id") or "") in experience_ids
+        ]
+        segment_ids = {str(item["segment_id"]) for item in segments}
+        qas = [
+            item for item in qas
+            if str(item.get("segment_id") or "") in segment_ids
+        ]
+        segment_ids_with_qas = {
+            str(item["segment_id"]) for item in qas
+        }
+        segments = [
+            item for item in segments
+            if str(item["segment_id"]) in segment_ids_with_qas
+        ]
+        experience_ids_with_segments = {
+            str(item["experience_id"]) for item in segments
+        }
+        experiences = [
+            item for item in experiences
+            if str(item["experience_id"]) in experience_ids_with_segments
+        ]
+        experiences.sort(
+            key=lambda item: float(item.get("_candidate_score") or 0.0),
+            reverse=True,
+        )
+        segments.sort(
+            key=lambda item: float(item.get("_candidate_score") or 0.0),
+            reverse=True,
+        )
+        qas.sort(
+            key=lambda item: float(item.get("_candidate_score") or 0.0),
+            reverse=True,
+        )
+        counts = {
+            "experience": len(experiences),
+            "segment": len(segments),
+            "qa": len(qas),
+        }
+        logger.info("Canonical candidate paths prepared counts=%s", counts)
+        return {
+            "experiences": experiences,
+            "segments": segments,
+            "qas": qas,
+            "counts": counts,
+            "source_counts": source_counts,
+        }
+
+    def _tree_counts(
+        self, candidate_tree: list[dict[str, Any]]
+    ) -> dict[str, int]:
+        return {
+            "experience": len(candidate_tree),
+            "segment": sum(
+                len(experience.get("segments") or [])
+                for experience in candidate_tree
+            ),
+            "qa": sum(
+                len(segment.get("qas") or [])
+                for experience in candidate_tree
+                for segment in experience.get("segments") or []
+            ),
+        }
+
+    def _validate_candidate_tree(
+        self, candidate_tree: list[dict[str, Any]]
+    ) -> None:
+        """Fail fast if pruning or rescue introduced an orphan/duplicate node."""
+        experience_ids: set[str] = set()
+        segment_ids: set[str] = set()
+        qa_ids: set[str] = set()
+        for experience in candidate_tree:
+            experience_id = str(experience.get("id") or "")
+            segments = experience.get("segments") or []
+            if not experience_id or experience_id in experience_ids or not segments:
+                raise ValueError("Invalid candidate tree Experience node")
+            experience_ids.add(experience_id)
+            for segment in segments:
+                segment_id = str(segment.get("id") or "")
+                qas = segment.get("qas") or []
+                if not segment_id or segment_id in segment_ids or not qas:
+                    raise ValueError("Invalid candidate tree Segment node")
+                segment_ids.add(segment_id)
+                for qa in qas:
+                    qa_id = str(qa.get("id") or "")
+                    if not qa_id or qa_id in qa_ids:
+                        raise ValueError("Invalid candidate tree QA node")
+                    qa_ids.add(qa_id)
+
+    def _filter_candidate_data_to_tree(
+        self,
+        candidate_data: dict[str, Any],
+        candidate_tree: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        experience_ids = {
+            str(experience["id"]) for experience in candidate_tree
+        }
+        segment_ids = {
+            str(segment["id"])
+            for experience in candidate_tree
+            for segment in experience.get("segments") or []
+        }
+        qa_ids = {
+            str(qa["id"])
+            for experience in candidate_tree
+            for segment in experience.get("segments") or []
+            for qa in segment.get("qas") or []
+        }
+        return {
+            "experiences": [
+                item for item in candidate_data["experiences"]
+                if str(item["experience_id"]) in experience_ids
+            ],
+            "segments": [
+                item for item in candidate_data["segments"]
+                if str(item["segment_id"]) in segment_ids
+            ],
+            "qas": [
+                item for item in candidate_data["qas"]
+                if str(item["qa_id"]) in qa_ids
+            ],
+        }
+
+    def _segment_branch_score(self, segment: dict[str, Any]) -> float:
+        qa_scores = sorted(
+            (
+                float(qa.get("local_score") or 0.0)
+                for qa in segment.get("qas") or []
+            ),
+            reverse=True,
+        )
+        top_scores = qa_scores[:3]
+        return clamp01(
+            0.65 * max(qa_scores, default=0.0)
+            + 0.20 * (
+                sum(top_scores) / len(top_scores) if top_scores else 0.0
+            )
+            + 0.15 * float(segment.get("local_score") or 0.0)
+        )
+
+    def _experience_branch_score(self, experience: dict[str, Any]) -> float:
+        segment_scores = sorted(
+            (
+                self._segment_branch_score(segment)
+                for segment in experience.get("segments") or []
+            ),
+            reverse=True,
+        )
+        top_scores = segment_scores[:2]
+        return clamp01(
+            0.60 * max(segment_scores, default=0.0)
+            + 0.25 * (
+                sum(top_scores) / len(top_scores) if top_scores else 0.0
+            )
+            + 0.15 * float(experience.get("local_score") or 0.0)
+        )
+
+    def _remove_lowest_qa(
+        self,
+        tree: list[dict[str, Any]],
+    ) -> tuple[str | None, list[str], list[str]]:
+        candidates = sorted(
+            (
+                (
+                    float(qa.get("local_score") or 0.0),
+                    str(experience["id"]),
+                    str(segment["id"]),
+                    str(qa["id"]),
+                )
+                for experience in tree
+                for segment in experience.get("segments") or []
+                for qa in segment.get("qas") or []
+            ),
+            key=lambda item: (item[0], item[3]),
+        )
+        for _, experience_id, segment_id, qa_id in candidates:
+            experience = next(
+                item for item in tree if str(item["id"]) == experience_id
+            )
+            segment = next(
+                item for item in experience["segments"]
+                if str(item["id"]) == segment_id
+            )
+            # Keep the strongest evidence leaf in every Segment. Once each
+            # Segment has one QA, branch-level decisions belong to the Segment
+            # stage rather than being driven by a single low-scoring leaf.
+            if len(segment["qas"]) <= 1:
+                continue
+
+            segment["qas"] = [
+                qa for qa in segment["qas"] if str(qa["id"]) != qa_id
+            ]
+            removed_segments: list[str] = []
+            removed_experiences: list[str] = []
+            return qa_id, removed_segments, removed_experiences
+        return None, [], []
+
+    def _remove_lowest_segment(
+        self,
+        tree: list[dict[str, Any]],
+        min_segments: int,
+    ) -> tuple[str | None, str | None]:
+        candidates = sorted(
+            (
+                (
+                    self._segment_branch_score(segment),
+                    str(experience["id"]),
+                    str(segment["id"]),
+                )
+                for experience in tree
+                for segment in experience.get("segments") or []
+            ),
+            key=lambda item: (item[0], item[2]),
+        )
+        counts = self._tree_counts(tree)
+        for _, experience_id, segment_id in candidates:
+            experience = next(
+                item for item in tree if str(item["id"]) == experience_id
+            )
+            if counts["segment"] <= min_segments:
+                continue
+            # Preserve one Segment per Experience here. Root-level deletion is
+            # intentionally deferred to the Experience pruning stage.
+            if len(experience["segments"]) <= 1:
+                continue
+            experience["segments"] = [
+                segment for segment in experience["segments"]
+                if str(segment["id"]) != segment_id
+            ]
+            return segment_id, None
+        return None, None
+
+    def _remove_lowest_experience(
+        self,
+        tree: list[dict[str, Any]],
+        min_experiences: int,
+        min_segments: int,
+    ) -> str | None:
+        counts = self._tree_counts(tree)
+        candidates = sorted(
+            tree,
+            key=lambda item: (
+                self._experience_branch_score(item),
+                str(item.get("id") or ""),
+            ),
+        )
+        for experience in candidates:
+            branch_segments = len(experience.get("segments") or [])
+            if counts["experience"] <= min_experiences:
+                return None
+            if counts["segment"] - branch_segments < min_segments:
+                continue
+            experience_id = str(experience["id"])
+            tree[:] = [
+                item for item in tree if str(item["id"]) != experience_id
+            ]
+            return experience_id
+        return None
+
+    def _compress_tree_to_char_limits(
+        self,
+        tree: list[dict[str, Any]],
+        *,
+        experience_limit: int,
+        segment_limit: int,
+    ) -> dict[str, int]:
+        changed_experiences = 0
+        changed_segments = 0
+        for experience in tree:
+            summary = str(experience.get("summary") or "")
+            compressed = self._truncate_for_prompt(summary, experience_limit)
+            if compressed != summary:
+                experience["summary"] = compressed
+                changed_experiences += 1
+            for segment in experience.get("segments") or []:
+                summary = str(segment.get("summary") or "")
+                compressed = self._truncate_for_prompt(summary, segment_limit)
+                if compressed != summary:
+                    segment["summary"] = compressed
+                    changed_segments += 1
+        return {
+            "experience_summaries": changed_experiences,
+            "segment_summaries": changed_segments,
+        }
+
+    def _clip_qa_payloads_to_budget(
+        self, tree: list[dict[str, Any]]
+    ) -> int:
+        """Last-resort clipping when the protected minimum tree is itself huge."""
+        clipped = 0
+        for _ in range(256):
+            if self._count_candidate_tree_tokens(tree) <= self.max_context_tokens:
+                break
+            fields = [
+                (qa, field)
+                for experience in tree
+                for segment in experience.get("segments") or []
+                for qa in segment.get("qas") or []
+                for field in ("assistant_output", "user_input")
+                if len(str(qa.get(field) or "")) > 96
+            ]
+            if not fields:
+                break
+            qa, field = max(
+                fields, key=lambda item: len(str(item[0].get(item[1]) or ""))
+            )
+            original = str(qa.get(field) or "")
+            target = max(96, int(len(original) * 0.75))
+            # Keep the ellipsis inside the hard target so every iteration makes
+            # progress and cannot stall at target + len("...").
+            qa[field] = original[:target - 1].rstrip() + "…"
+            clipped += 1
+        return clipped
+
+    def _fit_candidate_tree_to_context(
+        self, candidate_tree: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Fit the tree by QA, Segment, Experience, then two summary passes."""
+        tree = deepcopy(candidate_tree)
+        tree.sort(key=self._experience_branch_score, reverse=True)
+        for experience in tree:
+            experience["segments"].sort(
+                key=self._segment_branch_score, reverse=True
+            )
+            for segment in experience.get("segments") or []:
+                segment["qas"].sort(
+                    key=lambda qa: float(qa.get("local_score") or 0.0),
+                    reverse=True,
+                )
+
+        initial_counts = self._tree_counts(tree)
+        min_experiences = min(
+            self.min_retained_experiences, initial_counts["experience"]
+        )
+        min_segments = min(
+            self.min_retained_segments, initial_counts["segment"]
+        )
+        tokens_before = self._count_candidate_tree_tokens(tree)
+        removed_qa_ids: list[str] = []
+        removed_segment_ids: list[str] = []
+        removed_experience_ids: list[str] = []
+
+        # Stage 1: remove the least relevant leaves. Empty parents are removed
+        # in the same operation, but only when the configured minima survive.
+        while self._count_candidate_tree_tokens(tree) > self.max_context_tokens:
+            qa_id, segment_ids, experience_ids = self._remove_lowest_qa(
+                tree
+            )
+            if qa_id is None:
+                break
+            removed_qa_ids.append(qa_id)
+            removed_segment_ids.extend(segment_ids)
+            removed_experience_ids.extend(experience_ids)
+        tokens_after_qa = self._count_candidate_tree_tokens(tree)
+        logger.info(
+            "Context pruning QA stage removed=%d cascaded_segments=%d "
+            "cascaded_experiences=%d tokens=%d",
+            len(removed_qa_ids),
+            len(removed_segment_ids),
+            len(removed_experience_ids),
+            tokens_after_qa,
+        )
+
+        # Stage 2: remove complete Segment branches once QA leaf pruning can no
+        # longer make progress without violating the structural minimum.
+        segment_stage_removed: list[str] = []
+        while self._count_candidate_tree_tokens(tree) > self.max_context_tokens:
+            segment_id, experience_id = self._remove_lowest_segment(
+                tree, min_segments
+            )
+            if segment_id is None:
+                break
+            segment_stage_removed.append(segment_id)
+            removed_segment_ids.append(segment_id)
+            if experience_id:
+                removed_experience_ids.append(experience_id)
+        tokens_after_segment = self._count_candidate_tree_tokens(tree)
+        logger.info(
+            "Context pruning Segment stage removed=%d tokens=%d",
+            len(segment_stage_removed),
+            tokens_after_segment,
+        )
+
+        # Stage 3: whole Experience branches are the last structural deletion.
+        experience_stage_removed: list[str] = []
+        while self._count_candidate_tree_tokens(tree) > self.max_context_tokens:
+            experience_id = self._remove_lowest_experience(
+                tree, min_experiences, min_segments
+            )
+            if experience_id is None:
+                break
+            experience_stage_removed.append(experience_id)
+            removed_experience_ids.append(experience_id)
+        tokens_after_experience = self._count_candidate_tree_tokens(tree)
+        logger.info(
+            "Context pruning Experience stage removed=%d tokens=%d",
+            len(experience_stage_removed),
+            tokens_after_experience,
+        )
+
+        normal_compression: dict[str, Any] = {}
+        if tokens_after_experience > self.max_context_tokens:
+            normal_compression.update(self._compress_tree_summaries(tree))
+            normal_compression.update(self._compress_tree_to_char_limits(
+                tree,
+                experience_limit=self.summary_soft_experience_chars,
+                segment_limit=self.summary_soft_segment_chars,
+            ))
+        tokens_after_normal_compression = self._count_candidate_tree_tokens(tree)
+        logger.info(
+            "Context normal summary compression applied=%s tokens=%d",
+            bool(normal_compression),
+            tokens_after_normal_compression,
+        )
+
+        extreme_compression: dict[str, int] = {}
+        if tokens_after_normal_compression > self.max_context_tokens:
+            extreme_compression = self._compress_tree_to_char_limits(
+                tree,
+                experience_limit=self.summary_extreme_experience_chars,
+                segment_limit=self.summary_extreme_segment_chars,
+            )
+        tokens_after_extreme_compression = self._count_candidate_tree_tokens(tree)
+        logger.info(
+            "Context extreme summary compression applied=%s tokens=%d",
+            bool(extreme_compression),
+            tokens_after_extreme_compression,
+        )
+
+        emergency_qa_clips = 0
+        if tokens_after_extreme_compression > self.max_context_tokens:
+            emergency_qa_clips = self._clip_qa_payloads_to_budget(tree)
+        final_tokens = self._count_candidate_tree_tokens(tree)
+        if emergency_qa_clips:
+            logger.warning(
+                "Protected minimum tree required emergency QA clipping "
+                "operations=%d final_tokens=%d",
+                emergency_qa_clips,
+                final_tokens,
+            )
+        self._validate_candidate_tree(tree)
+        return tree, {
+            "limit_tokens": self.max_context_tokens,
+            "candidate_tokens_before_pruning": tokens_before,
+            "candidate_tokens_after_qa_pruning": tokens_after_qa,
+            "candidate_tokens_after_segment_pruning": tokens_after_segment,
+            "candidate_tokens_after_experience_pruning": tokens_after_experience,
+            "candidate_tokens_after_normal_compression": (
+                tokens_after_normal_compression
+            ),
+            "candidate_tokens_after_extreme_compression": (
+                tokens_after_extreme_compression
+            ),
+            "candidate_tokens_final": final_tokens,
+            "minimum_experiences": min_experiences,
+            "minimum_segments": min_segments,
+            "removed_qa_ids": removed_qa_ids,
+            "removed_segment_ids": removed_segment_ids,
+            "removed_experience_ids": removed_experience_ids,
+            "normal_summary_compression": normal_compression,
+            "extreme_summary_compression": extreme_compression,
+            "emergency_qa_clip_operations": emergency_qa_clips,
+            "context_overflow_unresolved": final_tokens > self.max_context_tokens,
+        }
+
+    def _cohere_selected_results(
+        self,
+        experiences: list[dict[str, Any]],
+        segments: list[dict[str, Any]],
+        qas: list[dict[str, Any]],
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        """Remove selected parents that have no selected descendants."""
+        segment_ids_with_qas = {
+            str(qa.get("segment_id") or "") for qa in qas
+        }
+        coherent_segments = [
+            segment for segment in segments
+            if str(segment.get("segment_id") or "") in segment_ids_with_qas
+        ]
+        experience_ids_with_segments = {
+            str(segment.get("experience_id") or "")
+            for segment in coherent_segments
+        }
+        coherent_experiences = [
+            experience for experience in experiences
+            if str(experience.get("experience_id") or "")
+            in experience_ids_with_segments
+        ]
+        return coherent_experiences, coherent_segments, qas
+
 class StructuredRetriever(HybridRetriever):
-    """Backward-compatible alias."""
+    """Alias retained for callers that prefer the structural name."""

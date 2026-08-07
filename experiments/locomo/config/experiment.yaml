@@ -26,11 +26,11 @@ retrieval:
   top_k_values: [1, 3, 5]   # K values for Recall/Precision/Accuracy@K
   default_top_k: 5           # used for context injection into LLM
 
-# ── LLM (answer generation + judge + topic extraction) ───────
-# All LLM calls (except embedding) use topic_extraction config from configs/config.yaml
+# ── Model configuration ─────────────────────────────────────
+# Model roles are configured independently in configs/config.yaml:
+# topic_extraction, answer_generation, retrieval, summarization, evaluation, embedding.
 llm:
-  use_topic_extraction_config: true  # read api_key/model/base_url/max_retries/retry_delay
-                                     # from configs/config.yaml [topic_extraction]
+  config_path: configs/config.yaml
 
 # ── Token counting ────────────────────────────────────────────
 token_counter:

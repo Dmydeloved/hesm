@@ -47,10 +47,8 @@ class _InMemoryCollection:
         del include
         query_embedding = query_embeddings[0]
         candidates = [
-            item
-            for item in self._items.values()
-            if not where
-            or all(item["metadata"].get(key) == value for key, value in where.items())
+            item for item in self._items.values()
+            if self._matches_where(item["metadata"], where)
         ]
         ranked = sorted(
             candidates,
@@ -62,6 +60,28 @@ class _InMemoryCollection:
             "metadatas": [[item["metadata"] for item in ranked]],
             "distances": [[self._cosine_distance(query_embedding, item["embedding"]) for item in ranked]],
         }
+
+    def _matches_where(
+        self, metadata: dict[str, Any], where: dict[str, Any] | None
+    ) -> bool:
+        """Small Chroma-compatible subset used by the offline fallback."""
+        if not where:
+            return True
+        if "$and" in where:
+            return all(
+                self._matches_where(metadata, condition)
+                for condition in where["$and"]
+            )
+        for key, condition in where.items():
+            actual = metadata.get(key)
+            if isinstance(condition, dict):
+                if "$in" in condition and actual not in condition["$in"]:
+                    return False
+                if "$eq" in condition and actual != condition["$eq"]:
+                    return False
+            elif actual != condition:
+                return False
+        return True
 
     def count(self) -> int:
         return len(self._items)
@@ -184,13 +204,25 @@ class ChromaVectorStore:
             metadatas=[vector_metadata],
         )
 
-    def query(self, query_embedding: list[float], memory_type: str = "qa", top_k: int = 20) -> list[dict[str, Any]]:
+    def query(
+        self,
+        query_embedding: list[float],
+        memory_type: str = "qa",
+        top_k: int = 20,
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         if self.collection.count() == 0:
             return []
+        filters: list[dict[str, Any]] = [{"memory_type": memory_type}]
+        for key, value in (metadata_filter or {}).items():
+            filters.append({
+                key: {"$in": value} if isinstance(value, list) else value
+            })
+        where = filters[0] if len(filters) == 1 else {"$and": filters}
         result = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=min(top_k, self.collection.count()),
-            where={"memory_type": memory_type},
+            where=where,
             include=["documents", "metadatas", "distances"],
         )
         items = []

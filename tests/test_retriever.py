@@ -58,7 +58,7 @@ if __name__ == "__main__":
 
         start = time.perf_counter()
         result = retriever.recall(
-            topic='人物经历',
+            topic='跨性别经历与LGBTQ倡导',
             core_entity='Caroline',
             intent='查询',
             entities= [
@@ -68,21 +68,21 @@ if __name__ == "__main__":
                         "来源地"
                     ],
             query='Where did Caroline move from 4 years ago?',
-            state_key="test_retriever",
-            use_cache=False,
+            query_confidence=0.7,
         )
         elapsed_ms = (time.perf_counter() - start) * 1000
 
+        output_data = {
+            "elapsed_ms": round(elapsed_ms, 3),
+            "result": result,
+        }
+
+        # 输出到控制台
         print("retrieval result:")
-        print(
-            json.dumps(
-                {
-                    "elapsed_ms": round(elapsed_ms, 3),
-                    "result": result,
-                },
-                ensure_ascii=False,
-                indent=4,
-            )
-        )
+        print(json.dumps(output_data, ensure_ascii=False, indent=4))
+
+        # 写入json文件
+        with open("retrieval_result.json", "w", encoding="utf-8") as f:
+            json.dump(output_data, f, ensure_ascii=False, indent=4)
     finally:
         storage.close()

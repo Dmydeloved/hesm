@@ -75,6 +75,10 @@ CREATE INDEX IF NOT EXISTS idx_segment_experience_id
 ON segment_memory(experience_id);
 CREATE INDEX IF NOT EXISTS idx_experience_topic_entity
 ON experience_memory(topic, core_entity);
+CREATE INDEX IF NOT EXISTS idx_experience_core_entity
+ON experience_memory(core_entity);
+CREATE INDEX IF NOT EXISTS idx_qa_topic
+ON qa_memory(topic);
 """
 
 
@@ -287,11 +291,14 @@ class MemoryStorage:
         return self._row_to_dict(row)
 
     def get_qas(self, qa_ids: list[str]) -> list[dict[str, Any]]:
-        return [
-            qa
-            for qa in (self.get_qa(qa_id) for qa_id in qa_ids)
-            if qa is not None
-        ]
+        if not qa_ids:
+            return []
+        placeholders = ", ".join("?" for _ in qa_ids)
+        rows = self.connection.execute(
+            f"SELECT * FROM qa_memory WHERE qa_id IN ({placeholders})",
+            qa_ids,
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
 
     def get_segment(self, segment_id: str | None) -> dict[str, Any] | None:
         if not segment_id:
@@ -303,11 +310,14 @@ class MemoryStorage:
         return self._row_to_dict(row)
 
     def get_segments(self, segment_ids: list[str]) -> list[dict[str, Any]]:
-        return [
-            segment
-            for segment in (self.get_segment(segment_id) for segment_id in segment_ids)
-            if segment is not None
-        ]
+        if not segment_ids:
+            return []
+        placeholders = ", ".join("?" for _ in segment_ids)
+        rows = self.connection.execute(
+            f"SELECT * FROM segment_memory WHERE segment_id IN ({placeholders})",
+            segment_ids,
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
 
     def insert_segment(self, segment: dict[str, Any]) -> None:
         self.connection.execute(
@@ -430,6 +440,108 @@ class MemoryStorage:
             LIMIT ?
             """,
             (topic, limit),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def search_experiences(
+        self,
+        topic: str,
+        core_entity: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Recall Experience rows by topic/core_entity only."""
+        topic = str(topic or "").strip()
+        core_entity = str(core_entity or "").strip()
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        score_parts: list[str] = []
+        score_parameters: list[Any] = []
+        if topic:
+            conditions.append("topic = ?")
+            parameters.append(topic)
+            score_parts.append("CASE WHEN topic = ? THEN 1 ELSE 0 END")
+            score_parameters.append(topic)
+        if core_entity:
+            conditions.append("core_entity = ?")
+            parameters.append(core_entity)
+            score_parts.append("CASE WHEN core_entity = ? THEN 1 ELSE 0 END")
+            score_parameters.append(core_entity)
+        if not conditions:
+            return []
+
+        rows = self.connection.execute(
+            f"""
+            SELECT *, ({' + '.join(score_parts)}) AS relation_score
+            FROM experience_memory
+            WHERE {' OR '.join(conditions)}
+            ORDER BY relation_score DESC, updated_at DESC, created_at DESC
+            LIMIT ?
+            """,
+            (*score_parameters, *parameters, max(1, int(limit))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def search_qas(
+        self,
+        *,
+        topic: str,
+        core_entity: str,
+        entities: list[str],
+        keywords: list[str],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Broad relational QA recall used only for low-confidence queries."""
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        topic = str(topic or "").strip()
+        core_entity = str(core_entity or "").strip()
+        normalized_entities = sorted({
+            str(value).strip().casefold()
+            for value in entities
+            if str(value).strip()
+        })
+        normalized_keywords = [
+            str(value).strip() for value in keywords if str(value).strip()
+        ]
+
+        if topic:
+            conditions.append("q.topic = ?")
+            parameters.append(topic)
+        if core_entity:
+            conditions.append("q.core_entity = ?")
+            parameters.append(core_entity)
+        if normalized_entities:
+            placeholders = ", ".join("?" for _ in normalized_entities)
+            # JSON1 membership avoids substring matches in serialized entity data.
+            conditions.append(
+                "EXISTS ("
+                "SELECT 1 FROM json_each("
+                "CASE WHEN json_valid(q.entities_json) THEN q.entities_json ELSE '[]' END"
+                ") AS entity WHERE lower(trim(CAST(entity.value AS TEXT))) "
+                f"IN ({placeholders})"
+                ")"
+            )
+            parameters.extend(normalized_entities)
+        searchable = (
+            "COALESCE(q.user_input, '') || ' ' || "
+            "COALESCE(q.assistant_output, '') || ' ' || "
+            "COALESCE(q.intent, '')"
+        )
+        for keyword in normalized_keywords:
+            conditions.append(f"({searchable}) LIKE ?")
+            parameters.append(f"%{keyword}%")
+        if not conditions:
+            return []
+
+        rows = self.connection.execute(
+            f"""
+            SELECT q.*
+            FROM qa_memory AS q
+            WHERE q.status = 'active' AND ({' OR '.join(conditions)})
+            ORDER BY q.timestamp DESC
+            LIMIT ?
+            """,
+            (*parameters, max(1, int(limit))),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 

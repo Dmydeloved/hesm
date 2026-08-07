@@ -58,7 +58,8 @@ class HESMMemory(MemorySystem):
             hesm_cfg:           hesm section from experiment.yaml
             use_llm_summarizer: if False, use TemplateSummarizer (faster, offline)
             use_llm_reranker:   if False, skip LLM reranking (vector-only retrieval)
-            use_cache:          passed to HybridRetriever.recall(use_cache=...)
+            use_cache:          retained by the benchmark adapter interface;
+                                candidate-cache routing is not used by Retriever
         """
         self._memory_root = Path(memory_root)
         self._cfg = hesm_cfg
@@ -239,10 +240,12 @@ class HESMMemory(MemorySystem):
         top_k: int = 5,
         use_cache: bool | None = None,
     ) -> RetrievalResult:
+        # The shared benchmark interface still supplies top_k/use_cache. HESM
+        # now gets its three explicit limits from configuration.
+        del top_k, use_cache
         if self._retriever is None or self._extractor is None:
             return RetrievalResult("", [], 0, {"error": "memory not built"})
 
-        _use_cache = self._use_cache if use_cache is None else use_cache
         cfg = self._cfg
 
         try:
@@ -262,11 +265,10 @@ class HESMMemory(MemorySystem):
                 intent=intent,
                 entities=entities,
                 query=question,
+                query_confidence=float(q_topic.get("confidence", 0.0)),
                 top_experience=int(cfg.get("top_experience", 3)),
                 top_segment=int(cfg.get("top_segment", 5)),
-                top_qa=int(cfg.get("top_qa", top_k)),
-                state_key="default",
-                use_cache=_use_cache,
+                top_qa=int(cfg.get("top_qa", 8)),
             )
         except Exception as exc:
             logger.warning("[HESM] retrieve failed for %r: %s", question[:60], exc)
@@ -574,6 +576,7 @@ class HESMAblationMemory(MemorySystem):
         )
 
     def _retrieve_full_hesm(self, question: str, top_k: int) -> RetrievalResult:
+        del top_k
         if self._retriever is None or self._extractor is None:
             return RetrievalResult("", [], 0, {"error": "retriever not initialised"})
         cfg = self._hesm_cfg
@@ -587,11 +590,11 @@ class HESMAblationMemory(MemorySystem):
                 core_entity=q_topic.get("core_entity", ""),
                 intent=q_topic.get("intent"),
                 entities=q_topic.get("entities", []),
+                query=question,
+                query_confidence=float(q_topic.get("confidence", 0.0)),
                 top_experience=int(cfg.get("top_experience", 3)),
                 top_segment=int(cfg.get("top_segment", 5)),
-                top_qa=int(cfg.get("top_qa", top_k)),
-                state_key="default",
-                use_cache=True,
+                top_qa=int(cfg.get("top_qa", 8)),
             )
         except Exception as exc:
             return RetrievalResult("", [], 0, {"error": str(exc)})
