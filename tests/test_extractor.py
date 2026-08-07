@@ -12,7 +12,7 @@ from memory.extractor import TopicExtractor
 if __name__ == "__main__":
     topic_extractor = TopicExtractor()
 
-    single_topic_input = "When did Caroline go to the LGBTQ support group?"
+    single_topic_input = "Where did Caroline move from 4 years ago?"
     single_topic_result = topic_extractor.extract(user_input=single_topic_input)
     print("single topic result:")
     print(json.dumps(single_topic_result, ensure_ascii=False, indent=4))

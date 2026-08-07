@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
@@ -402,6 +405,17 @@ class HybridRetriever:
         self.vector_store = vector_store
         self.embedder = embedder
         self.reranker = reranker
+        self.max_context_tokens = max(
+            1, int(config_get('retrieval', 'max_context_tokens', 30000))
+        )
+        self.min_prompt_experiences = max(
+            1, int(config_get('retrieval', 'min_prompt_experiences', 6))
+        )
+        self.token_encoding = str(
+            config_get('retrieval', 'token_encoding', 'cl100k_base')
+        )
+        self._token_encoder: Any | None = None
+        self._token_encoder_initialized = False
 
         if self.reranker is None and rerank_with_llm:
             self.reranker = LLMRetrievalReranker(
@@ -459,10 +473,17 @@ class HybridRetriever:
             top_qa=top_qa,
         )
         candidate_tree = self._build_prompt_candidate_tree(candidate_data)
+        candidate_tree, tree_fit_debug = self._fit_candidate_tree_to_context(
+            candidate_tree
+        )
 
         llm_calls = 0
         selection: dict[str, Any] = {"experiences": []}
-        if candidate_tree and self.reranker is not None:
+        if (
+            candidate_tree
+            and self.reranker is not None
+            and not tree_fit_debug['context_overflow_unresolved']
+        ):
             rerank_hierarchy = getattr(self.reranker, "rerank_hierarchy", None)
             if callable(rerank_hierarchy):
                 llm_calls = 1
@@ -482,6 +503,11 @@ class HybridRetriever:
                 logger.warning(
                     "Injected reranker has no rerank_hierarchy(); using local fallback"
                 )
+        elif tree_fit_debug['context_overflow_unresolved']:
+            logger.warning(
+                'Candidate tree still exceeds max_context_tokens after pruning and '
+                'summary compression; skipping LLM rerank'
+            )
 
         experiences, segments, qas = self._hydrate_hierarchical_selection(
             selection,
@@ -495,12 +521,8 @@ class HybridRetriever:
                 candidate_data, top_experience, top_segment, top_qa
             )
 
-        raw_counts = candidate_data["raw_counts"]
-        experience_count = raw_counts["experience"]
-        segment_count = raw_counts["segment"]
-        qa_count = raw_counts["qa"]
-        vector_counts = candidate_data["vector_counts"]
-        keyword_counts = candidate_data["keyword_counts"]
+        direct_unique_counts = candidate_data["direct_unique_counts"]
+        source_counts = candidate_data["source_counts"]
         cached_experience_ids = set(retrieval_cache.get("experience_ids") or [])
         cached_segment_ids = set(retrieval_cache.get("segment_ids") or [])
         experience_cache_hit = bool(
@@ -514,29 +536,76 @@ class HybridRetriever:
             and cached_segment_ids
         )
 
+        prompt_counts = {
+            "experience": len(candidate_tree),
+            "segment": sum(len(item.get("segments") or []) for item in candidate_tree),
+            "qa": sum(
+                len(segment.get("qas") or [])
+                for item in candidate_tree
+                for segment in item.get("segments") or []
+            ),
+        }
         debug = {
-            "experience_candidates": experience_count,
-            "segment_candidates": segment_count,
-            "qa_candidates": qa_count,
-            "prompt_experience_candidates": len(candidate_data["experiences"]),
-            "prompt_segment_candidates": len(candidate_data["segments"]),
-            "prompt_qa_candidates": len(candidate_data["qas"]),
-            "vector_experience_candidates": vector_counts["experience"],
-            "vector_segment_candidates": vector_counts["segment"],
-            "vector_qa_candidates": vector_counts["qa"],
-            "keyword_experience_candidates": keyword_counts["experience"],
-            "keyword_segment_candidates": keyword_counts["segment"],
-            "keyword_qa_candidates": keyword_counts["qa"],
-            "experience_cache_hit": experience_cache_hit,
-            "segment_cache_hit": segment_cache_hit,
-            "retrieval_strategy": "hierarchical_hybrid_joint",
+            # strategy：本次召回采用的融合与层级处理策略。
+            "strategy": "hierarchical_equal_weight_rrf",
+            # source_candidates：各层每种数据源在去重前返回的原始条数。
+            "source_candidates": source_counts,
+            # pipeline_counts：候选在召回、补祖先、质量裁剪、上下文裁剪各阶段的数量。
+            "pipeline_counts": {
+                # direct_unique：各数据源合并去重后的直接召回数量。
+                "direct_unique": direct_unique_counts,
+                # direct_selected：每层第一次按融合分和候选上限筛选后的数量。
+                "direct_selected": candidate_data["direct_selected_counts"],
+                # ancestors_added：为保持树完整而补入的 Experience/Segment 数量。
+                "ancestors_added": candidate_data["completion_counts"],
+                # after_completion：补齐祖先后、质量上限裁剪前的三层数量。
+                "after_completion": candidate_data["counts_after_completion"],
+                # after_quality_pruning：按路径质量和分层上限裁剪后的数量。
+                "after_quality_pruning": candidate_data[
+                    "counts_after_quality_pruning"
+                ],
+                # submitted_to_llm：真正放入最终 candidate_tree 的三层数量。
+                "submitted_to_llm": prompt_counts,
+                # final_selected：LLM 或本地 fallback 最终返回的三层数量。
+                "final_selected": {
+                    "experience": len(experiences),
+                    "segment": len(segments),
+                    "qa": len(qas),
+                },
+            },
+            # candidate_limits：补祖先后的质量裁剪上限，不是最终 LLM top-k。
+            "candidate_limits": candidate_data["limits"],
+            # context_budget：只针对 candidate_tree 的 token 预算与裁剪结果。
+            "context_budget": {
+                "limit_tokens": tree_fit_debug["max_context_tokens"],
+                "tokens_before": tree_fit_debug["candidate_tokens_before_pruning"],
+                "tokens_after": tree_fit_debug[
+                    "candidate_tokens_after_summary_compression"
+                ],
+                "removed_experience_ids": tree_fit_debug[
+                    "removed_experience_ids"
+                ],
+                "summary_compressed": tree_fit_debug["summary_compressed"],
+                "overflow_unresolved": tree_fit_debug[
+                    "context_overflow_unresolved"
+                ],
+            },
+            # cache_hits：当前查询是否复用了 Experience/Segment 检索缓存。
+            "cache_hits": {
+                "experience": experience_cache_hit,
+                "segment": segment_cache_hit,
+            },
+            # llm_calls：本次层级 rerank 实际调用 LLM 的次数。
             "llm_calls": llm_calls,
         }
         logger.info(
             "检索结果：experience=%s/%s segment=%s/%s qa=%s/%s vectors=%s/%s/%s cache=%s/%s",
-            len(experiences), experience_count, len(segments), segment_count,
-            len(qas), qa_count, vector_counts["experience"],
-            vector_counts["segment"], vector_counts["qa"],
+            len(experiences), direct_unique_counts["experience"],
+            len(segments), direct_unique_counts["segment"],
+            len(qas), direct_unique_counts["qa"],
+            source_counts["experience"]["vector"],
+            source_counts["segment"]["vector"],
+            source_counts["qa"]["vector"],
             experience_cache_hit, segment_cache_hit,
         )
         if use_cache:
@@ -747,6 +816,20 @@ class HybridRetriever:
         text = str(value or "").lower()
         words = set("".join(char if char.isalnum() else " " for char in text).split())
         words = {word for word in words if len(word) > 1}
+        # 补充轻量英文词形归一化，使 move/moved、year/years 能互相命中。
+        normalized_words = set(words)
+        for word in words:
+            if word.endswith("ies") and len(word) > 4:
+                normalized_words.add(word[:-3] + "y")
+            elif word.endswith("s") and len(word) > 3:
+                normalized_words.add(word[:-1])
+            if word.endswith("ed") and len(word) > 4:
+                normalized_words.add(word[:-2])
+                normalized_words.add(word[:-1])
+            if word.endswith("ing") and len(word) > 5:
+                normalized_words.add(word[:-3])
+                normalized_words.add(word[:-3] + "e")
+        words = normalized_words
         chinese = [char for char in text if "\u4e00" <= char <= "\u9fff"]
         words.update(
             chinese[index] + chinese[index + 1]
@@ -775,34 +858,42 @@ class HybridRetriever:
             float(item.get("descendant_similarity") or 0.0) * 0.9,
         )
         keyword_score = float(item.get("keyword_score") or 0.0)
-        score = vector_similarity * 0.45 + keyword_score * 0.15
-        if str(item.get("topic") or "").strip() == str(topic or "").strip():
-            score += 0.15
-        if str(item.get("core_entity") or "").strip() == str(core_entity or "").strip():
-            score += 0.1
-
         item_intents = item.get("intents") or [item.get("intent")]
         normalized_intents = {str(value or "").strip() for value in item_intents}
-        if str(intent or "").strip() in normalized_intents:
-            score += 0.1
-
-        candidate_text = " ".join(
-            str(item.get(key) or "")
-            for key in (
-                "topic",
-                "core_entity",
-                "intents",
-                "intent",
-                "summary",
-                "user_input",
-                "assistant_output",
-                "entities",
+        structure_matches = [
+            float(
+                str(item.get("topic") or "").strip()
+                == str(topic or "").strip()
+            ),
+            float(
+                str(item.get("core_entity") or "").strip()
+                == str(core_entity or "").strip()
+            ),
+        ]
+        if str(intent or "").strip():
+            structure_matches.append(
+                float(str(intent or "").strip() in normalized_intents)
             )
+        structure_score = sum(structure_matches) / len(structure_matches)
+        item["_structure_score"] = clamp01(structure_score)
+        item["_vector_channel_score"] = (
+            clamp01(0.75 * vector_similarity + 0.25 * structure_score)
+            if vector_similarity > 0.0
+            else 0.0
         )
-        if not keyword_score:
-            score += self._lexical_overlap(query_text, candidate_text) * 0.15
+        item["_keyword_channel_score"] = (
+            clamp01(0.75 * keyword_score + 0.25 * structure_score)
+            if keyword_score > 0.0
+            else 0.0
+        )
+        # 两个召回通道各占 35%，topic/core_entity/intent 等权共享 30%。
+        score = (
+            vector_similarity * 0.35
+            + keyword_score * 0.35
+            + structure_score * 0.3
+        )
         if cached:
-            score += 0.05
+            score += 0.03
         return clamp01(score)
 
     def _rank_with_parent_coverage(
@@ -853,15 +944,8 @@ class HybridRetriever:
         limit: int,
         parent_field: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Keep explicit vector and keyword recall quotas, then fill by fusion score."""
-        combined = sorted(
-            items,
-            key=lambda item: (
-                float(item.get("_candidate_score") or 0.0),
-                str(item.get("updated_at") or item.get("timestamp") or ""),
-            ),
-            reverse=True,
-        )
+        """Fuse equal-weight vector/keyword ranks and keep quotas for both channels."""
+        del parent_field  # 父级多样性改在完整树裁剪时处理，避免候选分支膨胀。
         selected: list[dict[str, Any]] = []
         selected_ids: set[str] = set()
 
@@ -871,34 +955,63 @@ class HybridRetriever:
                 selected.append(item)
                 selected_ids.add(memory_id)
 
-        if parent_field:
-            seen_parents: set[str] = set()
-            for item in combined:
-                parent_id = str(item.get(parent_field) or "")
-                if parent_id in seen_parents:
-                    continue
-                add(item)
-                seen_parents.add(parent_id)
-
-        channel_quota = max(1, limit // 3)
         vector_ranked = sorted(
             (
                 item
                 for item in items
-                if float(item.get("vector_similarity") or 0.0) > 0.0
+                if float(item.get("_vector_channel_score") or 0.0) > 0.0
             ),
-            key=lambda item: float(item.get("vector_similarity") or 0.0),
+            key=lambda item: float(item.get("_vector_channel_score") or 0.0),
             reverse=True,
         )
         keyword_ranked = sorted(
             (
                 item
                 for item in items
-                if float(item.get("keyword_score") or 0.0) > 0.0
+                if float(item.get("_keyword_channel_score") or 0.0) > 0.0
             ),
-            key=lambda item: float(item.get("keyword_score") or 0.0),
+            key=lambda item: float(item.get("_keyword_channel_score") or 0.0),
             reverse=True,
         )
+        vector_ranks = {
+            str(item.get(id_field) or ""): rank
+            for rank, item in enumerate(vector_ranked, 1)
+        }
+        keyword_ranks = {
+            str(item.get(id_field) or ""): rank
+            for rank, item in enumerate(keyword_ranked, 1)
+        }
+        rrf_constant = 60.0
+        for item in items:
+            memory_id = str(item.get(id_field) or "")
+            vector_rank = vector_ranks.get(memory_id)
+            keyword_rank = keyword_ranks.get(memory_id)
+            vector_rrf = (
+                (rrf_constant + 1.0) / (rrf_constant + vector_rank)
+                if vector_rank is not None
+                else 0.0
+            )
+            keyword_rrf = (
+                (rrf_constant + 1.0) / (rrf_constant + keyword_rank)
+                if keyword_rank is not None
+                else 0.0
+            )
+            fusion_score = 0.5 * vector_rrf + 0.5 * keyword_rrf
+            item["_fusion_score"] = clamp01(fusion_score)
+            item["_candidate_score"] = clamp01(
+                0.75 * fusion_score
+                + 0.25 * float(item.get("_candidate_score") or 0.0)
+            )
+
+        combined = sorted(
+            items,
+            key=lambda item: (
+                float(item.get("_candidate_score") or 0.0),
+                str(item.get("updated_at") or item.get("timestamp") or ""),
+            ),
+            reverse=True,
+        )
+        channel_quota = max(1, limit // 3)
         for item in vector_ranked[:channel_quota]:
             add(item)
         for item in keyword_ranked[:channel_quota]:
@@ -912,6 +1025,43 @@ class HybridRetriever:
             reverse=True,
         )
 
+    def _structured_experience_rows(
+        self,
+        topic: str,
+        core_entity: str,
+        intent: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Recall Experiences by equal-weight topic/core_entity/intent matches."""
+        conditions: list[tuple[str, Any]] = []
+        if str(topic or "").strip():
+            conditions.append(("topic = ?", str(topic).strip()))
+        if str(core_entity or "").strip():
+            conditions.append(("core_entity = ?", str(core_entity).strip()))
+        if str(intent or "").strip():
+            conditions.append(("intents_link_json LIKE ?", f'%"{str(intent).strip()}"%'))
+        if not conditions:
+            return []
+        score_expression = " + ".join(
+            f"CASE WHEN {condition} THEN 1 ELSE 0 END"
+            for condition, _ in conditions
+        )
+        where_expression = " OR ".join(condition for condition, _ in conditions)
+        values = [value for _, value in conditions]
+        rows = self.storage.connection.execute(
+            f"""
+            SELECT experience_id, ({score_expression}) AS structure_score
+            FROM experience_memory
+            WHERE {where_expression}
+            ORDER BY structure_score DESC, updated_at DESC, created_at DESC
+            LIMIT ?
+            """,
+            (*values, *values, limit),
+        ).fetchall()
+        return self.storage.get_experiences(
+            [str(row["experience_id"]) for row in rows]
+        )
+
     def _keyword_experience_rows(
         self,
         topic: str,
@@ -920,40 +1070,12 @@ class HybridRetriever:
         query_text: str,
         limit: int,
     ) -> list[dict[str, Any]]:
-        ignored = {
-            "主题",
-            "核心实体",
-            "用户意图",
-            "相关实体",
-            "问题",
-            "topic",
-            "core",
-            "entity",
-            "intent",
-            "query",
-            "question",
-            "user",
-            "related",
-        }
-        terms: list[str] = []
-        for value in (topic, core_entity, intent):
-            term = str(value or "").strip()
-            if term and term not in terms:
-                terms.append(term)
-        lexical_terms = sorted(
-            (
-                term
-                for term in self._lexical_units(query_text)
-                if term not in ignored and 1 < len(term) <= 32
-            ),
-            key=lambda value: (len(value), value),
-            reverse=True,
+        # topic/core_entity/intent 由结构化通道处理，内容关键词通道只检索
+        # entities 和原始问题，避免一个常见人物名召回该人物的全部记忆。
+        terms = self._keyword_terms(
+            query_text,
+            excluded_values=(topic, core_entity, intent or ""),
         )
-        for term in lexical_terms:
-            if term not in terms:
-                terms.append(term)
-            if len(terms) >= 12:
-                break
         if not terms:
             return []
 
@@ -979,8 +1101,14 @@ class HybridRetriever:
         )
 
     def _candidate_keyword_score(
-        self, item: dict[str, Any], query_text: str
+        self,
+        item: dict[str, Any],
+        query_text: str,
+        topic: str = "",
+        core_entity: str = "",
+        intent: str | None = None,
     ) -> float:
+        """Content-keyword relevance; structure fields are scored separately."""
         candidate_text = " ".join(
             str(item.get(key) or "")
             for key in (
@@ -994,7 +1122,155 @@ class HybridRetriever:
                 "entities",
             )
         )
-        return clamp01(self._lexical_overlap(query_text, candidate_text))
+        content_terms = self._keyword_terms(
+            query_text,
+            excluded_values=(topic, core_entity, intent or ""),
+        )
+        if not content_terms:
+            return 0.0
+        return clamp01(
+            self._lexical_overlap(" ".join(content_terms), candidate_text)
+        )
+
+    def _keyword_terms(
+        self,
+        query_text: str,
+        limit: int = 12,
+        excluded_values: tuple[Any, ...] = (),
+    ) -> list[str]:
+        ignored = {
+            '主题', '核心实体', '用户意图', '相关实体', '问题',
+            'topic', 'core', 'entity', 'intent', 'query', 'question',
+            'user', 'related', 'what', 'when', 'where', 'who', 'why', 'how',
+            'did', 'does', 'do', 'is', 'are', 'was', 'were', 'the', 'a', 'an',
+            'of', 'to', 'from', 'in', 'on', 'for', 'with', 'about', 'this',
+            'that', 'it',
+        }
+        for value in excluded_values:
+            ignored.update(self._lexical_units(value))
+        return sorted(
+            (
+                term
+                for term in self._lexical_units(query_text)
+                if term not in ignored and 1 < len(term) <= 32
+            ),
+            key=lambda value: (len(value), value),
+            reverse=True,
+        )[:limit]
+
+    def _structured_child_rows(
+        self,
+        memory_type: str,
+        topic: str,
+        core_entity: str,
+        intent: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Recall child rows by equal-weight topic/core_entity/intent matches."""
+        specs = {
+            "segment": (
+                "segment_memory", "segment_id", "status != 'deleted'",
+                self.storage.get_segments,
+            ),
+            "qa": (
+                "qa_memory", "qa_id", "status = 'active'",
+                self.storage.get_qas,
+            ),
+        }
+        table, id_field, status_filter, loader = specs[memory_type]
+        field_values = [
+            ("topic", str(topic or "").strip()),
+            ("core_entity", str(core_entity or "").strip()),
+            ("intent", str(intent or "").strip()),
+        ]
+        field_values = [(field, value) for field, value in field_values if value]
+        if not field_values:
+            return []
+        score_expression = " + ".join(
+            f"CASE WHEN {field} = ? THEN 1 ELSE 0 END"
+            for field, _ in field_values
+        )
+        where_expression = " OR ".join(
+            f"{field} = ?" for field, _ in field_values
+        )
+        values = [value for _, value in field_values]
+        order_field = "timestamp" if memory_type == "qa" else "updated_at"
+        rows = self.storage.connection.execute(
+            f"""
+            SELECT {id_field}, ({score_expression}) AS structure_score
+            FROM {table}
+            WHERE {status_filter} AND ({where_expression})
+            ORDER BY structure_score DESC, {order_field} DESC
+            LIMIT ?
+            """,
+            (*values, *values, limit),
+        ).fetchall()
+        return loader([str(row[id_field]) for row in rows])
+
+    def _keyword_segment_rows(
+        self,
+        query_text: str,
+        limit: int,
+        topic: str = "",
+        core_entity: str = "",
+        intent: str | None = None,
+    ) -> list[dict[str, Any]]:
+        terms = self._keyword_terms(
+            query_text,
+            excluded_values=(topic, core_entity, intent or ""),
+        )
+        if not terms:
+            return []
+        searchable = (
+            '''COALESCE(topic, '') || ' ' || COALESCE(core_entity, '') || ' ' || '''
+            '''COALESCE(intent, '') || ' ' || COALESCE(summary, '')'''
+        )
+        where_clause = ' OR '.join(f'({searchable}) LIKE ?' for _ in terms)
+        rows = self.storage.connection.execute(
+            f'''
+            SELECT segment_id
+            FROM segment_memory
+            WHERE status != 'deleted' AND ({where_clause})
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT ?
+            ''',
+            (*[f'%{term}%' for term in terms], limit),
+        ).fetchall()
+        return self.storage.get_segments(
+            [str(row['segment_id']) for row in rows]
+        )
+
+    def _keyword_qa_rows(
+        self,
+        query_text: str,
+        limit: int,
+        topic: str = "",
+        core_entity: str = "",
+        intent: str | None = None,
+    ) -> list[dict[str, Any]]:
+        terms = self._keyword_terms(
+            query_text,
+            excluded_values=(topic, core_entity, intent or ""),
+        )
+        if not terms:
+            return []
+        searchable = (
+            '''COALESCE(topic, '') || ' ' || COALESCE(core_entity, '') || ' ' || '''
+            '''COALESCE(intent, '') || ' ' || COALESCE(user_input, '') || ' ' || '''
+            '''COALESCE(assistant_output, '') || ' ' || COALESCE(entities_json, '')'''
+        )
+        where_clause = ' OR '.join(f'({searchable}) LIKE ?' for _ in terms)
+        rows = self.storage.connection.execute(
+            f'''
+            SELECT qa_id
+            FROM qa_memory
+            WHERE status = 'active' AND ({where_clause})
+            ORDER BY timestamp DESC
+            LIMIT ?
+            ''',
+            (*[f'%{term}%' for term in terms], limit),
+        ).fetchall()
+        return self.storage.get_qas([str(row['qa_id']) for row in rows])
 
     def _collect_hierarchical_candidates(
         self,
@@ -1010,19 +1286,20 @@ class HybridRetriever:
         top_qa: int,
     ) -> dict[str, Any]:
         experience_limit = max(
+            self.min_prompt_experiences,
             top_experience,
-            int(config_get("retrieval", "experience_candidate_limit", 12)),
-            top_experience * 6,
+            int(config_get("retrieval", "experience_candidate_limit", 8)),
+            top_experience * 3,
         )
         segment_limit = max(
             top_segment,
-            int(config_get("retrieval", "segment_candidate_limit", 36)),
-            top_segment * 12,
+            int(config_get("retrieval", "segment_candidate_limit", 20)),
+            top_segment * 4,
         )
         qa_limit = max(
             top_qa,
-            int(config_get("retrieval", "qa_candidate_limit", 80)),
-            top_qa * 10,
+            int(config_get("retrieval", "qa_candidate_limit", 32)),
+            top_qa * 4,
         )
         cache_matches_experience = self._cache_same_experience(
             retrieval_cache, topic, core_entity
@@ -1041,9 +1318,9 @@ class HybridRetriever:
             else set()
         )
 
-        # Layer 1: Experience recall. Only this layer may define the parent scope.
+        # Layer 1: recall Experiences independently from child-layer candidates.
         experience_vectors = self._vector_candidates(
-            "experience", query_embedding, max(20, experience_limit * 4)
+            "experience", query_embedding, max(12, experience_limit * 2)
         )
         experience_rows: dict[str, dict[str, Any]] = {}
 
@@ -1051,18 +1328,36 @@ class HybridRetriever:
             if row and row.get("experience_id"):
                 experience_rows[str(row["experience_id"])] = row
 
-        structured_limit = max(experience_limit * 2, 20)
-        for row in self.storage.find_experiences(topic, core_entity, structured_limit):
-            add_experience(row)
-        for row in self.storage.list_experiences_by_topic(topic, structured_limit):
-            add_experience(row)
-        for row in self._keyword_experience_rows(
+        structured_limit = max(experience_limit * 2, 12)
+        exact_experience_rows = self.storage.find_experiences(
+            topic, core_entity, structured_limit
+        )
+        topic_experience_rows = self.storage.list_experiences_by_topic(
+            topic, structured_limit
+        )
+        structured_experience_rows = self._structured_experience_rows(
+            topic, core_entity, intent, structured_limit
+        )
+        keyword_experience_rows = self._keyword_experience_rows(
             topic, core_entity, intent, keyword_query_text, structured_limit
-        ):
+        )
+        vector_experience_rows = self.storage.get_experiences(
+            list(experience_vectors)
+        )
+        cached_experience_rows = self.storage.get_experiences(
+            list(cached_experience_ids)
+        )
+        for row in exact_experience_rows:
             add_experience(row)
-        for row in self.storage.get_experiences(list(experience_vectors)):
+        for row in topic_experience_rows:
             add_experience(row)
-        for row in self.storage.get_experiences(list(cached_experience_ids)):
+        for row in structured_experience_rows:
+            add_experience(row)
+        for row in keyword_experience_rows:
+            add_experience(row)
+        for row in vector_experience_rows:
+            add_experience(row)
+        for row in cached_experience_rows:
             add_experience(row)
 
         prepared_experiences: list[dict[str, Any]] = []
@@ -1070,7 +1365,7 @@ class HybridRetriever:
             item = self._prepare_experience(row, set(experience_vectors))
             item["vector_similarity"] = experience_vectors.get(experience_id, 0.0)
             item["keyword_score"] = self._candidate_keyword_score(
-                item, keyword_query_text
+                item, keyword_query_text, topic, core_entity, intent
             )
             item["keyword_recalled"] = item["keyword_score"] > 0.0
             item["_candidate_score"] = self._score_candidate(
@@ -1086,31 +1381,65 @@ class HybridRetriever:
         prepared_experiences = self._rank_hybrid_candidates(
             prepared_experiences, "experience_id", experience_limit
         )
-        selected_experience_ids = {
-            item["experience_id"] for item in prepared_experiences
-        }
-
-        # Layer 2: Segment recall is strictly limited to selected Experiences.
-        segment_rows = self.storage.list_segments_by_experience_ids(
-            list(selected_experience_ids)
+        for item in prepared_experiences:
+            item["_direct_recalled"] = True
+        logger.info(
+            "Experience candidate sources: exact=%s topic=%s structured=%s keyword=%s "
+            "vector=%s cache=%s deduplicated=%s selected=%s",
+            len(exact_experience_rows),
+            len(topic_experience_rows),
+            len(structured_experience_rows),
+            len(keyword_experience_rows),
+            len(vector_experience_rows),
+            len(cached_experience_rows),
+            raw_experience_count,
+            len(prepared_experiences),
         )
-        allowed_segment_ids = {
-            str(row["segment_id"]) for row in segment_rows if row.get("segment_id")
-        }
+
+        # Layer 2: recall Segments globally. Parent Experiences are completed later.
         segment_vectors = self._vector_candidates(
             "segment",
             query_embedding,
-            max(20, segment_limit * 4),
-            allowed_ids=allowed_segment_ids,
-            min_allowed=min(segment_limit, len(allowed_segment_ids)),
+            max(20, segment_limit * 2),
         )
+        segment_rows_by_id: dict[str, dict[str, Any]] = {}
+
+        def add_segment(row: dict[str, Any] | None) -> None:
+            if (
+                row
+                and row.get("segment_id")
+                and row.get("status") != "deleted"
+            ):
+                segment_rows_by_id[str(row["segment_id"])] = row
+
+        structured_segment_rows = self._structured_child_rows(
+            "segment", topic, core_entity, intent, segment_limit * 2
+        )
+        keyword_segment_rows = self._keyword_segment_rows(
+            keyword_query_text,
+            segment_limit * 2,
+            topic,
+            core_entity,
+            intent,
+        )
+        vector_segment_rows = self.storage.get_segments(list(segment_vectors))
+        cached_segment_rows = self.storage.get_segments(list(cached_segment_ids))
+        for row in structured_segment_rows:
+            add_segment(row)
+        for row in keyword_segment_rows:
+            add_segment(row)
+        for row in vector_segment_rows:
+            add_segment(row)
+        for row in cached_segment_rows:
+            add_segment(row)
+
         prepared_segments: list[dict[str, Any]] = []
-        for row in segment_rows:
+        for row in segment_rows_by_id.values():
             segment_id = str(row["segment_id"])
             item = self._prepare_segment(row, set(segment_vectors))
             item["vector_similarity"] = segment_vectors.get(segment_id, 0.0)
             item["keyword_score"] = self._candidate_keyword_score(
-                item, keyword_query_text
+                item, keyword_query_text, topic, core_entity, intent
             )
             item["keyword_recalled"] = item["keyword_score"] > 0.0
             item["_candidate_score"] = self._score_candidate(
@@ -1121,6 +1450,7 @@ class HybridRetriever:
                 keyword_query_text,
                 segment_id in cached_segment_ids,
             )
+            item["_direct_recalled"] = True
             prepared_segments.append(item)
         raw_segment_count = len(prepared_segments)
         prepared_segments = self._rank_hybrid_candidates(
@@ -1129,63 +1459,361 @@ class HybridRetriever:
             segment_limit,
             "experience_id",
         )
-        selected_segment_ids = {item["segment_id"] for item in prepared_segments}
-
-        # Layer 3: QA recall is strictly limited to selected Segments.
-        qa_rows = self.storage.list_qas_by_segment_ids(list(selected_segment_ids))
-        allowed_qa_ids = {
-            str(row["qa_id"]) for row in qa_rows if row.get("qa_id")
-        }
+        logger.info(
+            "Segment candidate sources: structured=%s keyword=%s vector=%s cache=%s "
+            "deduplicated=%s selected=%s",
+            len(structured_segment_rows),
+            len(keyword_segment_rows),
+            len(vector_segment_rows),
+            len(cached_segment_rows),
+            raw_segment_count,
+            len(prepared_segments),
+        )
+        # Layer 3: recall QAs globally. Segment and Experience ancestors are
+        # completed after the direct candidates have been capped.
         qa_vectors = self._vector_candidates(
             "qa",
             query_embedding,
-            max(20, qa_limit * 4),
-            allowed_ids=allowed_qa_ids,
-            min_allowed=min(qa_limit, len(allowed_qa_ids)),
+            max(20, qa_limit * 2),
         )
+        qa_rows_by_id: dict[str, dict[str, Any]] = {}
+
+        def add_qa(row: dict[str, Any] | None) -> None:
+            if row and row.get("qa_id") and row.get("status") == "active":
+                qa_rows_by_id[str(row["qa_id"])] = row
+
+        structured_qa_rows = self._structured_child_rows(
+            "qa", topic, core_entity, intent, qa_limit * 2
+        )
+        keyword_qa_rows = self._keyword_qa_rows(
+            keyword_query_text,
+            qa_limit * 2,
+            topic,
+            core_entity,
+            intent,
+        )
+        vector_qa_rows = self.storage.get_qas(list(qa_vectors))
+        for row in structured_qa_rows:
+            add_qa(row)
+        for row in keyword_qa_rows:
+            add_qa(row)
+        for row in vector_qa_rows:
+            add_qa(row)
+
         prepared_qas: list[dict[str, Any]] = []
-        for row in qa_rows:
+        for row in qa_rows_by_id.values():
             qa_id = str(row["qa_id"])
             item = self._prepare_qa(row, set(qa_vectors))
             item["vector_similarity"] = qa_vectors.get(qa_id, 0.0)
             item["keyword_score"] = self._candidate_keyword_score(
-                item, keyword_query_text
+                item, keyword_query_text, topic, core_entity, intent
             )
             item["keyword_recalled"] = item["keyword_score"] > 0.0
             item["_candidate_score"] = self._score_candidate(
                 item, topic, core_entity, intent, keyword_query_text
             )
+            item["_direct_recalled"] = True
             prepared_qas.append(item)
         raw_qa_count = len(prepared_qas)
         prepared_qas = self._rank_hybrid_candidates(
             prepared_qas, "qa_id", qa_limit, "segment_id"
         )
+        logger.info(
+            "QA candidate sources: structured=%s keyword=%s vector=%s "
+            "deduplicated=%s selected=%s",
+            len(structured_qa_rows),
+            len(keyword_qa_rows),
+            len(vector_qa_rows),
+            raw_qa_count,
+            len(prepared_qas),
+        )
+
+        prepared_experiences, prepared_segments, prepared_qas = (
+            self._complete_candidate_ancestry(
+                experiences=prepared_experiences,
+                segments=prepared_segments,
+                qas=prepared_qas,
+                experience_vectors=experience_vectors,
+                segment_vectors=segment_vectors,
+                cached_experience_ids=cached_experience_ids,
+                cached_segment_ids=cached_segment_ids,
+                topic=topic,
+                core_entity=core_entity,
+                intent=intent,
+                keyword_query_text=keyword_query_text,
+            )
+        )
+        counts_after_completion = {
+            "experience": len(prepared_experiences),
+            "segment": len(prepared_segments),
+            "qa": len(prepared_qas),
+        }
+        completion_counts = {
+            "experience": sum(
+                bool(item.get("_ancestor_completed"))
+                for item in prepared_experiences
+            ),
+            "segment": sum(
+                bool(item.get("_ancestor_completed"))
+                for item in prepared_segments
+            ),
+        }
+        prepared_experiences, prepared_segments, prepared_qas = (
+            self._prune_completed_candidates(
+                prepared_experiences,
+                prepared_segments,
+                prepared_qas,
+                experience_limit,
+                segment_limit,
+                qa_limit,
+            )
+        )
+        counts_after_quality_pruning = {
+            "experience": len(prepared_experiences),
+            "segment": len(prepared_segments),
+            "qa": len(prepared_qas),
+        }
 
         return {
             "experiences": prepared_experiences,
             "segments": prepared_segments,
             "qas": prepared_qas,
-            "raw_counts": {
+            "direct_unique_counts": {
                 "experience": raw_experience_count,
                 "segment": raw_segment_count,
                 "qa": raw_qa_count,
             },
-            "vector_counts": {
-                "experience": len(experience_vectors),
-                "segment": len(segment_vectors),
-                "qa": len(qa_vectors),
+            "direct_selected_counts": {
+                "experience": min(raw_experience_count, experience_limit),
+                "segment": min(raw_segment_count, segment_limit),
+                "qa": min(raw_qa_count, qa_limit),
             },
-            "keyword_counts": {
-                "experience": sum(
-                    bool(item.get("keyword_recalled"))
-                    for item in prepared_experiences
-                ),
-                "segment": sum(
-                    bool(item.get("keyword_recalled")) for item in prepared_segments
-                ),
-                "qa": sum(bool(item.get("keyword_recalled")) for item in prepared_qas),
+            "source_counts": {
+                "experience": {
+                    "exact": len(exact_experience_rows),
+                    "topic": len(topic_experience_rows),
+                    "structured": len(structured_experience_rows),
+                    "keyword": len(keyword_experience_rows),
+                    "vector": len(vector_experience_rows),
+                    "cache": len(cached_experience_rows),
+                },
+                "segment": {
+                    "structured": len(structured_segment_rows),
+                    "keyword": len(keyword_segment_rows),
+                    "vector": len(vector_segment_rows),
+                    "cache": len(cached_segment_rows),
+                },
+                "qa": {
+                    "structured": len(structured_qa_rows),
+                    "keyword": len(keyword_qa_rows),
+                    "vector": len(vector_qa_rows),
+                },
+            },
+            "completion_counts": completion_counts,
+            "counts_after_completion": counts_after_completion,
+            "counts_after_quality_pruning": counts_after_quality_pruning,
+            "limits": {
+                "experience": experience_limit,
+                "segment": segment_limit,
+                "qa": qa_limit,
             },
         }
+
+    def _complete_candidate_ancestry(
+        self,
+        *,
+        experiences: list[dict[str, Any]],
+        segments: list[dict[str, Any]],
+        qas: list[dict[str, Any]],
+        experience_vectors: dict[str, float],
+        segment_vectors: dict[str, float],
+        cached_experience_ids: set[str],
+        cached_segment_ids: set[str],
+        topic: str,
+        core_entity: str,
+        intent: str | None,
+        keyword_query_text: str,
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        '''Complete every recalled QA/Segment path up to its real Experience.'''
+        experience_by_id = {
+            str(item['experience_id']): item for item in experiences
+        }
+        segment_by_id = {str(item['segment_id']): item for item in segments}
+
+        missing_segment_ids = {
+            str(qa.get('segment_id') or '')
+            for qa in qas
+            if str(qa.get('segment_id') or '') not in segment_by_id
+        }
+        missing_segment_ids.discard('')
+        for row in self.storage.get_segments(list(missing_segment_ids)):
+            if row.get('status') == 'deleted':
+                continue
+            segment_id = str(row['segment_id'])
+            item = self._prepare_segment(row, set(segment_vectors))
+            item['vector_similarity'] = segment_vectors.get(segment_id, 0.0)
+            item['keyword_score'] = self._candidate_keyword_score(
+                item, keyword_query_text, topic, core_entity, intent
+            )
+            item['keyword_recalled'] = item['keyword_score'] > 0.0
+            item['_candidate_score'] = self._score_candidate(
+                item,
+                topic,
+                core_entity,
+                intent,
+                keyword_query_text,
+                segment_id in cached_segment_ids,
+            )
+            item['_direct_recalled'] = False
+            item['_ancestor_completed'] = True
+            segment_by_id[segment_id] = item
+
+        missing_experience_ids = {
+            str(segment.get('experience_id') or '')
+            for segment in segment_by_id.values()
+            if str(segment.get('experience_id') or '') not in experience_by_id
+        }
+        missing_experience_ids.discard('')
+        for row in self.storage.get_experiences(list(missing_experience_ids)):
+            experience_id = str(row['experience_id'])
+            item = self._prepare_experience(row, set(experience_vectors))
+            item['vector_similarity'] = experience_vectors.get(experience_id, 0.0)
+            item['keyword_score'] = self._candidate_keyword_score(
+                item, keyword_query_text, topic, core_entity, intent
+            )
+            item['keyword_recalled'] = item['keyword_score'] > 0.0
+            item['_candidate_score'] = self._score_candidate(
+                item,
+                topic,
+                core_entity,
+                intent,
+                keyword_query_text,
+                experience_id in cached_experience_ids,
+            )
+            item['_direct_recalled'] = False
+            item['_ancestor_completed'] = True
+            experience_by_id[experience_id] = item
+
+        valid_experience_ids = set(experience_by_id)
+        valid_segments = [
+            item
+            for item in segment_by_id.values()
+            if str(item.get('experience_id') or '') in valid_experience_ids
+        ]
+        valid_segment_ids = {
+            str(item['segment_id']) for item in valid_segments
+        }
+        valid_qas = [
+            item
+            for item in qas
+            if str(item.get('segment_id') or '') in valid_segment_ids
+        ]
+        return (
+            sorted(
+                experience_by_id.values(),
+                key=lambda item: float(item.get('_candidate_score') or 0.0),
+                reverse=True,
+            ),
+            sorted(
+                valid_segments,
+                key=lambda item: float(item.get('_candidate_score') or 0.0),
+                reverse=True,
+            ),
+            valid_qas,
+        )
+
+    def _prune_completed_candidates(
+        self,
+        experiences: list[dict[str, Any]],
+        segments: list[dict[str, Any]],
+        qas: list[dict[str, Any]],
+        experience_limit: int,
+        segment_limit: int,
+        qa_limit: int,
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        """Apply quality limits after ancestry completion without breaking paths."""
+        qas_by_segment: dict[str, list[dict[str, Any]]] = {}
+        segments_by_experience: dict[str, list[dict[str, Any]]] = {}
+        for qa in qas:
+            qas_by_segment.setdefault(str(qa["segment_id"]), []).append(qa)
+        for segment in segments:
+            segments_by_experience.setdefault(
+                str(segment["experience_id"]), []
+            ).append(segment)
+
+        def segment_path_score(segment: dict[str, Any]) -> float:
+            return clamp01(
+                0.7 * max(
+                    (
+                        float(qa.get("_candidate_score") or 0.0)
+                        for qa in qas_by_segment.get(
+                            str(segment["segment_id"]), []
+                        )
+                    ),
+                    default=0.0,
+                )
+                + 0.3 * float(segment.get("_candidate_score") or 0.0)
+            )
+
+        def experience_branch_score(experience: dict[str, Any]) -> float:
+            branch_segments = segments_by_experience.get(
+                str(experience["experience_id"]), []
+            )
+            return clamp01(
+                0.6 * max(
+                    (
+                        float(qa.get("_candidate_score") or 0.0)
+                        for segment in branch_segments
+                        for qa in qas_by_segment.get(
+                            str(segment["segment_id"]), []
+                        )
+                    ),
+                    default=0.0,
+                )
+                + 0.3 * max(
+                    (segment_path_score(segment) for segment in branch_segments),
+                    default=0.0,
+                )
+                + 0.1 * float(experience.get("_candidate_score") or 0.0)
+            )
+
+        selected_experiences = sorted(
+            experiences, key=experience_branch_score, reverse=True
+        )[:experience_limit]
+        selected_experience_ids = {
+            str(item["experience_id"]) for item in selected_experiences
+        }
+        selected_segments = sorted(
+            (
+                item
+                for item in segments
+                if str(item.get("experience_id") or "")
+                in selected_experience_ids
+            ),
+            key=segment_path_score,
+            reverse=True,
+        )[:segment_limit]
+        selected_segment_ids = {
+            str(item["segment_id"]) for item in selected_segments
+        }
+        selected_qas = sorted(
+            (
+                item
+                for item in qas
+                if str(item.get("segment_id") or "") in selected_segment_ids
+            ),
+            key=lambda item: float(item.get("_candidate_score") or 0.0),
+            reverse=True,
+        )[:qa_limit]
+        return selected_experiences, selected_segments, selected_qas
 
     def _build_prompt_candidate_tree(
         self, candidate_data: dict[str, Any]
@@ -1206,7 +1834,7 @@ class HybridRetriever:
                 "topic": experience.get("topic", ""),
                 "core_entity": experience.get("core_entity", ""),
                 "intents": experience.get("intents", []),
-                "summary": self._truncate_for_prompt(experience.get("summary"), 500),
+                "summary": str(experience.get("summary") or ""),
                 "state": self._truncate_for_prompt(
                     json.dumps(experience.get("state") or {}, ensure_ascii=False), 300
                 ),
@@ -1227,7 +1855,7 @@ class HybridRetriever:
                 segment_node = {
                     "id": segment["segment_id"],
                     "intent": segment.get("intent", ""),
-                    "summary": self._truncate_for_prompt(segment.get("summary"), 350),
+                    "summary": str(segment.get("summary") or ""),
                     "vector_similarity": round(
                         float(segment.get("vector_similarity") or 0.0), 4
                     ),
@@ -1264,6 +1892,218 @@ class HybridRetriever:
                 experience_node["segments"].append(segment_node)
             tree.append(experience_node)
         return tree
+
+    def _serialize_candidate_tree(self, candidate_tree: list[dict[str, Any]]) -> str:
+        return json.dumps(
+            candidate_tree, ensure_ascii=False, separators=(',', ':')
+        )
+
+    def _count_candidate_tree_tokens(
+        self, candidate_tree: list[dict[str, Any]]
+    ) -> int:
+        text = self._serialize_candidate_tree(candidate_tree)
+        if not self._token_encoder_initialized:
+            self._token_encoder_initialized = True
+            try:
+                import tiktoken
+
+                self._token_encoder = tiktoken.get_encoding(self.token_encoding)
+            except Exception:
+                self._token_encoder = None
+                logger.warning(
+                    'Tokenizer %s is unavailable; using conservative UTF-8 estimate',
+                    self.token_encoding,
+                )
+        if self._token_encoder is not None:
+            return len(self._token_encoder.encode(text))
+        return max(
+            math.ceil(len(text) / 3),
+            math.ceil(len(text.encode('utf-8')) / 3),
+        )
+
+    def _experience_branch_score(self, experience: dict[str, Any]) -> float:
+        segments = experience.get('segments') or []
+        segment_scores = [
+            float(segment.get('local_score') or 0.0) for segment in segments
+        ]
+        qa_scores = [
+            float(qa.get('local_score') or 0.0)
+            for segment in segments
+            for qa in segment.get('qas') or []
+        ]
+        experience_score = float(experience.get('local_score') or 0.0)
+        return clamp01(
+            0.6 * max(qa_scores, default=0.0)
+            + 0.3 * max(segment_scores, default=0.0)
+            + 0.1 * experience_score
+        )
+
+    def _extract_summary_sections(
+        self, summary: Any, headers: tuple[str, ...]
+    ) -> dict[str, str]:
+        text = str(summary or '').strip()
+        if not text:
+            return {}
+        header_pattern = '|'.join(re.escape(header) for header in headers)
+        matches = list(re.finditer(
+            rf'(?m)^\s*({header_pattern})\s*[：:]\s*', text
+        ))
+        sections: dict[str, str] = {}
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            sections[match.group(1)] = text[match.end():end].strip()
+        return sections
+
+    def _retain_summary_sections(
+        self,
+        summary: Any,
+        all_headers: tuple[str, ...],
+        retained_headers: tuple[str, ...],
+    ) -> tuple[str, bool]:
+        original = str(summary or '').strip()
+        sections = self._extract_summary_sections(original, all_headers)
+        if not sections:
+            return original, False
+        rendered = [
+            f'{header}：{sections[header]}'
+            for header in retained_headers
+            if header in sections
+        ]
+        return '\n\n'.join(rendered), True
+
+    def _compress_tree_summaries(
+        self, candidate_tree: list[dict[str, Any]]
+    ) -> dict[str, int]:
+        stats = {
+            'compressed_experience_summaries': 0,
+            'compressed_segment_summaries': 0,
+            'unstructured_summary_count': 0,
+        }
+        experience_headers = (
+            '目标', '总体状态', '阶段总结', '当前推进', '长期信息', '下一步'
+        )
+        segment_headers = ('阶段概述', '关键过程', '阶段结论', '关键事实')
+        for experience in candidate_tree:
+            compressed, structured = self._retain_summary_sections(
+                experience.get('summary'),
+                experience_headers,
+                ('阶段总结', '长期信息'),
+            )
+            if structured:
+                if compressed != str(experience.get('summary') or '').strip():
+                    stats['compressed_experience_summaries'] += 1
+                experience['summary'] = compressed
+            elif experience.get('summary'):
+                stats['unstructured_summary_count'] += 1
+
+            for segment in experience.get('segments') or []:
+                compressed, structured = self._retain_summary_sections(
+                    segment.get('summary'),
+                    segment_headers,
+                    ('关键过程', '阶段结论', '关键事实'),
+                )
+                if structured:
+                    if compressed != str(segment.get('summary') or '').strip():
+                        stats['compressed_segment_summaries'] += 1
+                    segment['summary'] = compressed
+                elif segment.get('summary'):
+                    stats['unstructured_summary_count'] += 1
+        return stats
+
+    def _shrink_structured_summary(self, summary: str) -> str:
+        headers = ('阶段总结', '长期信息', '关键过程', '阶段结论', '关键事实')
+        sections = self._extract_summary_sections(summary, headers)
+        if not sections:
+            if len(summary) <= 96:
+                return summary
+            return self._truncate_for_prompt(summary, max(96, int(len(summary) * 0.8)))
+        changed = False
+        rendered: list[str] = []
+        for header, body in sections.items():
+            target = max(32, int(len(body) * 0.8))
+            if len(body) > target:
+                body = self._truncate_for_prompt(body, target)
+                changed = True
+            rendered.append(f'{header}：{body}')
+        return '\n\n'.join(rendered) if changed else summary
+
+    def _shrink_summaries_to_budget(
+        self, candidate_tree: list[dict[str, Any]]
+    ) -> None:
+        for _ in range(24):
+            if self._count_candidate_tree_tokens(candidate_tree) <= self.max_context_tokens:
+                return
+            nodes = [
+                node
+                for experience in candidate_tree
+                for node in [experience, *(experience.get('segments') or [])]
+                if node.get('summary')
+            ]
+            nodes.sort(key=lambda node: len(str(node.get('summary') or '')), reverse=True)
+            changed = False
+            for node in nodes:
+                original = str(node.get('summary') or '')
+                shrunk = self._shrink_structured_summary(original)
+                if shrunk != original:
+                    node['summary'] = shrunk
+                    changed = True
+                    break
+            if not changed:
+                return
+
+    def _fit_candidate_tree_to_context(
+        self, candidate_tree: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        fitted_tree = deepcopy(candidate_tree)
+        fitted_tree.sort(key=self._experience_branch_score, reverse=True)
+        for experience in fitted_tree:
+            experience['segments'].sort(
+                key=lambda segment: float(segment.get('local_score') or 0.0),
+                reverse=True,
+            )
+            for segment in experience.get('segments') or []:
+                segment['qas'].sort(
+                    key=lambda qa: float(qa.get('local_score') or 0.0),
+                    reverse=True,
+                )
+
+        tokens_before = self._count_candidate_tree_tokens(fitted_tree)
+        minimum = max(1, min(self.min_prompt_experiences, len(fitted_tree)))
+        removed_experience_ids: list[str] = []
+        while (
+            self._count_candidate_tree_tokens(fitted_tree) > self.max_context_tokens
+            and len(fitted_tree) > minimum
+        ):
+            removed = fitted_tree.pop()
+            removed_experience_ids.append(str(removed.get('id') or ''))
+
+        tokens_after_pruning = self._count_candidate_tree_tokens(fitted_tree)
+        compression_stats = {
+            'compressed_experience_summaries': 0,
+            'compressed_segment_summaries': 0,
+            'unstructured_summary_count': 0,
+        }
+        summary_compressed = tokens_after_pruning > self.max_context_tokens
+        if summary_compressed:
+            compression_stats = self._compress_tree_summaries(fitted_tree)
+            self._shrink_summaries_to_budget(fitted_tree)
+        tokens_after_compression = self._count_candidate_tree_tokens(fitted_tree)
+
+        debug = {
+            'candidate_tokens_before_pruning': tokens_before,
+            'candidate_tokens_after_branch_pruning': tokens_after_pruning,
+            'candidate_tokens_after_summary_compression': tokens_after_compression,
+            'max_context_tokens': self.max_context_tokens,
+            'min_prompt_experiences': self.min_prompt_experiences,
+            'removed_experience_ids': removed_experience_ids,
+            'prompt_experiences_after_pruning': len(fitted_tree),
+            'summary_compressed': summary_compressed,
+            'context_overflow_unresolved': (
+                tokens_after_compression > self.max_context_tokens
+            ),
+            **compression_stats,
+        }
+        return fitted_tree, debug
 
     def _public_candidate(self, item: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -1365,19 +2205,74 @@ class HybridRetriever:
         top_segment: int,
         top_qa: int,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-        experience_items = candidate_data["experiences"][:top_experience]
+        qas_by_segment: dict[str, list[dict[str, Any]]] = {}
+        segments_by_experience: dict[str, list[dict[str, Any]]] = {}
+        for qa in candidate_data["qas"]:
+            qas_by_segment.setdefault(str(qa["segment_id"]), []).append(qa)
+        for segment in candidate_data["segments"]:
+            segments_by_experience.setdefault(
+                str(segment["experience_id"]), []
+            ).append(segment)
+
+        def segment_path_score(segment: dict[str, Any]) -> float:
+            qa_score = max(
+                (
+                    float(qa.get("_candidate_score") or 0.0)
+                    for qa in qas_by_segment.get(str(segment["segment_id"]), [])
+                ),
+                default=0.0,
+            )
+            return clamp01(
+                0.7 * qa_score
+                + 0.3 * float(segment.get("_candidate_score") or 0.0)
+            )
+
+        def experience_branch_score(experience: dict[str, Any]) -> float:
+            branch_segments = segments_by_experience.get(
+                str(experience["experience_id"]), []
+            )
+            qa_score = max(
+                (
+                    float(qa.get("_candidate_score") or 0.0)
+                    for segment in branch_segments
+                    for qa in qas_by_segment.get(str(segment["segment_id"]), [])
+                ),
+                default=0.0,
+            )
+            return clamp01(
+                0.6 * qa_score
+                + 0.3 * max(
+                    (segment_path_score(segment) for segment in branch_segments),
+                    default=0.0,
+                )
+                + 0.1 * float(experience.get("_candidate_score") or 0.0)
+            )
+
+        experience_items = sorted(
+            candidate_data["experiences"],
+            key=experience_branch_score,
+            reverse=True,
+        )[:top_experience]
         experience_ids = {item["experience_id"] for item in experience_items}
-        segment_items = [
-            item
-            for item in candidate_data["segments"]
-            if item.get("experience_id") in experience_ids
-        ][:top_segment]
+        segment_items = sorted(
+            (
+                item
+                for item in candidate_data["segments"]
+                if item.get("experience_id") in experience_ids
+            ),
+            key=segment_path_score,
+            reverse=True,
+        )[:top_segment]
         segment_ids = {item["segment_id"] for item in segment_items}
-        qa_items = [
-            item
-            for item in candidate_data["qas"]
-            if item.get("segment_id") in segment_ids
-        ][:top_qa]
+        qa_items = sorted(
+            (
+                item
+                for item in candidate_data["qas"]
+                if item.get("segment_id") in segment_ids
+            ),
+            key=lambda item: float(item.get("_candidate_score") or 0.0),
+            reverse=True,
+        )[:top_qa]
 
         def fallback_item(item: dict[str, Any]) -> dict[str, Any]:
             result = self._public_candidate(item)

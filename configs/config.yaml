@@ -33,6 +33,9 @@ retrieval:
   top_experience: 2
   top_segment: 3
   top_qa: 8
+  max_context_tokens: 30000
+  min_prompt_experiences: 6
+  token_encoding: cl100k_base
 
 summarization:
   api_key: "sk-RFUNAF0b6zfJWCVz9dA1Aa244aEa43Dc974693370b8d4338"

@@ -12,8 +12,14 @@ from memory.config import config_path
 from memory.retriever import HybridRetriever
 from memory.storage import MemoryStorage
 from memory.embedder import BailianEmbedder
+from memory.vector_store import ChromaVectorStore
 
+import logging
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
 
 
 def load_query(storage):
@@ -41,8 +47,12 @@ if __name__ == "__main__":
     storage = MemoryStorage(config_path("paths", "memory_db"))
     try:
         # query = load_query(storage)
+        vector_store = ChromaVectorStore(
+            persist_path=config_path("paths", "chroma")
+        )
         retriever = HybridRetriever(
             storage=storage,
+            vector_store=vector_store,
             embedder=BailianEmbedder()
         )
 
@@ -50,12 +60,14 @@ if __name__ == "__main__":
         result = retriever.recall(
             topic='人物经历',
             core_entity='Caroline',
-            intent='时间查询',
-            entities='',
-            query='When did Caroline go to the LGBTQ support group?',
-            top_experience=1,
-            top_segment=1,
-            top_qa=1,
+            intent='查询',
+            entities= [
+                        "Caroline",
+                        "4年前",
+                        "搬迁",
+                        "来源地"
+                    ],
+            query='Where did Caroline move from 4 years ago?',
             state_key="test_retriever",
             use_cache=False,
         )
