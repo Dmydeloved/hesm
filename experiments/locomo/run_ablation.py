@@ -1,14 +1,15 @@
 """
-Part 2 — Ablation Study: evaluate 4 HESM retrieval variants.
+Part 2 — Ablation Study: evaluate 5 HESM retrieval variants.
 
 Variants:
   flat_memory  — raw turn vectors, no TopicExtractor (independent ChromaDB)
   qa_only      — HESM QA vector layer only
   qa_segment   — HESM QA + Segment layers merged
+  full_hesm_no_reranker — full hierarchy without LLM reranking
   full_hesm    — full HybridRetriever.recall() (3-layer)
 
-The last 3 variants READ the HESM storage built in Part 1 (run_main.py).
-Run Part 1 first (or at least enable the 'hesm' method) before running ablation.
+The last 4 variants reuse HESM storage built in Part 1. When it is missing,
+run_ablation builds the shared storage automatically.
 
 Usage (from d:/code/hesm):
     python -m experiments.locomo.run_ablation
@@ -51,7 +52,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_ALL_VARIANTS = ["flat_memory", "qa_only", "qa_segment", "full_hesm"]
+_ALL_VARIANTS = [
+    "flat_memory",
+    "qa_only",
+    "qa_segment",
+    "full_hesm_no_reranker",
+    "full_hesm",
+]
 
 
 def run_ablation(
@@ -72,8 +79,9 @@ def run_ablation(
     answers_dir = _PROJECT_ROOT / exp_cfg["output"]["answers"]
     metrics_dir = _PROJECT_ROOT / exp_cfg["output"]["metrics"]
     tables_dir  = _PROJECT_ROOT / exp_cfg["output"]["tables"]
+    logs_dir = _PROJECT_ROOT / exp_cfg["output"].get("logs", "outputs/locomo/logs")
     memory_root = _PROJECT_ROOT / exp_cfg["output"]["memory"]
-    for d in (answers_dir, metrics_dir, tables_dir):
+    for d in (answers_dir, metrics_dir, tables_dir, logs_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     max_conv = max_conversations or exp_cfg.get("experiment", {}).get("max_conversations")
@@ -108,6 +116,7 @@ def run_ablation(
             judge=judge,
             output_dir=answers_dir,
             metrics_dir=metrics_dir,
+            logs_dir=logs_dir,
             top_k_values=top_k_values,
             token_encoding=token_encoding,
         )

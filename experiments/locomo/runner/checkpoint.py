@@ -27,7 +27,13 @@ QARecord schema (written by runner, read by aggregator):
   "f1": float,
   "f1_precision": float,
   "f1_recall": float,
-  "judge_score": int,            # 0/1/2 or -1 on failure
+  "judge_score": int,            # 0/1 or -1 on failure
+  "query_status": str,            # success | failed
+  "stage_status": {               # retrieval / answer / judge details
+    "retrieval": {"status": "success" | "failed", ...},
+    "answer": {"status": "success" | "failed" | "skipped", ...},
+    "judge": {"status": "success" | "failed" | "skipped", ...}
+  },
   "retrieval_metrics": {         # keyed by str(K)
     "1": {"recall": ..., "precision": ..., "f1": ..., "accuracy": ...},
     "3": {...},
@@ -85,17 +91,29 @@ class Checkpoint:
         question_index: int,
         question: str | None = None,
     ) -> bool:
-        """Return whether the answers file contains a valid answer for this question."""
+        """Return whether all required stages succeeded for this question.
+
+        New checkpoints carry an explicit ``query_status``. Older checkpoint
+        files are accepted only when they contain a non-empty prediction and a
+        successful Judge score. This deliberately retries legacy empty-answer
+        and ``judge_score == -1`` records.
+        """
         if not self.is_done(question_index):
             return False
         record = self._state.get("records", {}).get(question_index)
-        if not isinstance(record, dict) or record.get("prediction") is None:
+        if not isinstance(record, dict):
             return False
         if question is not None:
             saved_question = str(record.get("question") or "").strip()
             if saved_question != str(question).strip():
                 return False
-        return True
+        query_status = record.get("query_status")
+        if query_status is not None:
+            return query_status == "success"
+
+        prediction = str(record.get("prediction") or "").strip()
+        judge_score = record.get("judge_score", -1)
+        return bool(prediction) and isinstance(judge_score, (int, float)) and judge_score >= 0
 
     def load_records(self) -> list[dict[str, Any]]:
         """Return all completed QA records in question order."""
@@ -111,14 +129,22 @@ class Checkpoint:
         question_index: int,
         record: dict[str, Any],
         total_questions: int,
+        successful: bool = True,
     ) -> None:
-        """Append one completed QA record and persist to disk."""
+        """Persist a record and mark it complete only when successful.
+
+        Failed records remain available for diagnostics and metrics, but their
+        indices are omitted from ``completed_indices`` so they are retried.
+        """
         records: dict[int, dict] = self._state.setdefault("records", {})
         records[question_index] = record
 
         completed: list[int] = self._state.setdefault("completed_indices", [])
-        if question_index not in completed:
+        if successful and question_index not in completed:
             completed.append(question_index)
+        elif not successful and question_index in completed:
+            completed.remove(question_index)
+        completed.sort()
         self._state["completed_indices_set"] = set(completed)
 
         self._state["total_questions"] = total_questions

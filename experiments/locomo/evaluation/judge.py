@@ -98,6 +98,7 @@ class LLMJudge:
                 evaluation.get("judge_retry_delay", te.get("retry_delay", 2.0)),
             )
         )
+        self.last_error: str | None = None
         self._client = openai.OpenAI(api_key=api_key, base_url=base_url)
 
     def judge(
@@ -112,6 +113,7 @@ class LLMJudge:
         Returns 1 (CORRECT) or 0 (WRONG).
         Returns -1 on total failure (excluded from averages by the aggregator).
         """
+        self.last_error = None
         prompt = _JUDGE_PROMPT.format(
             question=question,
             ground_truth=ground_truth,
@@ -128,14 +130,19 @@ class LLMJudge:
                 raw = resp.choices[0].message.content.strip()
                 score = self._parse_score(raw)
                 if score is not None:
+                    self.last_error = None
                     return score
+                self.last_error = f"Unparseable Judge response: {raw[:500]}"
                 logger.warning("Judge returned unparseable response: %r", raw)
             except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
                 logger.warning(
                     "Judge attempt %d/%d failed: %s", attempt, self.max_retries, exc
                 )
                 if attempt < self.max_retries:
                     time.sleep(self.retry_delay * attempt)
+        if self.last_error is None:
+            self.last_error = "Judge failed without an error message"
         return -1
 
     @staticmethod

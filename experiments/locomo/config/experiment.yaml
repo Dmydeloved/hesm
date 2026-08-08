@@ -20,6 +20,7 @@ output:
   answers: outputs/locomo/answers    # per-question QA records (JSON)
   metrics: outputs/locomo/metrics    # per-method aggregated metrics (JSON)
   tables: outputs/locomo/tables      # final result tables (MD / CSV / JSON)
+  logs: outputs/locomo/logs          # four-stage, per-method structured logs
 
 # ── Retrieval settings ───────────────────────────────────────
 retrieval:
@@ -38,6 +39,7 @@ token_counter:
 
 # ── Methods to run ──────────────────────────────────────────
 methods:
+  # Optional run_main-only upper bound; run_all intentionally excludes it.
   full_context:
     enabled: true
   vector_rag:
@@ -84,15 +86,21 @@ ablation:
       retrieval_layers: [qa_direct]   # raw turn vectors, flat ChromaDB query
     qa_only:
       description: "HESM QA layer only; direct Chroma query on QA vectors"
-      use_topic_extractor: true
+      use_topic_extractor: false
       retrieval_layers: [qa]
     qa_segment:
       description: "HESM QA + Segment layers; merged vector results"
-      use_topic_extractor: true
+      use_topic_extractor: false
       retrieval_layers: [qa, segment]
+    full_hesm_no_reranker:
+      description: "Full hierarchical retrieval without LLM reranking"
+      use_topic_extractor: true
+      use_llm_reranker: false
+      retrieval_layers: [experience, segment, qa]
     full_hesm:
       description: "Full HESM hierarchical retrieval (Experience→Segment→QA)"
       use_topic_extractor: true
+      use_llm_reranker: true
       retrieval_layers: [experience, segment, qa]
 
 # ── Part 3: Cache evaluation ────────────────────────────────

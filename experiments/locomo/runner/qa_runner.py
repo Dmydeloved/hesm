@@ -33,10 +33,25 @@ from experiments.locomo.evaluation.token_metrics import (
     compute_compression_ratio,
     count_tokens,
 )
-from experiments.locomo.methods.base import LLMAnswerGenerator, MemorySystem
+from experiments.locomo.methods.base import LLMAnswerGenerator, MemorySystem, RetrievalResult
 from experiments.locomo.runner.checkpoint import Checkpoint
+from experiments.locomo.runner.stage_logger import MethodStageLogger
 
 logger = logging.getLogger(__name__)
+
+
+class _WarningCollector(logging.Handler):
+    """Collect warnings emitted by methods that tolerate per-item failures."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.messages.append(self.format(record))
+        except Exception:
+            self.messages.append(record.getMessage())
 
 
 class QARunner:
@@ -49,6 +64,7 @@ class QARunner:
         judge:           LLMJudge instance (pass None to skip judge scoring)
         output_dir:      directory for checkpoint files (answers/)
         metrics_dir:     directory for aggregated metric files (metrics/)
+        logs_dir:        directory for per-method four-stage logs
         top_k_values:    K values for Recall/Precision/Accuracy@K
         token_encoding:  tiktoken encoding name
     """
@@ -60,6 +76,7 @@ class QARunner:
         judge: Any,   # LLMJudge | None
         output_dir: str | Path,
         metrics_dir: str | Path,
+        logs_dir: str | Path | None = None,
         top_k_values: list[int] | None = None,
         token_encoding: str = "cl100k_base",
     ) -> None:
@@ -68,11 +85,14 @@ class QARunner:
         self.judge = judge
         self.output_dir = Path(output_dir)
         self.metrics_dir = Path(metrics_dir)
+        self.logs_dir = Path(logs_dir) if logs_dir is not None else self.output_dir.parent / "logs"
         self.top_k_values = top_k_values or [1, 3, 5]
         self.token_encoding = token_encoding
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.stage_logger = MethodStageLogger(self.logs_dir, self.method.method_name)
 
     # ─── Public: run all conversations ───────────────────────────────────────
 
@@ -119,6 +139,20 @@ class QARunner:
                 for index, qa_item in enumerate(conv.questions)
             )
             if all_answered:
+                self.stage_logger.event(
+                    "BUILD",
+                    "SKIPPED",
+                    message="Conversation already has successful query checkpoints",
+                    conv_id=conv.conv_id,
+                    questions=len(conv.questions),
+                )
+                for index, qa_item in enumerate(conv.questions):
+                    self.stage_logger.skipped_query(
+                        conv_id=conv.conv_id,
+                        query_index=index,
+                        question=qa_item.question,
+                        reason="successful checkpoint",
+                    )
                 logger.info(
                     "[%s] %s: answers file already contains all %d answers, skipping",
                     method_name,
@@ -140,13 +174,73 @@ class QARunner:
                 method_name, conv.conv_id, completed_count, len(conv.questions),
             )
 
-        # Build memory (always — cannot checkpoint mid-build without determinism issues)
-        self.method.reset()
-        self.method.build_memory(
+        # Build memory before retrying unfinished queries. Persistent methods may
+        # attach an existing store and return quickly.
+        build_started = time.perf_counter()
+        build_warnings = _WarningCollector()
+        logging.getLogger().addHandler(build_warnings)
+        self.stage_logger.event(
+            "BUILD",
+            "STARTED",
+            message="Building or attaching conversation memory",
             conv_id=conv.conv_id,
-            sessions=conv.sessions,
-            speaker_a=conv.speaker_a,
-            speaker_b=conv.speaker_b,
+            sessions=len(conv.sessions),
+            turns=len(conv.all_turns),
+            pending_questions=len(conv.questions) - completed_count,
+        )
+        try:
+            self.method.reset()
+            self.method.build_memory(
+                conv_id=conv.conv_id,
+                sessions=conv.sessions,
+                speaker_a=conv.speaker_a,
+                speaker_b=conv.speaker_b,
+            )
+        except Exception as exc:
+            logging.getLogger().removeHandler(build_warnings)
+            elapsed_ms = (time.perf_counter() - build_started) * 1000
+            reason = f"{type(exc).__name__}: {exc}"
+            self.stage_logger.event(
+                "BUILD",
+                "FAILED",
+                message="Memory build failed; unfinished queries will be retried",
+                conv_id=conv.conv_id,
+                elapsed_ms=round(elapsed_ms, 3),
+                error=reason,
+            )
+            for index, qa_item in enumerate(conv.questions):
+                if ckpt.is_answered(index, qa_item.question):
+                    continue
+                for stage in ("RETRIEVAL", "ANSWER", "JUDGE"):
+                    self.stage_logger.event(
+                        stage,
+                        "SKIPPED",
+                        message="Memory build failed",
+                        conv_id=conv.conv_id,
+                        query_index=index,
+                        question=qa_item.question,
+                        reason=reason,
+                    )
+            logger.exception("[%s] %s build failed", method_name, conv.conv_id)
+            return ckpt.load_all_records_ordered(len(conv.questions))
+
+        logging.getLogger().removeHandler(build_warnings)
+
+        build_elapsed_ms = (time.perf_counter() - build_started) * 1000
+        self.stage_logger.event(
+            "BUILD",
+            "PARTIAL" if build_warnings.messages else "SUCCESS",
+            message=(
+                "Conversation memory is ready with item-level failures"
+                if build_warnings.messages
+                else "Conversation memory is ready"
+            ),
+            conv_id=conv.conv_id,
+            elapsed_ms=round(build_elapsed_ms, 3),
+            sessions=len(conv.sessions),
+            turns=len(conv.all_turns),
+            failure_reasons=build_warnings.messages[:100],
+            suppressed_failure_count=max(0, len(build_warnings.messages) - 100),
         )
 
         # Pre-compute total conversation tokens for compression ratio
@@ -159,6 +253,12 @@ class QARunner:
 
         for i, qa_item in enumerate(conv.questions):
             if ckpt.is_answered(i, qa_item.question):
+                self.stage_logger.skipped_query(
+                    conv_id=conv.conv_id,
+                    query_index=i,
+                    question=qa_item.question,
+                    reason="successful checkpoint",
+                )
                 logger.info(
                     "[%s] %s: question %d/%d already answered, skipping: %s",
                     method_name,
@@ -180,12 +280,18 @@ class QARunner:
                 )
 
             record = self._run_single_qa(
+                query_index=i,
                 qa_item=qa_item,
                 conv=conv,
                 default_top_k=default_top_k,
                 total_conv_tokens=total_conv_tokens,
             )
-            ckpt.save_record(i, record, total_questions=len(conv.questions))
+            ckpt.save_record(
+                i,
+                record,
+                total_questions=len(conv.questions),
+                successful=record.get("query_status") == "success",
+            )
 
         return ckpt.load_all_records_ordered(len(conv.questions))
 
@@ -193,43 +299,212 @@ class QARunner:
 
     def _run_single_qa(
         self,
+        query_index: int,
         qa_item: Any,   # QAItem
         conv: LoCoMoConversation,
         default_top_k: int,
         total_conv_tokens: int,
     ) -> dict[str, Any]:
-        """Execute one question: retrieve → answer → evaluate → return record."""
+        """Execute and log retrieval, answer, and Judge stages for one query."""
 
-        # ── Retrieval ──────────────────────────────────────────────────────────
-        t0 = time.perf_counter()
-        retrieval = self.method.retrieve(
-            question=qa_item.question, top_k=default_top_k
-        )
-        latency_ms = (time.perf_counter() - t0) * 1000
-
-        # ── Answer generation ─────────────────────────────────────────────────
-        prediction = self.answer_generator.generate(
-            question=qa_item.question,
-            context=retrieval.context_text,
-            speaker_a=conv.speaker_a,
-            speaker_b=conv.speaker_b,
-        )
-
-        # ── Metrics ───────────────────────────────────────────────────────────
-        ground_truth = qa_item.answer_str()
-
-        f1_scores = compute_f1(prediction, ground_truth)
-
+        common = {
+            "conv_id": conv.conv_id,
+            "query_index": query_index,
+            "question": qa_item.question,
+        }
+        stage_status: dict[str, dict[str, Any]] = {}
+        retrieval = RetrievalResult("", [], 0, {})
+        prediction = ""
         judge_score = -1
-        if self.judge is not None:
+        answer_latency_ms = 0.0
+        judge_latency_ms = 0.0
+
+        # ── Part 2/4: Retrieval ────────────────────────────────────────────────
+        self.stage_logger.event(
+            "RETRIEVAL", "STARTED", message="Retrieving memory", **common
+        )
+        retrieval_started = time.perf_counter()
+        try:
+            retrieval = self.method.retrieve(
+                question=qa_item.question, top_k=default_top_k
+            )
+            retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000
+            retrieval_error = retrieval.raw_result.get("error")
+            if retrieval_error:
+                raise RuntimeError(str(retrieval_error))
+            stage_status["retrieval"] = {
+                "status": "success",
+                "elapsed_ms": retrieval_latency_ms,
+            }
+            self.stage_logger.event(
+                "RETRIEVAL",
+                "SUCCESS",
+                message="Retrieval completed",
+                **common,
+                elapsed_ms=round(retrieval_latency_ms, 3),
+                retrieved_ids=retrieval.retrieved_ids,
+                retrieved_count=len(retrieval.retrieved_ids),
+                retrieved_tokens=retrieval.token_count,
+                context_preview=retrieval.context_text[:1000],
+            )
+        except Exception as exc:
+            retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000
+            reason = f"{type(exc).__name__}: {exc}"
+            stage_status["retrieval"] = {
+                "status": "failed",
+                "elapsed_ms": retrieval_latency_ms,
+                "error": reason,
+            }
+            stage_status["answer"] = {
+                "status": "skipped",
+                "reason": "retrieval failed",
+            }
+            stage_status["judge"] = {
+                "status": "skipped",
+                "reason": "retrieval failed",
+            }
+            self.stage_logger.event(
+                "RETRIEVAL",
+                "FAILED",
+                message="Retrieval failed",
+                **common,
+                elapsed_ms=round(retrieval_latency_ms, 3),
+                error=reason,
+            )
+            self.stage_logger.event(
+                "ANSWER", "SKIPPED", message="Retrieval failed", **common, reason=reason
+            )
+            self.stage_logger.event(
+                "JUDGE", "SKIPPED", message="Retrieval failed", **common, reason=reason
+            )
+
+        # ── Part 3/4: LLM answer generation ──────────────────────────────────
+        if stage_status["retrieval"]["status"] == "success":
+            self.stage_logger.event(
+                "ANSWER", "STARTED", message="Generating LLM answer", **common
+            )
+            answer_started = time.perf_counter()
             try:
-                judge_score = self.judge.judge(
+                prediction = self.answer_generator.generate(
                     question=qa_item.question,
-                    ground_truth=ground_truth,
+                    context=retrieval.context_text,
+                    speaker_a=conv.speaker_a,
+                    speaker_b=conv.speaker_b,
+                )
+                answer_latency_ms = (time.perf_counter() - answer_started) * 1000
+                if not prediction.strip():
+                    error = getattr(self.answer_generator, "last_error", None)
+                    raise RuntimeError(error or "LLM returned an empty answer")
+                stage_status["answer"] = {
+                    "status": "success",
+                    "elapsed_ms": answer_latency_ms,
+                }
+                self.stage_logger.event(
+                    "ANSWER",
+                    "SUCCESS",
+                    message="LLM answer generated",
+                    **common,
+                    elapsed_ms=round(answer_latency_ms, 3),
                     prediction=prediction,
                 )
             except Exception as exc:
-                logger.warning("Judge failed for question %r: %s", qa_item.question[:50], exc)
+                answer_latency_ms = (time.perf_counter() - answer_started) * 1000
+                reason = f"{type(exc).__name__}: {exc}"
+                stage_status["answer"] = {
+                    "status": "failed",
+                    "elapsed_ms": answer_latency_ms,
+                    "error": reason,
+                }
+                stage_status["judge"] = {
+                    "status": "skipped",
+                    "reason": "answer generation failed",
+                }
+                self.stage_logger.event(
+                    "ANSWER",
+                    "FAILED",
+                    message="LLM answer generation failed",
+                    **common,
+                    elapsed_ms=round(answer_latency_ms, 3),
+                    error=reason,
+                )
+                self.stage_logger.event(
+                    "JUDGE",
+                    "SKIPPED",
+                    message="Answer generation failed",
+                    **common,
+                    reason=reason,
+                )
+
+        ground_truth = qa_item.answer_str()
+
+        # ── Part 4/4: Judge ───────────────────────────────────────────────────
+        if stage_status.get("answer", {}).get("status") == "success":
+            if self.judge is None:
+                stage_status["judge"] = {
+                    "status": "skipped",
+                    "reason": "Judge disabled",
+                }
+                self.stage_logger.event(
+                    "JUDGE", "SKIPPED", message="Judge disabled", **common
+                )
+            else:
+                self.stage_logger.event(
+                    "JUDGE", "STARTED", message="Evaluating answer", **common
+                )
+                judge_started = time.perf_counter()
+                try:
+                    judge_score = self.judge.judge(
+                        question=qa_item.question,
+                        ground_truth=ground_truth,
+                        prediction=prediction,
+                    )
+                    judge_latency_ms = (time.perf_counter() - judge_started) * 1000
+                    if judge_score < 0:
+                        error = getattr(self.judge, "last_error", None)
+                        raise RuntimeError(error or "Judge returned failure score -1")
+                    stage_status["judge"] = {
+                        "status": "success",
+                        "elapsed_ms": judge_latency_ms,
+                        "score": judge_score,
+                    }
+                    self.stage_logger.event(
+                        "JUDGE",
+                        "SUCCESS",
+                        message="Judge evaluation completed",
+                        **common,
+                        elapsed_ms=round(judge_latency_ms, 3),
+                        ground_truth=ground_truth,
+                        prediction=prediction,
+                        judge_score=judge_score,
+                    )
+                except Exception as exc:
+                    judge_latency_ms = (time.perf_counter() - judge_started) * 1000
+                    reason = f"{type(exc).__name__}: {exc}"
+                    judge_score = -1
+                    stage_status["judge"] = {
+                        "status": "failed",
+                        "elapsed_ms": judge_latency_ms,
+                        "error": reason,
+                    }
+                    self.stage_logger.event(
+                        "JUDGE",
+                        "FAILED",
+                        message="Judge evaluation failed",
+                        **common,
+                        elapsed_ms=round(judge_latency_ms, 3),
+                        error=reason,
+                        ground_truth=ground_truth,
+                        prediction=prediction,
+                    )
+
+        query_success = (
+            stage_status.get("retrieval", {}).get("status") == "success"
+            and stage_status.get("answer", {}).get("status") == "success"
+            and stage_status.get("judge", {}).get("status") in {"success", "skipped"}
+        )
+
+        # ── Metrics ───────────────────────────────────────────────────────────
+        f1_scores = compute_f1(prediction, ground_truth)
 
         retrieval_metrics_per_k = compute_retrieval_metrics(
             retrieved_ids=retrieval.retrieved_ids,
@@ -267,7 +542,11 @@ class QARunner:
             "retrieval_metrics": retrieval_metrics_dict,
             "total_conversation_tokens": total_conv_tokens,
             "compression_ratio": compression_ratio,
-            "latency_ms": latency_ms,
+            "latency_ms": retrieval_latency_ms,
+            "answer_latency_ms": answer_latency_ms,
+            "judge_latency_ms": judge_latency_ms,
+            "query_status": "success" if query_success else "failed",
+            "stage_status": stage_status,
         }
 
     # ─── Internal: persist metrics ─────────────────────────────────────────────

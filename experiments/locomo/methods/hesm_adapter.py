@@ -385,10 +385,12 @@ class HESMAblationMemory(MemorySystem):
       flat_memory  — raw turn vectors, no TopicExtractor, flat Chroma query
       qa_only      — Chroma query on QA vectors only
       qa_segment   — merged Chroma query on QA + Segment vectors
+      full_hesm_no_reranker — full hierarchy with local selection only
       full_hesm    — full HybridRetriever.recall() (same as HESMMemory)
 
     For "flat_memory" the memory is built fresh (raw turns → Chroma, no HESM).
-    For the other three, this class READS the HESM storage built by HESMMemory.build_memory().
+    Other variants reuse HESM storage. If it is absent, the first variant builds
+    it automatically so run_ablation.py also works standalone.
     """
 
     def __init__(
@@ -450,6 +452,9 @@ class HESMAblationMemory(MemorySystem):
         if self._variant == "flat_memory":
             self._build_flat_memory(conv_id, sessions)
         else:
+            self._ensure_hesm_storage(
+                conv_id, sessions, speaker_a=speaker_a, speaker_b=speaker_b
+            )
             self._attach_hesm_storage(conv_id)
 
     def retrieve(self, question: str, top_k: int = 5) -> RetrievalResult:
@@ -515,13 +520,44 @@ class HESMAblationMemory(MemorySystem):
         self._vector_store = ChromaVectorStore(persist_path=str(base / "chroma"))
         self._extractor = TopicExtractor()
 
-        if self._variant == "full_hesm":
+        if self._variant in {"full_hesm", "full_hesm_no_reranker"}:
             self._retriever = HybridRetriever(
                 storage=self._storage,
                 vector_store=self._vector_store,
                 embedder=self._embedder,
-                rerank_with_llm=True,
+                rerank_with_llm=bool(
+                    self._variant_cfg.get("use_llm_reranker", True)
+                ),
             )
+
+    def _ensure_hesm_storage(
+        self,
+        conv_id: str,
+        sessions: list[Session],
+        speaker_a: str,
+        speaker_b: str,
+    ) -> None:
+        """Build the shared HESM memory when ablation is run standalone."""
+        base = self._memory_root / f"hesm_{conv_id}"
+        db_path = base / "memory.sqlite3"
+        chroma_path = base / "chroma"
+        if db_path.exists() and chroma_path.exists():
+            return
+
+        logger.info(
+            "[Ablation] HESM storage for %s is missing; building it now", conv_id
+        )
+        builder = HESMMemory(
+            memory_root=self._memory_root,
+            hesm_cfg=self._hesm_cfg,
+            use_llm_summarizer=bool(
+                self._hesm_cfg.get("use_llm_summarizer", True)
+            ),
+            use_llm_reranker=False,
+        )
+        builder.build_memory(conv_id, sessions, speaker_a, speaker_b)
+        if not db_path.exists() or not chroma_path.exists():
+            raise RuntimeError(f"Failed to build reusable HESM storage at {base}")
 
     # ─── Retrieval helpers ────────────────────────────────────────────────────
 

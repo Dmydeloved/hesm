@@ -3,7 +3,7 @@ Report generator — produces paper-ready result tables in Markdown, CSV and JSO
 
 Three report types:
   - Main results table  (5 methods × all metrics)
-  - Ablation table      (4 HESM variants × all metrics)
+  - Ablation table      (5 HESM variants × all metrics)
   - Cache eval table    (cache ON/OFF × latency metrics)
 """
 

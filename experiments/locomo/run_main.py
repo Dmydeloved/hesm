@@ -130,7 +130,8 @@ def run_main(
     answers_dir = _PROJECT_ROOT / exp_cfg["output"]["answers"]
     metrics_dir = _PROJECT_ROOT / exp_cfg["output"]["metrics"]
     tables_dir  = _PROJECT_ROOT / exp_cfg["output"]["tables"]
-    for d in (answers_dir, metrics_dir, tables_dir):
+    logs_dir = _PROJECT_ROOT / exp_cfg["output"].get("logs", "outputs/locomo/logs")
+    for d in (answers_dir, metrics_dir, tables_dir, logs_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     # Load dataset
@@ -159,6 +160,7 @@ def run_main(
             judge=judge,
             output_dir=answers_dir,
             metrics_dir=metrics_dir,
+            logs_dir=logs_dir,
             top_k_values=top_k_values,
             token_encoding=token_encoding,
         )

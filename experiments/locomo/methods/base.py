@@ -159,6 +159,7 @@ class LLMAnswerGenerator:
         self.retry_delay: float = float(
             answer.get("retry_delay", te.get("retry_delay", 2.0))
         )
+        self.last_error: str | None = None
         self._client = openai.OpenAI(api_key=api_key, base_url=base_url)
 
     def generate(
@@ -169,6 +170,7 @@ class LLMAnswerGenerator:
         speaker_b: str = "Speaker B",
     ) -> str:
         """Call LLM and return the answer string. Returns "" on total failure."""
+        self.last_error = None
         prompt = _QA_PROMPT.format(
             speaker_a=speaker_a,
             speaker_b=speaker_b,
@@ -182,12 +184,21 @@ class LLMAnswerGenerator:
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
                 )
-                return resp.choices[0].message.content.strip()
+                answer = (resp.choices[0].message.content or "").strip()
+                if not answer:
+                    self.last_error = "LLM returned an empty answer"
+                    logger.warning(self.last_error)
+                    continue
+                self.last_error = None
+                return answer
             except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
                 logger.warning(
                     "Answer generation attempt %d/%d failed: %s",
                     attempt, self.max_retries, exc,
                 )
                 if attempt < self.max_retries:
                     time.sleep(self.retry_delay * attempt)
+        if self.last_error is None:
+            self.last_error = "Answer generation failed without an error message"
         return ""

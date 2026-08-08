@@ -1,15 +1,15 @@
 """
 One-click runner — executes all three experiment parts in sequence.
 
-Part 1: Main experiment  (5 methods)
-Part 2: Ablation study   (4 HESM variants)
+Part 1: Main experiment  (Vector RAG, Mem0, A-MEM, HESM)
+Part 2: Ablation study   (5 HESM variants)
 Part 3: Cache evaluation (cache ON/OFF)
 
 Usage (from d:/code/hesm):
     python -m experiments.locomo.run_all
     python -m experiments.locomo.run_all --skip-parts ablation cache
     python -m experiments.locomo.run_all --max-conversations 2  # quick test
-    python -m experiments.locomo.run_all --methods hesm full_context  # subset
+    python -m experiments.locomo.run_all --methods hesm vector_rag  # subset
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_RUN_ALL_METHODS = ["vector_rag", "mem0", "amem", "hesm"]
+
 
 def run_all(
     config_path: str | Path | None = None,
@@ -44,11 +46,27 @@ def run_all(
         logger.info("PART 1: Main Experiment")
         logger.info("=" * 60)
         from experiments.locomo.run_main import run_main
-        run_main(
-            config_path=config_path,
-            enabled_methods=enabled_methods,
-            max_conversations=max_conversations,
+        requested_methods = (
+            list(enabled_methods) if enabled_methods is not None else _RUN_ALL_METHODS
         )
+        main_methods = [
+            method for method in requested_methods if method in _RUN_ALL_METHODS
+        ]
+        removed_methods = sorted(set(requested_methods) - set(main_methods))
+        if removed_methods:
+            logger.warning(
+                "run_all ignores unsupported methods: %s", removed_methods
+            )
+        if main_methods:
+            run_main(
+                config_path=config_path,
+                # Full Context remains available from run_main, but is
+                # intentionally excluded from this one-click suite.
+                enabled_methods=main_methods,
+                max_conversations=max_conversations,
+            )
+        else:
+            logger.warning("Skipping Part 1: no supported run_all methods selected")
     else:
         logger.info("Skipping Part 1 (main)")
 
@@ -89,9 +107,9 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--methods", nargs="+",
-        choices=["full_context", "vector_rag", "mem0", "amem", "hesm"],
+        choices=_RUN_ALL_METHODS,
         default=None,
-        help="Methods to run in Part 1 (default: all enabled in config)",
+        help="Methods to run in Part 1 (default: all four run_all methods)",
     )
     p.add_argument("--max-conversations", type=int, default=None)
     return p.parse_args()
