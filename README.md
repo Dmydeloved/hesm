@@ -95,6 +95,28 @@ version control. The relevant sections are:
 Experiment paths, enabled methods, top-K values, and ablation variants are in
 `experiments/locomo/config/experiment.yaml`.
 
+### Models used by Mem0, A-MEM, and HESM
+
+The current configuration is:
+
+| Component | Configuration section | Current model |
+|---|---|---|
+| Mem0 internal extraction/update LLM | `memory_methods.mem0.llm` | `gpt-5.4-nano-high` |
+| Mem0 embeddings | `memory_methods.mem0.embedding` | `text-embedding-v4` |
+| A-MEM keyword/context LLM | `memory_methods.amem.llm` | `gpt-5.4-nano-high` |
+| A-MEM embeddings | `memory_methods.amem.embedding` | `text-embedding-v4` |
+| HESM topic extraction | `memory_methods.hesm.topic_extraction` | `gpt-5.4-nano-high` |
+| HESM hierarchical summarization | `memory_methods.hesm.summarization` | `gpt-5.4-nano-high` |
+| HESM retrieval reranking | `memory_methods.hesm.retrieval` | `gpt-5.4-nano-high` |
+| HESM embeddings | `memory_methods.hesm.embedding` | `text-embedding-v4` |
+| Shared final answer generator | `answer_generation` | `gpt-5.4-mini` |
+| Shared LLM Judge | `evaluation` | `gpt-5.4-mini` |
+
+Each adapter reads its own `memory_methods` subsection. YAML profiles centralize
+the shared connection, model, retry, and embedding settings, while the existing
+role paths remain available to the code. Change a profile once to update every
+role that references it, or replace a method alias with a dedicated mapping.
+
 ## Running experiments
 
 Run commands from the repository root.
@@ -122,7 +144,19 @@ python -m experiments.locomo.run_all --methods vector_rag hesm
 
 # Skip expensive parts
 python -m experiments.locomo.run_all --skip-parts ablation cache
+
+# Recommended: methods serial, four concurrent QA workers per method
+python -m experiments.locomo.run_all --method-workers 1 --qa-workers 4
 ```
+
+`method_workers` controls how many methods run at the same time. It defaults to
+1 so latency numbers are not distorted by competition between methods.
+`qa_workers` controls concurrent questions after a conversation memory is
+ready; the default is 4. Every QA worker owns its retrieval reader, answer
+client, and Judge client, while checkpoint writes stay in the parent thread.
+Use `--method-workers 4 --qa-workers 1` if total completion time matters more
+than isolated per-method latency. Avoid multiplying both values aggressively:
+the approximate peak request concurrency is their product.
 
 ### Main experiment only
 
@@ -222,6 +256,12 @@ all succeed. On rerun:
 - failed records and stage error messages remain in the checkpoint and log;
 - legacy checkpoints are considered successful only when the prediction is
   non-empty and `judge_score >= 0`.
+- Mem0 and A-MEM persist completed source `dia_id` values in
+  `memory/mem0_<conv_id>/build_state.json` and
+  `memory/amem_<conv_id>/build_state.json`; complete stores skip all memory-add
+  calls, while partial stores add only missing turns.
+- HESM validates stored `dia_id` values in SQLite: a complete store skips
+  reconstruction, while a partial store processes only missing turns.
 
 This makes an interrupted experiment resumable without paying for successful
 queries again.

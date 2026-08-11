@@ -38,6 +38,8 @@ def run_all(
     skip_parts: list[str] | None = None,
     enabled_methods: list[str] | None = None,
     max_conversations: int | None = None,
+    method_workers: int | None = None,
+    qa_workers: int | None = None,
 ) -> None:
     skip = set(skip_parts or [])
 
@@ -64,6 +66,8 @@ def run_all(
                 # intentionally excluded from this one-click suite.
                 enabled_methods=main_methods,
                 max_conversations=max_conversations,
+                method_workers=method_workers,
+                qa_workers=qa_workers,
             )
         else:
             logger.warning("Skipping Part 1: no supported run_all methods selected")
@@ -78,6 +82,7 @@ def run_all(
         run_ablation(
             config_path=config_path,
             max_conversations=max_conversations,
+            qa_workers=qa_workers,
         )
     else:
         logger.info("Skipping Part 2 (ablation)")
@@ -112,6 +117,14 @@ def _parse_args() -> argparse.Namespace:
         help="Methods to run in Part 1 (default: all four run_all methods)",
     )
     p.add_argument("--max-conversations", type=int, default=None)
+    p.add_argument(
+        "--method-workers", type=int, default=None,
+        help="Concurrent main-method workers (overrides experiment.yaml)",
+    )
+    p.add_argument(
+        "--qa-workers", type=int, default=None,
+        help="Concurrent QA workers per method (overrides experiment.yaml)",
+    )
     return p.parse_args()
 
 
@@ -122,4 +135,6 @@ if __name__ == "__main__":
         skip_parts=args.skip_parts,
         enabled_methods=args.methods,
         max_conversations=args.max_conversations,
+        method_workers=args.method_workers,
+        qa_workers=args.qa_workers,
     )

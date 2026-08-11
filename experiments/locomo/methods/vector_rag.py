@@ -74,6 +74,20 @@ class VectorRAGMemory(MemorySystem):
         self._embedder = BailianEmbedder()
         self._turn_texts = {}
 
+        expected_count = sum(
+            1
+            for session in sessions
+            for turn in session.turns
+            if turn.dia_id and turn.text.strip()
+        )
+        if expected_count and self._vector_store.count() >= expected_count:
+            logger.info(
+                "[VectorRAG] %s: memory already complete (%d turns), skipping build",
+                conv_id,
+                expected_count,
+            )
+            return
+
         total = 0
         for session in sessions:
             for turn in session.turns:

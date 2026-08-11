@@ -22,6 +22,8 @@ class RunAllSelectionTests(unittest.TestCase):
             config_path=None,
             enabled_methods=["hesm"],
             max_conversations=1,
+            method_workers=None,
+            qa_workers=None,
         )
 
     def test_complete_ablation_set_contains_no_reranker_variant(self) -> None:
@@ -39,4 +41,3 @@ class RunAllSelectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

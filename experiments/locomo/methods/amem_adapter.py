@@ -13,8 +13,8 @@ Retrieval: keyword overlap + dense vector similarity → graph expansion
            → top-K nodes ranked by combined score.
 
 Storage: SQLite for note graph, ChromaDB for dense vectors.
-All LLM calls use the topic_extraction config (same as the rest of the project).
-All embeddings use the BailianEmbedder (embedding config).
+All LLM calls use memory_methods.amem.llm, and embeddings use
+memory_methods.amem.embedding, with legacy top-level fallbacks.
 """
 
 from __future__ import annotations
@@ -34,6 +34,11 @@ import openai
 from experiments.locomo.data.loader import Session
 from experiments.locomo.evaluation.token_metrics import count_tokens
 from experiments.locomo.methods.base import MemorySystem, RetrievalResult
+from experiments.locomo.methods.build_state import (
+    expected_dia_ids,
+    load_completed_dia_ids,
+    save_build_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,10 +142,49 @@ class AMEMMemory(MemorySystem):
         self._conv_id = conv_id
         self._setup_components(conv_id)
 
+        expected = expected_dia_ids(sessions)
+        state_path = self._memory_root / f"amem_{conv_id}" / "build_state.json"
+        manifest_completed = load_completed_dia_ids(state_path)
+        database_dia_ids: set[str] = set()
+        if self._db is not None:
+            database_dia_ids.update(
+                str(row[0])
+                for row in self._db.execute(
+                    "SELECT DISTINCT dia_id FROM notes WHERE dia_id IS NOT NULL "
+                    "AND TRIM(dia_id) != ''"
+                ).fetchall()
+            )
+        vector_dia_ids = self._stored_vector_dia_ids()
+        verified_completed = database_dia_ids & vector_dia_ids
+        completed = (
+            manifest_completed & verified_completed
+            if manifest_completed
+            else verified_completed
+        )
+
+        if expected and expected <= completed:
+            save_build_state(
+                state_path,
+                method=self.method_name,
+                conv_id=conv_id,
+                expected=expected,
+                completed=completed,
+            )
+            logger.info(
+                "[AMEM] %s: memory already complete (%d turns), skipping build",
+                conv_id,
+                len(expected),
+            )
+            return
+
         total = 0
+        skipped = 0
         for session in sessions:
             for turn in session.turns:
-                if not turn.text.strip():
+                if not turn.text.strip() or not turn.dia_id:
+                    continue
+                if turn.dia_id in completed:
+                    skipped += 1
                     continue
                 text = f"[{turn.speaker}]: {turn.text}"
                 try:
@@ -150,10 +194,30 @@ class AMEMMemory(MemorySystem):
                         timestamp=turn.timestamp,
                     )
                     total += 1
+                    completed.add(turn.dia_id)
+                    save_build_state(
+                        state_path,
+                        method=self.method_name,
+                        conv_id=conv_id,
+                        expected=expected,
+                        completed=completed,
+                    )
                 except Exception as exc:
                     logger.warning("[AMEM] turn %s failed: %s", turn.dia_id, exc)
 
-        logger.info("[AMEM] %s: added %d notes", conv_id, total)
+        save_build_state(
+            state_path,
+            method=self.method_name,
+            conv_id=conv_id,
+            expected=expected,
+            completed=completed,
+        )
+        logger.info(
+            "[AMEM] %s: added %d notes, skipped %d completed turns",
+            conv_id,
+            total,
+            skipped,
+        )
 
     def retrieve(self, question: str, top_k: int = 5) -> RetrievalResult:
         if self._db is None:
@@ -212,10 +276,21 @@ class AMEMMemory(MemorySystem):
         self._vector_store = ChromaVectorStore(
             persist_path=str(base / "chroma")
         )
-        self._embedder = BailianEmbedder()
 
-        # LLM client (topic_extraction config)
-        te = self._hesm_config.get("topic_extraction", {})
+        method_cfg = self._hesm_config.get("memory_methods", {}).get("amem", {})
+        te = method_cfg.get("llm") or self._hesm_config.get(
+            "topic_extraction", {}
+        )
+        embedding_cfg = method_cfg.get("embedding") or self._hesm_config.get(
+            "embedding", {}
+        )
+        self._embedder = BailianEmbedder(
+            api_key=embedding_cfg.get("api_key"),
+            model=embedding_cfg.get("model"),
+            base_url=embedding_cfg.get("base_url"),
+        )
+
+        # Method-isolated A-MEM LLM client.
         api_key = te.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
         base_url = te.get("base_url", "https://api.openai.com/v1/")
         self._llm_model = te.get("model", "gpt-4")
@@ -226,7 +301,22 @@ class AMEMMemory(MemorySystem):
     # ─── Internal: add note ───────────────────────────────────────────────────
 
     def _add_note(self, text: str, dia_id: str, timestamp: str) -> str:
-        note_id = str(uuid.uuid4())
+        # Reuse the same note ID when retrying a turn whose SQLite insert
+        # succeeded but whose vector upsert failed.
+        existing = self._db.execute(
+            "SELECT note_id FROM notes WHERE dia_id = ? ORDER BY created_at LIMIT 1",
+            (dia_id,),
+        ).fetchone()
+        note_id = (
+            str(existing[0])
+            if existing is not None
+            else str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"locomo-amem:{self._conv_id}:{dia_id}",
+                )
+            )
+        )
 
         # Step 1: Extract keywords
         keywords = self._extract_keywords(text)
@@ -261,7 +351,7 @@ class AMEMMemory(MemorySystem):
 
         # Step 6: Persist
         self._db.execute(
-            """INSERT INTO notes
+            """INSERT OR REPLACE INTO notes
                (note_id, dia_id, content, context, keywords, links, timestamp, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
@@ -283,6 +373,29 @@ class AMEMMemory(MemorySystem):
             metadata={"note_id": note_id, "dia_id": dia_id},
         )
         return note_id
+
+    def _stored_vector_dia_ids(self) -> set[str]:
+        """Return dialogue IDs that have a persisted dense vector."""
+        if self._vector_store is None:
+            return set()
+        collection = self._vector_store.collection
+        try:
+            if hasattr(collection, "get"):
+                result = collection.get(include=["metadatas"])
+                metadatas = result.get("metadatas", []) or []
+            else:
+                metadatas = [
+                    item.get("metadata", {})
+                    for item in getattr(collection, "_items", {}).values()
+                ]
+            return {
+                str(metadata.get("dia_id"))
+                for metadata in metadatas
+                if metadata and str(metadata.get("dia_id", "")).strip()
+            }
+        except Exception as exc:
+            logger.warning("[AMEM] failed to inspect vector build state: %s", exc)
+            return set()
 
     def _add_link(self, note_id: str, new_link_id: str) -> None:
         """Add new_link_id to note_id's links list (bidirectional)."""

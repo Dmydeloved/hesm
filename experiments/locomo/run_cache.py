@@ -79,6 +79,7 @@ def run_cache_eval(
         hesm_cfg=hesm_section,
         use_llm_summarizer=hesm_section.get("use_llm_summarizer", True),
         use_llm_reranker=hesm_section.get("use_llm_reranker", True),
+        model_config=hesm_cfg,
     )
 
     runner = CacheEvalRunner(

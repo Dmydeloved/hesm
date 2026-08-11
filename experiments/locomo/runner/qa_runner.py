@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from experiments.locomo.data.loader import LoCoMoConversation
 from experiments.locomo.evaluation.aggregator import MethodMetrics, aggregate
@@ -46,12 +48,25 @@ class _WarningCollector(logging.Handler):
     def __init__(self) -> None:
         super().__init__(level=logging.WARNING)
         self.messages: list[str] = []
+        self.thread_id = threading.get_ident()
 
     def emit(self, record: logging.LogRecord) -> None:
+        if record.thread != self.thread_id:
+            return
         try:
             self.messages.append(self.format(record))
         except Exception:
             self.messages.append(record.getMessage())
+
+
+class _UnavailableMemory:
+    """Query adapter used to route worker setup failures through normal logging."""
+
+    def __init__(self, error: str) -> None:
+        self.error = error
+
+    def retrieve(self, question: str, top_k: int = 5) -> RetrievalResult:
+        return RetrievalResult("", [], 0, {"error": self.error})
 
 
 class QARunner:
@@ -65,6 +80,8 @@ class QARunner:
         output_dir:      directory for checkpoint files (answers/)
         metrics_dir:     directory for aggregated metric files (metrics/)
         logs_dir:        directory for per-method four-stage logs
+        qa_workers:      concurrent query workers; 1 keeps serial behavior
+        method_factory:  creates a thread-local memory reader for parallel QA
         top_k_values:    K values for Recall/Precision/Accuracy@K
         token_encoding:  tiktoken encoding name
     """
@@ -77,6 +94,10 @@ class QARunner:
         output_dir: str | Path,
         metrics_dir: str | Path,
         logs_dir: str | Path | None = None,
+        qa_workers: int = 1,
+        method_factory: Callable[[], MemorySystem] | None = None,
+        answer_generator_factory: Callable[[], Any] | None = None,
+        judge_factory: Callable[[], Any] | None = None,
         top_k_values: list[int] | None = None,
         token_encoding: str = "cl100k_base",
     ) -> None:
@@ -86,6 +107,11 @@ class QARunner:
         self.output_dir = Path(output_dir)
         self.metrics_dir = Path(metrics_dir)
         self.logs_dir = Path(logs_dir) if logs_dir is not None else self.output_dir.parent / "logs"
+        self.qa_workers = max(1, int(qa_workers))
+        self.method_factory = method_factory
+        self.answer_generator_factory = answer_generator_factory
+        self.judge_factory = judge_factory
+        self._worker_local = threading.local()
         self.top_k_values = top_k_values or [1, 3, 5]
         self.token_encoding = token_encoding
 
@@ -93,6 +119,17 @@ class QARunner:
         self.metrics_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.stage_logger = MethodStageLogger(self.logs_dir, self.method.method_name)
+        if self.qa_workers > 1 and (
+            self.method_factory is None or self.answer_generator_factory is None
+            or (self.judge is not None and self.judge_factory is None)
+        ):
+            logger.warning(
+                "[%s] qa_workers=%d requested without worker factories; "
+                "falling back to serial QA",
+                self.method.method_name,
+                self.qa_workers,
+            )
+            self.qa_workers = 1
 
     # ─── Public: run all conversations ───────────────────────────────────────
 
@@ -251,6 +288,7 @@ class QARunner:
         # Default top_k for retrieval (used during memory building)
         default_top_k = max(self.top_k_values)
 
+        pending_queries: list[tuple[int, Any]] = []
         for i, qa_item in enumerate(conv.questions):
             if ckpt.is_answered(i, qa_item.question):
                 self.stage_logger.skipped_query(
@@ -278,24 +316,125 @@ class QARunner:
                     len(conv.questions),
                     qa_item.question[:100],
                 )
+            pending_queries.append((i, qa_item))
 
-            record = self._run_single_qa(
-                query_index=i,
-                qa_item=qa_item,
-                conv=conv,
-                default_top_k=default_top_k,
-                total_conv_tokens=total_conv_tokens,
+        effective_workers = 1 if build_warnings.messages else self.qa_workers
+        if build_warnings.messages and self.qa_workers > 1:
+            logger.warning(
+                "[%s] %s: memory build was partial; using serial QA for safety",
+                method_name,
+                conv.conv_id,
             )
-            ckpt.save_record(
-                i,
-                record,
-                total_questions=len(conv.questions),
-                successful=record.get("query_status") == "success",
+
+        if effective_workers <= 1 or len(pending_queries) <= 1:
+            for i, qa_item in pending_queries:
+                record = self._run_single_qa(
+                    query_index=i,
+                    qa_item=qa_item,
+                    conv=conv,
+                    default_top_k=default_top_k,
+                    total_conv_tokens=total_conv_tokens,
+                )
+                ckpt.save_record(
+                    i,
+                    record,
+                    total_questions=len(conv.questions),
+                    successful=record.get("query_status") == "success",
+                )
+        else:
+            logger.info(
+                "[%s] %s: running %d pending queries with %d workers",
+                method_name,
+                conv.conv_id,
+                len(pending_queries),
+                effective_workers,
             )
+            with ThreadPoolExecutor(
+                max_workers=effective_workers,
+                thread_name_prefix=f"{method_name}-{conv.conv_id}",
+            ) as executor:
+                futures: dict[Future[dict[str, Any]], int] = {
+                    executor.submit(
+                        self._run_parallel_query,
+                        query_index=i,
+                        qa_item=qa_item,
+                        conv=conv,
+                        default_top_k=default_top_k,
+                        total_conv_tokens=total_conv_tokens,
+                    ): i
+                    for i, qa_item in pending_queries
+                }
+                for future in as_completed(futures):
+                    i = futures[future]
+                    record = future.result()
+                    # Only the owning conversation thread writes checkpoints.
+                    ckpt.save_record(
+                        i,
+                        record,
+                        total_questions=len(conv.questions),
+                        successful=record.get("query_status") == "success",
+                    )
 
         return ckpt.load_all_records_ordered(len(conv.questions))
 
     # ─── Internal: single QA ──────────────────────────────────────────────────
+
+    def _run_parallel_query(
+        self,
+        *,
+        query_index: int,
+        qa_item: Any,
+        conv: LoCoMoConversation,
+        default_top_k: int,
+        total_conv_tokens: int,
+    ) -> dict[str, Any]:
+        """Run one query with resources owned by the current worker thread."""
+        try:
+            components = self._get_worker_components(conv)
+        except Exception as exc:
+            reason = f"Worker initialisation failed: {type(exc).__name__}: {exc}"
+            components = (_UnavailableMemory(reason), self.answer_generator, None)
+        return self._run_single_qa(
+            query_index=query_index,
+            qa_item=qa_item,
+            conv=conv,
+            default_top_k=default_top_k,
+            total_conv_tokens=total_conv_tokens,
+            components=components,
+        )
+
+    def _get_worker_components(
+        self,
+        conv: LoCoMoConversation,
+    ) -> tuple[Any, Any, Any]:
+        """Create one memory reader, answer client, and Judge per worker thread."""
+        state = getattr(self._worker_local, "state", None)
+        if state is not None and state["conv_id"] == conv.conv_id:
+            return state["components"]
+
+        if self.method_factory is None or self.answer_generator_factory is None:
+            raise RuntimeError("parallel QA worker factories are not configured")
+
+        worker_method = self.method_factory()
+        worker_method.reset()
+        worker_method.build_memory(
+            conv_id=conv.conv_id,
+            sessions=conv.sessions,
+            speaker_a=conv.speaker_a,
+            speaker_b=conv.speaker_b,
+        )
+        worker_answer_generator = self.answer_generator_factory()
+        worker_judge = (
+            self.judge_factory()
+            if self.judge is not None and self.judge_factory is not None
+            else None
+        )
+        components = (worker_method, worker_answer_generator, worker_judge)
+        self._worker_local.state = {
+            "conv_id": conv.conv_id,
+            "components": components,
+        }
+        return components
 
     def _run_single_qa(
         self,
@@ -304,8 +443,15 @@ class QARunner:
         conv: LoCoMoConversation,
         default_top_k: int,
         total_conv_tokens: int,
+        components: tuple[Any, Any, Any] | None = None,
     ) -> dict[str, Any]:
         """Execute and log retrieval, answer, and Judge stages for one query."""
+
+        active_method, active_answer_generator, active_judge = components or (
+            self.method,
+            self.answer_generator,
+            self.judge,
+        )
 
         common = {
             "conv_id": conv.conv_id,
@@ -325,7 +471,7 @@ class QARunner:
         )
         retrieval_started = time.perf_counter()
         try:
-            retrieval = self.method.retrieve(
+            retrieval = active_method.retrieve(
                 question=qa_item.question, top_k=default_top_k
             )
             retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000
@@ -385,7 +531,7 @@ class QARunner:
             )
             answer_started = time.perf_counter()
             try:
-                prediction = self.answer_generator.generate(
+                prediction = active_answer_generator.generate(
                     question=qa_item.question,
                     context=retrieval.context_text,
                     speaker_a=conv.speaker_a,
@@ -393,7 +539,7 @@ class QARunner:
                 )
                 answer_latency_ms = (time.perf_counter() - answer_started) * 1000
                 if not prediction.strip():
-                    error = getattr(self.answer_generator, "last_error", None)
+                    error = getattr(active_answer_generator, "last_error", None)
                     raise RuntimeError(error or "LLM returned an empty answer")
                 stage_status["answer"] = {
                     "status": "success",
@@ -439,7 +585,7 @@ class QARunner:
 
         # ── Part 4/4: Judge ───────────────────────────────────────────────────
         if stage_status.get("answer", {}).get("status") == "success":
-            if self.judge is None:
+            if active_judge is None:
                 stage_status["judge"] = {
                     "status": "skipped",
                     "reason": "Judge disabled",
@@ -453,14 +599,14 @@ class QARunner:
                 )
                 judge_started = time.perf_counter()
                 try:
-                    judge_score = self.judge.judge(
+                    judge_score = active_judge.judge(
                         question=qa_item.question,
                         ground_truth=ground_truth,
                         prediction=prediction,
                     )
                     judge_latency_ms = (time.perf_counter() - judge_started) * 1000
                     if judge_score < 0:
-                        error = getattr(self.judge, "last_error", None)
+                        error = getattr(active_judge, "last_error", None)
                         raise RuntimeError(error or "Judge returned failure score -1")
                     stage_status["judge"] = {
                         "status": "success",

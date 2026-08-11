@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import random
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Ensure the HESM project root is on sys.path
@@ -61,6 +61,45 @@ def load_hesm_config() -> dict:
         return yaml.safe_load(f)
 
 
+def build_method(
+    name: str,
+    exp_cfg: dict,
+    hesm_cfg: dict,
+    *,
+    parallel_query_mode: bool = False,
+) -> MemorySystem:
+    """Construct one memory method, optionally disabling mutable query caches."""
+    memory_root = _PROJECT_ROOT / exp_cfg["output"]["memory"]
+    hesm_section = exp_cfg.get("hesm", {})
+    if name == "full_context":
+        return FullContextMemory()
+    if name == "vector_rag":
+        return VectorRAGMemory(memory_root=memory_root)
+    if name == "mem0":
+        mem0_section = exp_cfg.get("mem0", {})
+        return Mem0Memory(
+            memory_root=memory_root,
+            hesm_config=hesm_cfg,
+            collection_prefix=mem0_section.get("collection_prefix", "mem0_locomo"),
+        )
+    if name == "amem":
+        return AMEMMemory(
+            memory_root=memory_root,
+            hesm_config=hesm_cfg,
+            amem_cfg=exp_cfg.get("amem", {}),
+        )
+    if name == "hesm":
+        return HESMMemory(
+            memory_root=memory_root,
+            hesm_cfg=hesm_section,
+            use_llm_summarizer=hesm_section.get("use_llm_summarizer", True),
+            use_llm_reranker=hesm_section.get("use_llm_reranker", True),
+            use_cache=not parallel_query_mode,
+            model_config=hesm_cfg,
+        )
+    raise ValueError(f"Unknown memory method: {name}")
+
+
 def build_methods(
     exp_cfg: dict,
     hesm_cfg: dict,
@@ -68,38 +107,14 @@ def build_methods(
 ) -> list[MemorySystem]:
     """Construct all enabled MemorySystem instances."""
     methods_cfg = exp_cfg.get("methods", {})
-    memory_root = _PROJECT_ROOT / exp_cfg["output"]["memory"]
-    hesm_section = exp_cfg.get("hesm", {})
-    amem_section = exp_cfg.get("amem", {})
-    mem0_section = exp_cfg.get("mem0", {})
-
-    all_methods: list[tuple[str, MemorySystem]] = [
-        ("full_context", FullContextMemory()),
-        ("vector_rag",   VectorRAGMemory(memory_root=memory_root)),
-        ("mem0",         Mem0Memory(
-            memory_root=memory_root,
-            hesm_config=hesm_cfg,
-            collection_prefix=mem0_section.get("collection_prefix", "mem0_locomo"),
-        )),
-        ("amem",         AMEMMemory(
-            memory_root=memory_root,
-            hesm_config=hesm_cfg,
-            amem_cfg=amem_section,
-        )),
-        ("hesm",         HESMMemory(
-            memory_root=memory_root,
-            hesm_cfg=hesm_section,
-            use_llm_summarizer=hesm_section.get("use_llm_summarizer", True),
-            use_llm_reranker=hesm_section.get("use_llm_reranker", True),
-        )),
-    ]
 
     selected: list[MemorySystem] = []
-    for name, method in all_methods:
+    for name in ("full_context", "vector_rag", "mem0", "amem", "hesm"):
         if enabled_methods and name not in enabled_methods:
             continue
         if not methods_cfg.get(name, {}).get("enabled", True):
             continue
+        method = build_method(name, exp_cfg, hesm_cfg)
         selected.append(method)
         logger.info("Enabled method: %s", name)
 
@@ -110,6 +125,8 @@ def run_main(
     config_path: str | Path | None = None,
     enabled_methods: list[str] | None = None,
     max_conversations: int | None = None,
+    method_workers: int | None = None,
+    qa_workers: int | None = None,
 ) -> list[MethodMetrics]:
     """
     Main entry point — usable both as a script and as a library call.
@@ -140,32 +157,76 @@ def run_main(
     conversations = loader.load(max_conversations=max_conv)
     logger.info("Loaded %d conversations", len(conversations))
 
-    # Shared evaluators
-    answer_generator = LLMAnswerGenerator(hesm_cfg)
-    judge = LLMJudge(hesm_cfg)
     top_k_values: list[int] = exp_cfg.get("retrieval", {}).get("top_k_values", [1, 3, 5])
     token_encoding: str = exp_cfg.get("token_counter", {}).get("encoding", "cl100k_base")
+    concurrency_cfg = exp_cfg.get("concurrency", {})
+    resolved_method_workers = max(
+        1,
+        int(
+            method_workers
+            if method_workers is not None
+            else concurrency_cfg.get("method_workers", 1)
+        ),
+    )
+    resolved_qa_workers = max(
+        1,
+        int(
+            qa_workers
+            if qa_workers is not None
+            else concurrency_cfg.get("qa_workers", 1)
+        ),
+    )
 
     methods = build_methods(exp_cfg, hesm_cfg, enabled_methods)
     if not methods:
         logger.error("No methods enabled — check experiment.yaml")
         return []
 
-    # Run each method
-    all_metrics: list[MethodMetrics] = []
-    for method in methods:
+    def _run_method(method: MemorySystem) -> MethodMetrics:
+        method_name = method.method_name
         runner = QARunner(
             method=method,
-            answer_generator=answer_generator,
-            judge=judge,
+            answer_generator=LLMAnswerGenerator(hesm_cfg),
+            judge=LLMJudge(hesm_cfg),
             output_dir=answers_dir,
             metrics_dir=metrics_dir,
             logs_dir=logs_dir,
+            qa_workers=resolved_qa_workers,
+            method_factory=lambda name=method_name: build_method(
+                name,
+                exp_cfg,
+                hesm_cfg,
+                parallel_query_mode=True,
+            ),
+            answer_generator_factory=lambda: LLMAnswerGenerator(hesm_cfg),
+            judge_factory=lambda: LLMJudge(hesm_cfg),
             top_k_values=top_k_values,
             token_encoding=token_encoding,
         )
-        metrics = runner.run(conversations)
-        all_metrics.append(metrics)
+        return runner.run(conversations)
+
+    # Run methods serially by default; retain declaration order in final tables.
+    if resolved_method_workers <= 1 or len(methods) <= 1:
+        all_metrics = [_run_method(method) for method in methods]
+    else:
+        logger.info(
+            "Running %d methods with %d workers; QA workers per method=%d",
+            len(methods),
+            resolved_method_workers,
+            resolved_qa_workers,
+        )
+        ordered_metrics: list[MethodMetrics | None] = [None] * len(methods)
+        with ThreadPoolExecutor(
+            max_workers=min(resolved_method_workers, len(methods)),
+            thread_name_prefix="locomo-method",
+        ) as executor:
+            futures: dict[Future[MethodMetrics], int] = {
+                executor.submit(_run_method, method): index
+                for index, method in enumerate(methods)
+            }
+            for future in as_completed(futures):
+                ordered_metrics[futures[future]] = future.result()
+        all_metrics = [metric for metric in ordered_metrics if metric is not None]
 
     # Generate result tables
     tg = TableGenerator(tables_dir)
@@ -188,6 +249,18 @@ def _parse_args() -> argparse.Namespace:
         help="Subset of methods to run (default: all enabled in config)",
     )
     p.add_argument(
+        "--method-workers",
+        type=int,
+        default=None,
+        help="Concurrent main-method workers (overrides experiment.yaml)",
+    )
+    p.add_argument(
+        "--qa-workers",
+        type=int,
+        default=None,
+        help="Concurrent QA workers per method (overrides experiment.yaml)",
+    )
+    p.add_argument(
         "--max-conversations",
         type=int,
         default=None,
@@ -202,4 +275,6 @@ if __name__ == "__main__":
         config_path=args.config,
         enabled_methods=args.methods,
         max_conversations=args.max_conversations,
+        method_workers=args.method_workers,
+        qa_workers=args.qa_workers,
     )

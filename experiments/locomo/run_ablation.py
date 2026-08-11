@@ -65,6 +65,7 @@ def run_ablation(
     config_path: str | Path | None = None,
     enabled_variants: list[str] | None = None,
     max_conversations: int | None = None,
+    qa_workers: int | None = None,
 ) -> list[MethodMetrics]:
     if config_path is None:
         config_path = _PROJECT_ROOT / "experiments" / "locomo" / "config" / "experiment.yaml"
@@ -92,6 +93,15 @@ def run_ablation(
     judge = LLMJudge(hesm_cfg)
     top_k_values: list[int] = exp_cfg.get("retrieval", {}).get("top_k_values", [1, 3, 5])
     token_encoding: str = exp_cfg.get("token_counter", {}).get("encoding", "cl100k_base")
+    concurrency_cfg = exp_cfg.get("concurrency", {})
+    resolved_qa_workers = max(
+        1,
+        int(
+            qa_workers
+            if qa_workers is not None
+            else concurrency_cfg.get("qa_workers", 1)
+        ),
+    )
 
     ablation_cfg: dict[str, Any] = exp_cfg.get("ablation", {}).get("variants", {})
     hesm_section = exp_cfg.get("hesm", {})
@@ -109,6 +119,7 @@ def run_ablation(
             memory_root=memory_root,
             hesm_cfg=hesm_section,
             variant_cfg=ablation_cfg[variant],
+            model_config=hesm_cfg,
         )
         runner = QARunner(
             method=method,
@@ -117,6 +128,16 @@ def run_ablation(
             output_dir=answers_dir,
             metrics_dir=metrics_dir,
             logs_dir=logs_dir,
+            qa_workers=resolved_qa_workers,
+            method_factory=lambda name=variant: HESMAblationMemory(
+                variant=name,
+                memory_root=memory_root,
+                hesm_cfg=hesm_section,
+                variant_cfg={**ablation_cfg[name], "use_cache": False},
+                model_config=hesm_cfg,
+            ),
+            answer_generator_factory=lambda: LLMAnswerGenerator(hesm_cfg),
+            judge_factory=lambda: LLMJudge(hesm_cfg),
             top_k_values=top_k_values,
             token_encoding=token_encoding,
         )
@@ -138,6 +159,10 @@ def _parse_args() -> argparse.Namespace:
         help="Ablation variants to run",
     )
     p.add_argument("--max-conversations", type=int, default=None)
+    p.add_argument(
+        "--qa-workers", type=int, default=None,
+        help="Concurrent QA workers (overrides experiment.yaml)",
+    )
     return p.parse_args()
 
 
@@ -147,4 +172,5 @@ if __name__ == "__main__":
         config_path=args.config,
         enabled_variants=args.variants,
         max_conversations=args.max_conversations,
+        qa_workers=args.qa_workers,
     )

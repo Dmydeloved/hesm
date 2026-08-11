@@ -51,6 +51,7 @@ class HESMMemory(MemorySystem):
         use_llm_summarizer: bool = True,
         use_llm_reranker: bool = True,
         use_cache: bool = True,
+        model_config: dict[str, Any] | None = None,
     ) -> None:
         """
         Args:
@@ -58,14 +59,17 @@ class HESMMemory(MemorySystem):
             hesm_cfg:           hesm section from experiment.yaml
             use_llm_summarizer: if False, use TemplateSummarizer (faster, offline)
             use_llm_reranker:   if False, skip LLM reranking (vector-only retrieval)
-            use_cache:          retained by the benchmark adapter interface;
-                                candidate-cache routing is not used by Retriever
+            use_cache:          compatibility-only benchmark argument; the
+                                current HybridRetriever has no cache switch
+            model_config:       full configs/config.yaml content; HESM reads
+                                memory_methods.hesm from it
         """
         self._memory_root = Path(memory_root)
         self._cfg = hesm_cfg
         self._use_llm_summarizer = use_llm_summarizer
         self._use_llm_reranker = use_llm_reranker
-        self._use_cache = use_cache
+        del use_cache
+        self._model_config = model_config or {}
 
         # Populated by build_memory(); reset by reset()
         self._storage: Any = None
@@ -102,6 +106,8 @@ class HESMMemory(MemorySystem):
         if self._has_existing_memory(sessions):
             return
 
+        completed_dia_ids = self._stored_dia_ids()
+
         total_turns = sum(len(s.turns) for s in sessions)
         processed = 0
         recent_turns: list[str] = []  # rolling window for extractor context
@@ -111,6 +117,11 @@ class HESMMemory(MemorySystem):
                 if not turn.text.strip():
                     continue
                 user_input = f"[{turn.speaker}]: {turn.text}"
+                if turn.dia_id and turn.dia_id in completed_dia_ids:
+                    recent_turns.append(
+                        {"user_input": user_input, "extractor_result": {}}
+                    )
+                    continue
                 window_turns = recent_turns[-_CONTEXT_WINDOW:]
                 str_list = [json.dumps(turn, ensure_ascii=False) for turn in window_turns]
                 context = "\n".join(str_list)
@@ -144,6 +155,8 @@ class HESMMemory(MemorySystem):
                             state_key="default",
                         )
                     processed += 1
+                    if turn.dia_id:
+                        completed_dia_ids.add(turn.dia_id)
                 except Exception as exc:
                     logger.warning(
                         "[HESM] %s turn %s failed: %s", conv_id, turn.dia_id, exc
@@ -198,13 +211,14 @@ class HESMMemory(MemorySystem):
         missing_count = len(expected_dia_ids - stored_dia_ids)
         if missing_count:
             logger.warning(
-                "[HESM] %s: reusing existing memory with %d missing dia_ids "
-                "(qa=%d, vectors=%d)",
+                "[HESM] %s: existing memory has %d missing dia_ids; "
+                "only missing turns will be built (qa=%d, vectors=%d)",
                 self._conv_id,
                 missing_count,
                 qa_count,
                 vector_count,
             )
+            return False
         else:
             logger.info(
                 "[HESM] %s: existing memory found (qa=%d, vectors=%d), skipping build",
@@ -212,7 +226,7 @@ class HESMMemory(MemorySystem):
                 qa_count,
                 vector_count,
             )
-        return True
+            return True
 
     def _stored_dia_ids(self) -> set[str]:
         if self._storage is None:
@@ -240,8 +254,10 @@ class HESMMemory(MemorySystem):
         top_k: int = 5,
         use_cache: bool | None = None,
     ) -> RetrievalResult:
-        # The shared benchmark interface still supplies top_k/use_cache. HESM
-        # now gets its three explicit limits from configuration.
+        # The shared benchmark interface still supplies top_k. HESM gets its
+        # three explicit limits from configuration.
+        # use_cache is retained only for callers such as the legacy cache
+        # runner. The current HybridRetriever.recall() does not accept it.
         del top_k, use_cache
         if self._retriever is None or self._extractor is None:
             return RetrievalResult("", [], 0, {"error": "memory not built"})
@@ -311,11 +327,45 @@ class HESMMemory(MemorySystem):
 
         self._storage = MemoryStorage(db_path=str(db_path))
         self._vector_store = ChromaVectorStore(persist_path=str(chroma_path))
-        self._embedder = BailianEmbedder()
-        self._extractor = TopicExtractor()
+        method_models = self._model_config.get("memory_methods", {}).get(
+            "hesm", {}
+        )
+        embedding_cfg = method_models.get("embedding") or self._model_config.get(
+            "embedding", {}
+        )
+        topic_cfg = method_models.get(
+            "topic_extraction"
+        ) or self._model_config.get("topic_extraction", {})
+        summarization_cfg = method_models.get(
+            "summarization"
+        ) or self._model_config.get("summarization", {})
+        retrieval_cfg = method_models.get("retrieval") or self._model_config.get(
+            "retrieval", {}
+        )
+
+        self._embedder = BailianEmbedder(
+            api_key=embedding_cfg.get("api_key"),
+            model=embedding_cfg.get("model"),
+            base_url=embedding_cfg.get("base_url"),
+        )
+        self._extractor = TopicExtractor(
+            api_key=topic_cfg.get("api_key"),
+            model=topic_cfg.get("model"),
+            base_url=topic_cfg.get("base_url"),
+            max_retries=topic_cfg.get("max_retries"),
+            retry_delay=topic_cfg.get("retry_delay"),
+        )
 
         summarizer = (
-            LLMSummarizer() if self._use_llm_summarizer else TemplateSummarizer()
+            LLMSummarizer(
+                api_key=summarization_cfg.get("api_key"),
+                model=summarization_cfg.get("model"),
+                base_url=summarization_cfg.get("base_url"),
+                max_retries=summarization_cfg.get("max_retries"),
+                retry_delay=summarization_cfg.get("retry_delay"),
+            )
+            if self._use_llm_summarizer
+            else TemplateSummarizer()
         )
 
         self._manager = MemoryManager(
@@ -343,6 +393,11 @@ class HESMMemory(MemorySystem):
                 vector_store=self._vector_store,
                 embedder=self._embedder,
                 rerank_with_llm=True,
+                retrieval_api_key=retrieval_cfg.get("api_key"),
+                retrieval_model=retrieval_cfg.get("model"),
+                retrieval_base_url=retrieval_cfg.get("base_url"),
+                retrieval_max_retries=retrieval_cfg.get("max_retries"),
+                retrieval_retry_delay=retrieval_cfg.get("retry_delay"),
             )
         else:
             self._retriever = HybridRetriever(
@@ -399,6 +454,7 @@ class HESMAblationMemory(MemorySystem):
         memory_root: str | Path,
         hesm_cfg: dict[str, Any],
         variant_cfg: dict[str, Any],
+        model_config: dict[str, Any] | None = None,
     ) -> None:
         """
         Args:
@@ -411,6 +467,7 @@ class HESMAblationMemory(MemorySystem):
         self._memory_root = Path(memory_root)
         self._hesm_cfg = hesm_cfg
         self._variant_cfg = variant_cfg
+        self._model_config = model_config or {}
 
         self._storage: Any = None
         self._vector_store: Any = None       # HESM vector store (QA/Segment/Exp vectors)
@@ -447,7 +504,17 @@ class HESMAblationMemory(MemorySystem):
         from memory.embedder import BailianEmbedder
 
         self._conv_id = conv_id
-        self._embedder = BailianEmbedder()
+        method_models = self._model_config.get("memory_methods", {}).get(
+            "hesm", {}
+        )
+        embedding_cfg = method_models.get("embedding") or self._model_config.get(
+            "embedding", {}
+        )
+        self._embedder = BailianEmbedder(
+            api_key=embedding_cfg.get("api_key"),
+            model=embedding_cfg.get("model"),
+            base_url=embedding_cfg.get("base_url"),
+        )
 
         if self._variant == "flat_memory":
             self._build_flat_memory(conv_id, sessions)
@@ -478,6 +545,20 @@ class HESMAblationMemory(MemorySystem):
         flat_path = self._memory_root / f"ablation_flat_{conv_id}" / "chroma"
         flat_path.mkdir(parents=True, exist_ok=True)
         self._flat_vector_store = ChromaVectorStore(persist_path=str(flat_path))
+
+        expected_count = sum(
+            1
+            for session in sessions
+            for turn in session.turns
+            if turn.dia_id and turn.text.strip()
+        )
+        if expected_count and self._flat_vector_store.count() >= expected_count:
+            logger.info(
+                "[AblationFlat] %s: memory already complete (%d turns), skipping build",
+                conv_id,
+                expected_count,
+            )
+            return
 
         total = 0
         for session in sessions:
@@ -518,7 +599,22 @@ class HESMAblationMemory(MemorySystem):
 
         self._storage = MemoryStorage(db_path=str(base / "memory.sqlite3"))
         self._vector_store = ChromaVectorStore(persist_path=str(base / "chroma"))
-        self._extractor = TopicExtractor()
+        method_models = self._model_config.get("memory_methods", {}).get(
+            "hesm", {}
+        )
+        topic_cfg = method_models.get(
+            "topic_extraction"
+        ) or self._model_config.get("topic_extraction", {})
+        retrieval_cfg = method_models.get("retrieval") or self._model_config.get(
+            "retrieval", {}
+        )
+        self._extractor = TopicExtractor(
+            api_key=topic_cfg.get("api_key"),
+            model=topic_cfg.get("model"),
+            base_url=topic_cfg.get("base_url"),
+            max_retries=topic_cfg.get("max_retries"),
+            retry_delay=topic_cfg.get("retry_delay"),
+        )
 
         if self._variant in {"full_hesm", "full_hesm_no_reranker"}:
             self._retriever = HybridRetriever(
@@ -528,6 +624,11 @@ class HESMAblationMemory(MemorySystem):
                 rerank_with_llm=bool(
                     self._variant_cfg.get("use_llm_reranker", True)
                 ),
+                retrieval_api_key=retrieval_cfg.get("api_key"),
+                retrieval_model=retrieval_cfg.get("model"),
+                retrieval_base_url=retrieval_cfg.get("base_url"),
+                retrieval_max_retries=retrieval_cfg.get("max_retries"),
+                retrieval_retry_delay=retrieval_cfg.get("retry_delay"),
             )
 
     def _ensure_hesm_storage(
@@ -554,6 +655,7 @@ class HESMAblationMemory(MemorySystem):
                 self._hesm_cfg.get("use_llm_summarizer", True)
             ),
             use_llm_reranker=False,
+            model_config=self._model_config,
         )
         builder.build_memory(conv_id, sessions, speaker_a, speaker_b)
         if not db_path.exists() or not chroma_path.exists():

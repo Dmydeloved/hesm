@@ -12,30 +12,35 @@ paths:
   end_to_end_details: data/benchmark/end_to_end_details.jsonl
   end_to_end_summary: data/benchmark/end_to_end_summary.json
 
-topic_extraction: &primary_llm_defaults
+# Shared provider settings. Role/method sections below only select a model.
+_llm_connection: &llm_connection
   api_key: "sk-RFUNAF0b6zfJWCVz9dA1Aa244aEa43Dc974693370b8d4338"
-  model: gpt-5.5
   base_url: https://api.gpt.ge/v1/
   max_retries: 3
   retry_delay: 2.0
 
-# Final answer generation. Connection and retry settings inherit from
-# topic_extraction, while the model can be selected independently.
-answer_generation:
-  <<: *primary_llm_defaults
-  model: gpt-5.4-nano-high
+_llm_profiles:
+  strong: &strong_llm
+    <<: *llm_connection
+    model: gpt-5.6-sol
+  nano: &nano_llm
+    <<: *llm_connection
+    model: gpt-5.4-nano-high
+  judge: &judge_llm
+    <<: *llm_connection
+    model: gpt-5.4-mini
 
-embedding:
+topic_extraction: *nano_llm
+answer_generation: *judge_llm
+
+embedding: &embedding_defaults
   api_key: "sk-29434e233c3e437281144cd9e2a1f04f"
   model: text-embedding-v4
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 
 retrieval:
-  api_key: "sk-RFUNAF0b6zfJWCVz9dA1Aa244aEa43Dc974693370b8d4338"
-  model: gpt-5.4-nano-high
-  base_url: https://api.gpt.ge/v1/
-  max_retries: 3
-  retry_delay: 2.0
+  # Retrieval-specific tuning extends the shared nano LLM profile.
+  <<: *nano_llm
   top_experience: 2
   top_segment: 3
   top_qa: 8
@@ -56,13 +61,19 @@ retrieval:
   summary_extreme_segment_chars: 160
   token_encoding: cl100k_base
 
-summarization:
-  api_key: "sk-RFUNAF0b6zfJWCVz9dA1Aa244aEa43Dc974693370b8d4338"
-  model: gpt-5.5
-  base_url: https://api.gpt.ge/v1/
-  max_retries: 3
-  retry_delay: 2.0
+summarization: *strong_llm
+evaluation: *judge_llm
 
-evaluation:
-  <<: *primary_llm_defaults
-  model: gpt-5.4-nano-high
+# Each benchmark method keeps an explicit config path while reusing profiles.
+memory_methods:
+  mem0:
+    llm: *nano_llm
+    embedding: *embedding_defaults
+  amem:
+    llm: *nano_llm
+    embedding: *embedding_defaults
+  hesm:
+    topic_extraction: *nano_llm
+    summarization: *nano_llm
+    retrieval: *nano_llm
+    embedding: *embedding_defaults

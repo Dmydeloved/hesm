@@ -2,9 +2,8 @@
 Mem0 memory system adapter.
 
 Uses the mem0ai library (pip install mem0ai) to build and query memory.
-Configures Mem0 to use the same OpenAI-compatible LLM and embedding API
-as the rest of the HESM experiment (topic_extraction and embedding sections
-from configs/config.yaml).
+Configures Mem0 from the isolated memory_methods.mem0 section in
+configs/config.yaml, with legacy top-level fallbacks.
 
 dia_id tracking: stored as Mem0 metadata {"dia_id": "D1:3"} and recovered
 from search results.
@@ -14,12 +13,18 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
 from experiments.locomo.data.loader import Session
 from experiments.locomo.evaluation.token_metrics import count_tokens
 from experiments.locomo.methods.base import MemorySystem, RetrievalResult
+from experiments.locomo.methods.build_state import (
+    expected_dia_ids,
+    load_completed_dia_ids,
+    save_build_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +37,8 @@ class Mem0Memory(MemorySystem):
     are isolated between conversations.
 
     Mem0 is configured to use:
-    - LLM:       topic_extraction config (OpenAI-compatible)
-    - Embedder:  embedding config (Alibaba DashScope text-embedding-v4)
+    - LLM:       memory_methods.mem0.llm (OpenAI-compatible)
+    - Embedder:  memory_methods.mem0.embedding
     - VectorDB:  Chroma (persisted per conv_id)
     """
 
@@ -67,12 +72,40 @@ class Mem0Memory(MemorySystem):
         self._user_id = conv_id
         self._memory = self._create_mem0(conv_id)
         if self._memory is None:
+            raise RuntimeError(f"Mem0 could not attach or initialise memory for {conv_id}")
+
+        expected = expected_dia_ids(sessions)
+        base = self._memory_root / f"mem0_{conv_id}"
+        state_path = base / "build_state.json"
+        completed = load_completed_dia_ids(state_path)
+        if not completed:
+            # Backward compatibility for stores built before build_state.json
+            # existed. Chroma persists the source dia_id in embedding metadata.
+            completed.update(self._legacy_chroma_dia_ids(base / "chroma"))
+
+        if expected and expected <= completed:
+            save_build_state(
+                state_path,
+                method=self.method_name,
+                conv_id=conv_id,
+                expected=expected,
+                completed=completed,
+            )
+            logger.info(
+                "[Mem0] %s: memory already complete (%d turns), skipping build",
+                conv_id,
+                len(expected),
+            )
             return
 
         total = 0
+        skipped = 0
         for session in sessions:
             for turn in session.turns:
-                if not turn.text.strip():
+                if not turn.text.strip() or not turn.dia_id:
+                    continue
+                if turn.dia_id in completed:
+                    skipped += 1
                     continue
                 text = f"[{turn.speaker}]: {turn.text}"
                 try:
@@ -87,10 +120,30 @@ class Mem0Memory(MemorySystem):
                         },
                     )
                     total += 1
+                    completed.add(turn.dia_id)
+                    save_build_state(
+                        state_path,
+                        method=self.method_name,
+                        conv_id=conv_id,
+                        expected=expected,
+                        completed=completed,
+                    )
                 except Exception as exc:
                     logger.warning("[Mem0] turn %s failed: %s", turn.dia_id, exc)
 
-        logger.info("[Mem0] %s: added %d turns", conv_id, total)
+        save_build_state(
+            state_path,
+            method=self.method_name,
+            conv_id=conv_id,
+            expected=expected,
+            completed=completed,
+        )
+        logger.info(
+            "[Mem0] %s: added %d turns, skipped %d completed turns",
+            conv_id,
+            total,
+            skipped,
+        )
 
     def retrieve(self, question: str, top_k: int = 5) -> RetrievalResult:
         if self._memory is None:
@@ -141,8 +194,9 @@ class Mem0Memory(MemorySystem):
             return None
 
         cfg = self._hesm_config
-        te = cfg.get("topic_extraction", {})
-        emb = cfg.get("embedding", {})
+        method_cfg = cfg.get("memory_methods", {}).get("mem0", {})
+        te = method_cfg.get("llm") or cfg.get("topic_extraction", {})
+        emb = method_cfg.get("embedding") or cfg.get("embedding", {})
 
         api_key = te.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
         emb_api_key = emb.get("api_key") or api_key
@@ -181,6 +235,28 @@ class Mem0Memory(MemorySystem):
 
         try:
             return Memory.from_config(mem0_config)
-        except Exception as exc:
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             logger.error("[Mem0] Failed to initialise: %s", exc)
             return None
+
+    @staticmethod
+    def _legacy_chroma_dia_ids(chroma_path: Path) -> set[str]:
+        """Recover source IDs from a legacy Mem0 Chroma store without loading Mem0."""
+        sqlite_path = chroma_path / "chroma.sqlite3"
+        if not sqlite_path.exists():
+            return set()
+        try:
+            connection = sqlite3.connect(str(sqlite_path))
+            try:
+                rows = connection.execute(
+                    "SELECT string_value FROM embedding_metadata "
+                    "WHERE key = 'dia_id' AND string_value IS NOT NULL"
+                ).fetchall()
+            finally:
+                connection.close()
+            return {str(row[0]) for row in rows if str(row[0]).strip()}
+        except sqlite3.Error as exc:
+            logger.warning("[Mem0] failed to inspect legacy build state: %s", exc)
+            return set()

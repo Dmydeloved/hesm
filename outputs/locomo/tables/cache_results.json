@@ -1,0 +1,20 @@
+[
+  {
+    "mode": "cache_off",
+    "avg_latency_ms": 10056.2,
+    "p50_ms": 8166.6,
+    "p90_ms": 17960.47,
+    "p99_ms": 26945.52,
+    "cache_hit_rate": 0.0,
+    "latency_reduction": "-15.00%"
+  },
+  {
+    "mode": "cache_on",
+    "avg_latency_ms": 11564.47,
+    "p50_ms": 10437.97,
+    "p90_ms": 21848.97,
+    "p99_ms": 26205.59,
+    "cache_hit_rate": 0.0,
+    "latency_reduction": "-15.00%"
+  }
+]

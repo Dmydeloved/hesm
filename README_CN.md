@@ -91,6 +91,27 @@ pip install openai pyyaml tiktoken chromadb mem0ai
 实验路径、启用方法、Top-K 和消融变体位于
 `experiments/locomo/config/experiment.yaml`。
 
+### Mem0、A-MEM 与 HESM 使用的模型
+
+当前配置如下：
+
+| 组件 | 配置段 | 当前模型 |
+|---|---|---|
+| Mem0 内部记忆抽取/更新 LLM | `memory_methods.mem0.llm` | `gpt-5.4-nano-high` |
+| Mem0 Embedding | `memory_methods.mem0.embedding` | `text-embedding-v4` |
+| A-MEM 关键词与上下文生成 LLM | `memory_methods.amem.llm` | `gpt-5.4-nano-high` |
+| A-MEM Embedding | `memory_methods.amem.embedding` | `text-embedding-v4` |
+| HESM 主题抽取 | `memory_methods.hesm.topic_extraction` | `gpt-5.4-nano-high` |
+| HESM 层级摘要 | `memory_methods.hesm.summarization` | `gpt-5.4-nano-high` |
+| HESM 检索重排 | `memory_methods.hesm.retrieval` | `gpt-5.4-nano-high` |
+| HESM Embedding | `memory_methods.hesm.embedding` | `text-embedding-v4` |
+| 各方法共用的最终答案模型 | `answer_generation` | `gpt-5.4-mini` |
+| 各方法共用的 Judge 模型 | `evaluation` | `gpt-5.4-mini` |
+
+三个适配器分别读取自己的 `memory_methods` 子配置。YAML Profile 统一维护公共连接、
+模型、重试和 Embedding 参数，同时保留代码原有的角色配置路径。修改 Profile 可同步
+更新所有引用它的角色；如需单独调整某种方法，也可将对应别名替换为独立配置。
+
 ## 运行实验
 
 以下命令均在仓库根目录执行。
@@ -118,7 +139,17 @@ python -m experiments.locomo.run_all --methods vector_rag hesm
 
 # 跳过耗时部分
 python -m experiments.locomo.run_all --skip-parts ablation cache
+
+# 推荐配置：方法串行，每种方法内部并发执行 4 个 QA
+python -m experiments.locomo.run_all --method-workers 1 --qa-workers 4
 ```
+
+`method_workers` 控制同时运行的方法数，默认值为 1，避免不同方法竞争资源而干扰
+延迟指标。`qa_workers` 控制每个对话完成记忆构建后并发处理的问题数，默认值为 4。
+每个 QA 工作线程独占检索读取器、答案模型客户端和 Judge 客户端，checkpoint 仍由
+父线程串行写入。如果更关心总完成时间而不是隔离后的单方法延迟，可使用
+`--method-workers 4 --qa-workers 1`。不建议同时把两者设得很大，因为峰值请求并发量
+近似为两者的乘积。
 
 ### 只运行主实验
 
@@ -214,6 +245,11 @@ outputs/locomo/answers/<method>_<conv_id>.json
 - 检索失败、空答案和 Judge 失败的 query 自动重试；
 - 失败记录和阶段错误原因保留在检查点及日志中；
 - 旧检查点只有在答案非空且 `judge_score >= 0` 时才视为成功。
+- Mem0 与 A-MEM 会分别在 `memory/mem0_<conv_id>/build_state.json` 和
+  `memory/amem_<conv_id>/build_state.json` 保存已完成的源 `dia_id`；完整记忆会跳过
+  全部构建调用，部分完成的记忆只补建缺失轮次。
+- HESM 会核对 SQLite 中保存的 `dia_id`：存储完整时跳过重构，部分完成时仅补建
+  缺失轮次。
 
 因此，实验中断后可以直接重新执行原命令，不会重复支付已成功 query 的调用成本。
 

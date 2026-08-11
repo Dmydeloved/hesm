@@ -57,19 +57,22 @@ class _Judge:
         return self.score
 
 
-def _conversation() -> LoCoMoConversation:
+def _conversation(question_count: int = 1) -> LoCoMoConversation:
     turn = Turn("A", "answer", "D1:1", 1, "2026-01-01")
     return LoCoMoConversation(
         conv_id="conv-test",
         speaker_a="A",
         speaker_b="B",
         sessions=[Session(1, "2026-01-01", [turn])],
-        questions=[QAItem("What is the answer?", "answer", ["D1:1"], 4)],
+        questions=[
+            QAItem(f"What is answer {index}?", "answer", ["D1:1"], 4)
+            for index in range(question_count)
+        ],
         _turn_index={"D1:1": turn},
     )
 
 
-def _runner(tmp_path, method, judge) -> QARunner:
+def _runner(tmp_path, method, judge, **kwargs) -> QARunner:
     return QARunner(
         method=method,
         answer_generator=_Answer(),
@@ -77,6 +80,7 @@ def _runner(tmp_path, method, judge) -> QARunner:
         output_dir=tmp_path / "answers",
         metrics_dir=tmp_path / "metrics",
         logs_dir=tmp_path / "logs",
+        **kwargs,
     )
 
 
@@ -118,7 +122,7 @@ class RunnerResumeLoggingTests(unittest.TestCase):
         )
         self.assertFalse(failed_checkpoint.is_complete())
         self.assertFalse(
-            failed_checkpoint.is_answered(0, "What is the answer?")
+            failed_checkpoint.is_answered(0, "What is answer 0?")
         )
         failed_record = failed_checkpoint.load_all_records_ordered(1)[0]
         self.assertEqual(failed_record["query_status"], "failed")
@@ -147,8 +151,38 @@ class RunnerResumeLoggingTests(unittest.TestCase):
         )
         self.assertTrue(completed_checkpoint.is_complete())
         self.assertTrue(
-            completed_checkpoint.is_answered(0, "What is the answer?")
+            completed_checkpoint.is_answered(0, "What is answer 0?")
         )
+
+    def test_parallel_qa_uses_worker_owned_components(self) -> None:
+        conv = _conversation(question_count=6)
+        master_method = _Method()
+        worker_methods: list[_Method] = []
+
+        def method_factory() -> _Method:
+            method = _Method()
+            worker_methods.append(method)
+            return method
+
+        _runner(
+            self.root,
+            master_method,
+            _Judge(1),
+            qa_workers=2,
+            method_factory=method_factory,
+            answer_generator_factory=_Answer,
+            judge_factory=lambda: _Judge(1),
+        ).run([conv])
+
+        checkpoint = Checkpoint(self.root / "answers", "fake_method", "conv-test")
+        records = checkpoint.load_all_records_ordered(len(conv.questions))
+        self.assertTrue(checkpoint.is_complete())
+        self.assertEqual(master_method.build_calls, 1)
+        self.assertEqual(master_method.retrieve_calls, 0)
+        self.assertGreaterEqual(len(worker_methods), 1)
+        self.assertLessEqual(len(worker_methods), 2)
+        self.assertEqual(sum(method.retrieve_calls for method in worker_methods), 6)
+        self.assertTrue(all(record["query_status"] == "success" for record in records))
 
     def test_legacy_checkpoint_requires_nonempty_answer_and_valid_judge(self) -> None:
         answers_dir = self.root / "answers"

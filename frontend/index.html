@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="HESM Experience、Segment 与 QA 记忆管理原型" />
+    <title>HESM Memory Manager</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="app-header">
+        <a class="brand" href="#" aria-label="HESM Memory Manager">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span><strong>HESM</strong><small>MEMORY MANAGER</small></span>
+        </a>
+
+        <div class="header-title">
+          <span class="header-divider"></span>
+          <div><small>MEMORY STORAGE</small><strong>记忆管理</strong></div>
+        </div>
+
+        <div class="header-actions">
+          <span class="snapshot-chip"><i></i>离线快照</span>
+          <button id="runtime-jump" class="secondary-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="2"></circle><path d="M12 2v3M12 19v3M2 12h3M19 12h3"></path></svg>
+            定位当前记忆
+          </button>
+        </div>
+      </header>
+
+      <div class="workspace">
+        <aside class="experience-pane" aria-label="Experience 列表">
+          <div class="pane-heading">
+            <div><p>MEMORY SPACE</p><h1>Experiences</h1></div>
+            <span id="experience-total" class="count-badge">0</span>
+          </div>
+
+          <label class="search-box" for="experience-search">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m16.5 16.5 4 4"></path></svg>
+            <input id="experience-search" type="search" placeholder="搜索主题、实体或 ID" />
+            <kbd>⌘ K</kbd>
+          </label>
+
+          <div class="filter-row" role="group" aria-label="Experience 筛选">
+            <button class="filter-chip active" type="button" data-exp-filter="all">全部</button>
+            <button class="filter-chip" type="button" data-exp-filter="current">当前</button>
+            <!-- <button class="filter-chip" type="button" data-exp-filter="has-summary">有总结</button> -->
+          </div>
+
+          <div id="experience-list" class="experience-list" aria-live="polite"></div>
+
+          <div class="pane-footer">
+            <div class="storage-meter"><span style="width: 68%"></span></div>
+            <div><span>hesm_conv-26</span><strong>完整数据快照</strong></div>
+          </div>
+        </aside>
+
+        <main class="content-pane">
+          <nav class="breadcrumb" aria-label="记忆层级">
+            <span>Memory</span><i>›</i><span>Experience</span><i>›</i><strong id="breadcrumb-topic">—</strong>
+          </nav>
+
+          <section class="global-stats" aria-label="记忆总量统计">
+            <article class="global-stat experience-stat">
+              <span class="stat-glyph">E</span>
+              <div><small>EXPERIENCE</small><strong id="global-experience-count">0</strong><p>一级主题记忆</p></div>
+            </article>
+            <article class="global-stat segment-stat">
+              <span class="stat-glyph">S</span>
+              <div><small>SEGMENT</small><strong id="global-segment-count">0</strong><p>阶段记忆序列</p></div>
+            </article>
+            <article class="global-stat qa-stat">
+              <span class="stat-glyph">Q</span>
+              <div><small>QA MEMORY</small><strong id="global-qa-count">0</strong><p>原始对话记忆</p></div>
+            </article>
+          </section>
+
+          <section id="experience-header" class="experience-header"></section>
+
+          <section class="state-card">
+            <div class="card-heading"><div><span class="heading-icon green">●</span><h2>Experience 状态与结构</h2></div></div>
+            <dl id="experience-state" class="state-grid"></dl>
+          </section>
+
+          <section class="intent-section">
+            <div class="section-title-row">
+              <div><span class="section-label">INTENT LINKS</span><h2>意图演进</h2></div>
+              <span id="intent-count">0 个意图</span>
+            </div>
+            <div id="intent-list" class="intent-list"></div>
+          </section>
+
+          <section class="segment-section">
+            <div class="section-title-row segment-title-row">
+              <div><span class="section-label">SEGMENT SEQUENCE</span><h2>Segment 序列</h2></div>
+              <div class="segment-controls">
+                <label class="mini-search">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m16.5 16.5 4 4"></path></svg>
+                  <input id="segment-search" type="search" placeholder="筛选 Segment" />
+                </label>
+                <span id="segment-count">0 个 Segment</span>
+              </div>
+            </div>
+            <div class="segment-table-head" aria-hidden="true">
+              <span>序列</span><span>主题 / 意图</span><span>状态</span><span>QA</span><span>更新时间</span><span></span>
+            </div>
+            <div id="segment-list" class="segment-list" aria-live="polite"></div>
+          </section>
+        </main>
+
+        <aside class="detail-pane" aria-label="Segment 和 QA 详情">
+          <div id="segment-detail" class="segment-detail"></div>
+
+          <section class="qa-section">
+            <div class="qa-section-head">
+              <div><span class="section-label">RAW MEMORIES</span><h2>QA 记忆</h2></div>
+              <span id="qa-count" class="count-badge small">0</span>
+            </div>
+            <label class="search-box compact" for="qa-search">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m16.5 16.5 4 4"></path></svg>
+              <input id="qa-search" type="search" placeholder="搜索对话内容或标签" />
+            </label>
+            <div id="qa-list" class="qa-list" aria-live="polite"></div>
+          </section>
+        </aside>
+      </div>
+    </div>
+
+    <dialog id="qa-dialog" class="qa-dialog">
+      <div class="dialog-header">
+        <div><span class="section-label">QA MEMORY DETAIL</span><h2>记忆详情</h2></div>
+        <button id="dialog-close" class="close-button" type="button" aria-label="关闭">×</button>
+      </div>
+      <div id="qa-dialog-content" class="dialog-content"></div>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <script src="memory-data.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

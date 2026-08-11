@@ -9,6 +9,15 @@ experiment:
   # null = run all 10 conversations; set to int to limit (e.g. 2 for quick test)
   max_conversations: null
 
+# ── Concurrency ─────────────────────────────────────────────
+concurrency:
+  # Keep methods serial by default so latency comparisons do not contend for
+  # the same API/network resources. Increase explicitly for throughput runs.
+  method_workers: 4
+  # Queries run concurrently after a conversation memory is fully built.
+  # Each worker owns its memory reader, answer client, and Judge client.
+  qa_workers: 4
+
 # ── Dataset ─────────────────────────────────────────────────
 dataset:
   path: data/locomo10.json
@@ -28,8 +37,8 @@ retrieval:
   default_top_k: 5           # used for context injection into LLM
 
 # ── Model configuration ─────────────────────────────────────
-# Model roles are configured independently in configs/config.yaml:
-# topic_extraction, answer_generation, retrieval, summarization, evaluation, embedding.
+# Memory models are isolated under configs/config.yaml [memory_methods]:
+# mem0, amem, and hesm. Answer generation and Judge remain shared roles.
 llm:
   config_path: configs/config.yaml
 
@@ -63,15 +72,13 @@ hesm:
 
 # ── Mem0 settings ───────────────────────────────────────────
 mem0:
-  # Mem0 uses the same embedding config (from configs/config.yaml [embedding])
-  # and topic_extraction config for its LLM
+  # LLM/embedding: configs/config.yaml [memory_methods.mem0]
   collection_prefix: mem0_locomo  # Chroma collection name prefix
 
 # ── A-MEM settings ──────────────────────────────────────────
 amem:
   # A-MEM implemented from scratch (paper algorithm)
-  # Uses topic_extraction LLM for keyword extraction
-  # Uses embedding config for vector similarity
+  # LLM/embedding: configs/config.yaml [memory_methods.amem]
   top_related: 5   # number of related memories to link when adding
   link_threshold: 0.7  # minimum similarity to create a memory link
 
