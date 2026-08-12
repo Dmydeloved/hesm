@@ -2,8 +2,8 @@
 Mem0 memory system adapter.
 
 Uses the mem0ai library (pip install mem0ai) to build and query memory.
-Configures Mem0 from the isolated memory_methods.mem0 section in
-configs/config.yaml, with legacy top-level fallbacks.
+Configures Mem0 exclusively from the isolated memory_methods.mem0 section in
+experiments/config/locomo.yaml.
 
 dia_id tracking: stored as Mem0 metadata {"dia_id": "D1:3"} and recovered
 from search results.
@@ -12,8 +12,6 @@ from search results.
 from __future__ import annotations
 
 import logging
-import os
-import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -45,11 +43,11 @@ class Mem0Memory(MemorySystem):
     def __init__(
         self,
         memory_root: str | Path,
-        hesm_config: dict[str, Any],
+        experiment_config: dict[str, Any],
         collection_prefix: str = "mem0_locomo",
     ) -> None:
         self._memory_root = Path(memory_root)
-        self._hesm_config = hesm_config  # full configs/config.yaml content
+        self._experiment_config = experiment_config  # full experiments/config/locomo.yaml content
         self._collection_prefix = collection_prefix
         self._memory: Any = None
         self._user_id: str = ""
@@ -78,11 +76,6 @@ class Mem0Memory(MemorySystem):
         base = self._memory_root / f"mem0_{conv_id}"
         state_path = base / "build_state.json"
         completed = load_completed_dia_ids(state_path)
-        if not completed:
-            # Backward compatibility for stores built before build_state.json
-            # existed. Chroma persists the source dia_id in embedding metadata.
-            completed.update(self._legacy_chroma_dia_ids(base / "chroma"))
-
         if expected and expected <= completed:
             save_build_state(
                 state_path,
@@ -193,13 +186,27 @@ class Mem0Memory(MemorySystem):
             )
             return None
 
-        cfg = self._hesm_config
+        cfg = self._experiment_config
         method_cfg = cfg.get("memory_methods", {}).get("mem0", {})
-        te = method_cfg.get("llm") or cfg.get("topic_extraction", {})
-        emb = method_cfg.get("embedding") or cfg.get("embedding", {})
+        te = method_cfg.get("llm", {})
+        emb = method_cfg.get("embedding", {})
 
-        api_key = te.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
-        emb_api_key = emb.get("api_key") or api_key
+        api_key = te.get("api_key")
+        emb_api_key = emb.get("api_key")
+        if not all(
+            (
+                api_key,
+                te.get("model"),
+                te.get("base_url"),
+                emb_api_key,
+                emb.get("model"),
+                emb.get("base_url"),
+            )
+        ):
+            raise ValueError(
+                "experiments/config/locomo.yaml must define complete "
+                "memory_methods.mem0 settings"
+            )
 
         chroma_path = str(
             self._memory_root / f"mem0_{conv_id}" / "chroma"
@@ -210,18 +217,18 @@ class Mem0Memory(MemorySystem):
             "llm": {
                 "provider": "openai",
                 "config": {
-                    "model": te.get("model", "gpt-4"),
+                    "model": te["model"],
                     "api_key": api_key,
-                    "openai_base_url": te.get("base_url", ""),
+                    "openai_base_url": te["base_url"],
                     "temperature": 0.0,
                 },
             },
             "embedder": {
                 "provider": "openai",
                 "config": {
-                    "model": emb.get("model", "text-embedding-v4"),
+                    "model": emb["model"],
                     "api_key": emb_api_key,
-                    "openai_base_url": emb.get("base_url", ""),
+                    "openai_base_url": emb["base_url"],
                 },
             },
             "vector_store": {
@@ -240,23 +247,3 @@ class Mem0Memory(MemorySystem):
                 raise
             logger.error("[Mem0] Failed to initialise: %s", exc)
             return None
-
-    @staticmethod
-    def _legacy_chroma_dia_ids(chroma_path: Path) -> set[str]:
-        """Recover source IDs from a legacy Mem0 Chroma store without loading Mem0."""
-        sqlite_path = chroma_path / "chroma.sqlite3"
-        if not sqlite_path.exists():
-            return set()
-        try:
-            connection = sqlite3.connect(str(sqlite_path))
-            try:
-                rows = connection.execute(
-                    "SELECT string_value FROM embedding_metadata "
-                    "WHERE key = 'dia_id' AND string_value IS NOT NULL"
-                ).fetchall()
-            finally:
-                connection.close()
-            return {str(row[0]) for row in rows if str(row[0]).strip()}
-        except sqlite3.Error as exc:
-            logger.warning("[Mem0] failed to inspect legacy build state: %s", exc)
-            return set()

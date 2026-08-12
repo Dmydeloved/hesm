@@ -3,10 +3,12 @@
 
   const data = window.HESM_MEMORY_DATA;
   const runtime = data.meta.runtime || {};
+  const locationParams = new URLSearchParams(window.location.search);
+  const requestedQaId = locationParams.get("qa") || "";
   const state = {
     experienceId:
-      runtime.current_experience_id || data.experiences[0]?.id || "",
-    segmentId: runtime.current_segment_id || "",
+      locationParams.get("experience") || runtime.current_experience_id || data.experiences[0]?.id || "",
+    segmentId: locationParams.get("segment") || runtime.current_segment_id || "",
     experienceSearch: "",
     experienceFilter: "all",
     segmentSearch: "",
@@ -483,4 +485,8 @@
   });
 
   selectExperience(state.experienceId, state.segmentId);
+  if (requestedQaId) {
+    const qa = currentSegment()?.qas.find((item) => item.id === requestedQaId);
+    if (qa) showQaDialog(qa);
+  }
 })();

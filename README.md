@@ -32,7 +32,7 @@ Optional LLM hierarchical reranking
 Bounded Experience + Segment + QA context
 ```
 
-The main implementation is under `memory/`:
+The main implementation is under `hesm/`:
 
 - `manager.py`: creates and updates the three memory levels.
 - `storage.py`: SQLite persistence and relational lookup.
@@ -40,6 +40,13 @@ The main implementation is under `memory/`:
 - `extractor.py`: topic, entity, intent, and confidence extraction.
 - `summarizer.py`: template or LLM summaries.
 - `retriever.py`: hierarchical recall, fallback routing, and reranking.
+
+Runtime concerns are deliberately separated:
+
+- `config/hesm.yaml`: production HESM configuration only;
+- `memory/`: production SQLite and Chroma memory only;
+- `experiments/config/locomo.yaml`: self-contained experiment configuration;
+- `experiments/outputs/`: all generated benchmark memories and results.
 
 ## LoCoMo benchmark
 
@@ -82,18 +89,38 @@ Install the runtime packages in your environment:
 pip install openai pyyaml tiktoken chromadb mem0ai
 ```
 
-Configure model roles in `configs/config.yaml`. Keep real API keys outside
-version control. The relevant sections are:
+Production HESM reads only `config/hesm.yaml`. Keep real API keys outside
+version control. Its relevant sections are:
 
 - `topic_extraction`;
-- `answer_generation`;
 - `embedding`;
 - `retrieval`;
 - `summarization`;
-- `evaluation`.
+- `memory_management`;
+- `api`.
 
-Experiment paths, enabled methods, top-K values, and ablation variants are in
-`experiments/locomo/config/experiment.yaml`.
+Experiments read only the self-contained `experiments/config/locomo.yaml`.
+That file owns experiment model roles, paths, enabled methods, top-K values,
+and ablation variants; experiment code never loads the production config.
+
+## Public interfaces
+
+The Python API exposes the two production operations through `HESMService`:
+
+```python
+from hesm import HESMService
+
+service = HESMService()
+service.add_memory(user_input="Alice moved to Paris.")
+result = service.retrieve(question="Where did Alice move?")
+```
+
+The HTTP server exposes the same operations as `POST /api/memories` and
+`POST /api/retrieve`:
+
+```bash
+python -m frontend.server
+```
 
 ### Models used by Mem0, A-MEM, and HESM
 
@@ -112,7 +139,8 @@ The current configuration is:
 | Shared final answer generator | `answer_generation` | `gpt-5.4-mini` |
 | Shared LLM Judge | `evaluation` | `gpt-5.4-mini` |
 
-Each adapter reads its own `memory_methods` subsection. YAML profiles centralize
+Each adapter reads its own `memory_methods` subsection from the experiment
+configuration. YAML profiles centralize
 the shared connection, model, retry, and embedding settings, while the existing
 role paths remain available to the code. Change a profile once to update every
 role that references it, or replace a method alias with a dedicated mapping.
@@ -209,7 +237,7 @@ python -m experiments.locomo.run_cache --num-samples 50
 Every main method and ablation variant writes one structured log file:
 
 ```text
-outputs/locomo/logs/<method>.log
+experiments/outputs/locomo/logs/<method>.log
 ```
 
 Each line is a UTF-8 JSON object. The `stage` field divides events into four
@@ -245,7 +273,7 @@ Example log event:
 Checkpoints are stored per method and conversation:
 
 ```text
-outputs/locomo/answers/<method>_<conv_id>.json
+experiments/outputs/locomo/answers/<method>_<conv_id>.json
 ```
 
 A query is marked complete only when retrieval, answer generation, and Judge
@@ -257,8 +285,8 @@ all succeed. On rerun:
 - legacy checkpoints are considered successful only when the prediction is
   non-empty and `judge_score >= 0`.
 - Mem0 and A-MEM persist completed source `dia_id` values in
-  `memory/mem0_<conv_id>/build_state.json` and
-  `memory/amem_<conv_id>/build_state.json`; complete stores skip all memory-add
+  `experiments/outputs/locomo/memory/mem0_<conv_id>/build_state.json` and
+  `experiments/outputs/locomo/memory/amem_<conv_id>/build_state.json`; complete stores skip all memory-add
   calls, while partial stores add only missing turns.
 - HESM validates stored `dia_id` values in SQLite: a complete store skips
   reconstruction, while a partial store processes only missing turns.
@@ -269,7 +297,7 @@ queries again.
 ## Output layout
 
 ```text
-outputs/locomo/
+experiments/outputs/locomo/
 ├── answers/   # per-method, per-conversation checkpoints and QA records
 ├── logs/      # one four-stage log per method or ablation variant
 ├── memory/    # isolated SQLite and vector stores

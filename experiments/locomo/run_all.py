@@ -23,6 +23,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from experiments.config import load_experiment_config, project_path
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -98,13 +100,21 @@ def run_all(
 
     logger.info("=" * 60)
     logger.info("ALL EXPERIMENTS COMPLETE")
-    logger.info("Results: %s", _PROJECT_ROOT / "outputs" / "locomo" / "tables")
+    experiment_config = load_experiment_config(config_path)
+    logger.info(
+        "Results: %s",
+        project_path(experiment_config["output"]["tables"]),
+    )
     logger.info("=" * 60)
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="LoCoMo Benchmark — Full Experiment Suite")
-    p.add_argument("--config", default=None, help="Path to experiment.yaml")
+    p.add_argument(
+        "--config",
+        default=None,
+        help="Path to experiments/config/locomo.yaml",
+    )
     p.add_argument(
         "--skip-parts", nargs="+",
         choices=["main", "ablation", "cache"], default=None,
@@ -119,11 +129,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-conversations", type=int, default=None)
     p.add_argument(
         "--method-workers", type=int, default=None,
-        help="Concurrent main-method workers (overrides experiment.yaml)",
+        help="Concurrent main-method workers (overrides experiments/config/locomo.yaml)",
     )
     p.add_argument(
         "--qa-workers", type=int, default=None,
-        help="Concurrent QA workers per method (overrides experiment.yaml)",
+        help="Concurrent QA workers per method (overrides experiments/config/locomo.yaml)",
     )
     return p.parse_args()
 

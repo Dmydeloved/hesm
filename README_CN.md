@@ -30,7 +30,7 @@ Experience ── 长期主题与状态
 受预算约束的 Experience + Segment + QA 上下文
 ```
 
-核心实现位于 `memory/`：
+核心实现位于 `hesm/`：
 
 - `manager.py`：创建并维护 Experience、Segment、QA 三层记忆；
 - `storage.py`：SQLite 持久化和关系检索；
@@ -38,6 +38,13 @@ Experience ── 长期主题与状态
 - `extractor.py`：抽取主题、实体、意图和置信度；
 - `summarizer.py`：模板摘要或 LLM 摘要；
 - `retriever.py`：层级召回、回退路由和重排序。
+
+运行目录严格分离：
+
+- `config/hesm.yaml`：仅供生产 HESM 使用；
+- `memory/`：仅保存生产 HESM 的 SQLite 与 Chroma 记忆；
+- `experiments/config/locomo.yaml`：完整且独立的实验配置；
+- `experiments/outputs/`：所有实验记忆与实验结果。
 
 ## LoCoMo 基准实验
 
@@ -78,18 +85,36 @@ Experience ── 长期主题与状态
 pip install openai pyyaml tiktoken chromadb mem0ai
 ```
 
-在 `configs/config.yaml` 中配置模型角色。请勿把真实 API Key 提交到版本库。
+生产 HESM 只读取 `config/hesm.yaml`。请勿把真实 API Key 提交到版本库。
 主要配置段包括：
 
 - `topic_extraction`：主题抽取；
-- `answer_generation`：最终答案生成；
 - `embedding`：向量模型；
 - `retrieval`：检索和重排序；
 - `summarization`：层级摘要；
-- `evaluation`：Judge 模型。
+- `memory_management`：记忆分段和聚合条件；
+- `api`：对外检索默认限制。
 
-实验路径、启用方法、Top-K 和消融变体位于
-`experiments/locomo/config/experiment.yaml`。
+实验只读取完整独立的 `experiments/config/locomo.yaml`，其中包含实验模型、
+路径、启用方法、Top-K 和消融变体。实验代码不会读取生产配置。
+
+## 对外接口
+
+Python 接口通过 `HESMService` 提供记忆添加和检索：
+
+```python
+from hesm import HESMService
+
+service = HESMService()
+service.add_memory(user_input="Alice 搬到了巴黎。")
+result = service.retrieve(question="Alice 搬到了哪里？")
+```
+
+HTTP 服务提供对应的 `POST /api/memories` 与 `POST /api/retrieve`：
+
+```bash
+python -m frontend.server
+```
 
 ### Mem0、A-MEM 与 HESM 使用的模型
 
@@ -108,9 +133,9 @@ pip install openai pyyaml tiktoken chromadb mem0ai
 | 各方法共用的最终答案模型 | `answer_generation` | `gpt-5.4-mini` |
 | 各方法共用的 Judge 模型 | `evaluation` | `gpt-5.4-mini` |
 
-三个适配器分别读取自己的 `memory_methods` 子配置。YAML Profile 统一维护公共连接、
-模型、重试和 Embedding 参数，同时保留代码原有的角色配置路径。修改 Profile 可同步
-更新所有引用它的角色；如需单独调整某种方法，也可将对应别名替换为独立配置。
+三个适配器分别从实验配置读取自己的 `memory_methods` 子配置。YAML Profile 统一维护
+公共连接、模型、重试和 Embedding 参数；如需单独调整某种方法，可将对应别名替换为
+独立配置。
 
 ## 运行实验
 
@@ -202,7 +227,7 @@ python -m experiments.locomo.run_cache --num-samples 50
 每个主实验方法和消融变体都会生成一个独立日志文件：
 
 ```text
-outputs/locomo/logs/<method>.log
+experiments/outputs/locomo/logs/<method>.log
 ```
 
 日志为 UTF-8 JSON Lines 格式，每行是一个 JSON 对象，通过 `stage` 字段划分为四部分：
@@ -236,7 +261,7 @@ outputs/locomo/logs/<method>.log
 每个方法、每个对话维护一个检查点：
 
 ```text
-outputs/locomo/answers/<method>_<conv_id>.json
+experiments/outputs/locomo/answers/<method>_<conv_id>.json
 ```
 
 只有检索、LLM 作答和 Judge 三个查询阶段全部成功，query 才会标记为完成。再次运行时：
@@ -245,8 +270,8 @@ outputs/locomo/answers/<method>_<conv_id>.json
 - 检索失败、空答案和 Judge 失败的 query 自动重试；
 - 失败记录和阶段错误原因保留在检查点及日志中；
 - 旧检查点只有在答案非空且 `judge_score >= 0` 时才视为成功。
-- Mem0 与 A-MEM 会分别在 `memory/mem0_<conv_id>/build_state.json` 和
-  `memory/amem_<conv_id>/build_state.json` 保存已完成的源 `dia_id`；完整记忆会跳过
+- Mem0 与 A-MEM 会分别在 `experiments/outputs/locomo/memory/mem0_<conv_id>/build_state.json` 和
+  `experiments/outputs/locomo/memory/amem_<conv_id>/build_state.json` 保存已完成的源 `dia_id`；完整记忆会跳过
   全部构建调用，部分完成的记忆只补建缺失轮次。
 - HESM 会核对 SQLite 中保存的 `dia_id`：存储完整时跳过重构，部分完成时仅补建
   缺失轮次。
@@ -256,7 +281,7 @@ outputs/locomo/answers/<method>_<conv_id>.json
 ## 输出目录
 
 ```text
-outputs/locomo/
+experiments/outputs/locomo/
 ├── answers/   # 按方法和对话保存的检查点、逐问题结果
 ├── logs/      # 每个方法或消融变体的四阶段日志
 ├── memory/    # 隔离的 SQLite 与向量存储

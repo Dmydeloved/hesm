@@ -3,14 +3,14 @@ Part 1 — Main Experiment: evaluate all 5 memory systems on LoCoMo.
 
 Usage (from d:/code/hesm):
     python -m experiments.locomo.run_main
-    python -m experiments.locomo.run_main --config experiments/locomo/config/experiment.yaml
+    python -m experiments.locomo.run_main --config experiments/config/locomo.yaml
     python -m experiments.locomo.run_main --methods full_context vector_rag hesm
     python -m experiments.locomo.run_main --max-conversations 2  # quick test
 
 Outputs:
-    outputs/locomo/answers/{method}_{conv_id}.json  — per-question QA records
-    outputs/locomo/metrics/{method}_metrics.json    — aggregated metrics
-    outputs/locomo/tables/main_results.{md,csv,json}
+    experiments/outputs/locomo/answers/{method}_{conv_id}.json  — per-question QA records
+    experiments/outputs/locomo/metrics/{method}_metrics.json    — aggregated metrics
+    experiments/outputs/locomo/tables/main_results.{md,csv,json}
 """
 
 from __future__ import annotations
@@ -27,8 +27,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-import yaml
-
+from experiments.config import DEFAULT_CONFIG_PATH, load_experiment_config
 from experiments.locomo.data.loader import LoCoMoLoader
 from experiments.locomo.evaluation.aggregator import MethodMetrics
 from experiments.locomo.evaluation.judge import LLMJudge
@@ -49,22 +48,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_experiment_config(path: str | Path) -> dict:
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def load_hesm_config() -> dict:
-    """Load the main HESM configs/config.yaml."""
-    cfg_path = _PROJECT_ROOT / "configs" / "config.yaml"
-    with open(cfg_path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
 def build_method(
     name: str,
     exp_cfg: dict,
-    hesm_cfg: dict,
     *,
     parallel_query_mode: bool = False,
 ) -> MemorySystem:
@@ -74,18 +60,21 @@ def build_method(
     if name == "full_context":
         return FullContextMemory()
     if name == "vector_rag":
-        return VectorRAGMemory(memory_root=memory_root)
+        return VectorRAGMemory(
+            memory_root=memory_root,
+            experiment_config=exp_cfg,
+        )
     if name == "mem0":
         mem0_section = exp_cfg.get("mem0", {})
         return Mem0Memory(
             memory_root=memory_root,
-            hesm_config=hesm_cfg,
+            experiment_config=exp_cfg,
             collection_prefix=mem0_section.get("collection_prefix", "mem0_locomo"),
         )
     if name == "amem":
         return AMEMMemory(
             memory_root=memory_root,
-            hesm_config=hesm_cfg,
+            experiment_config=exp_cfg,
             amem_cfg=exp_cfg.get("amem", {}),
         )
     if name == "hesm":
@@ -95,14 +84,13 @@ def build_method(
             use_llm_summarizer=hesm_section.get("use_llm_summarizer", True),
             use_llm_reranker=hesm_section.get("use_llm_reranker", True),
             use_cache=not parallel_query_mode,
-            model_config=hesm_cfg,
+            experiment_config=exp_cfg,
         )
     raise ValueError(f"Unknown memory method: {name}")
 
 
 def build_methods(
     exp_cfg: dict,
-    hesm_cfg: dict,
     enabled_methods: list[str] | None,
 ) -> list[MemorySystem]:
     """Construct all enabled MemorySystem instances."""
@@ -114,7 +102,7 @@ def build_methods(
             continue
         if not methods_cfg.get(name, {}).get("enabled", True):
             continue
-        method = build_method(name, exp_cfg, hesm_cfg)
+        method = build_method(name, exp_cfg)
         selected.append(method)
         logger.info("Enabled method: %s", name)
 
@@ -133,10 +121,9 @@ def run_main(
     Returns list of MethodMetrics (one per method).
     """
     if config_path is None:
-        config_path = _PROJECT_ROOT / "experiments" / "locomo" / "config" / "experiment.yaml"
+        config_path = DEFAULT_CONFIG_PATH
 
     exp_cfg = load_experiment_config(config_path)
-    hesm_cfg = load_hesm_config()
 
     # Fixed random seed
     seed = exp_cfg.get("experiment", {}).get("seed", 42)
@@ -147,7 +134,7 @@ def run_main(
     answers_dir = _PROJECT_ROOT / exp_cfg["output"]["answers"]
     metrics_dir = _PROJECT_ROOT / exp_cfg["output"]["metrics"]
     tables_dir  = _PROJECT_ROOT / exp_cfg["output"]["tables"]
-    logs_dir = _PROJECT_ROOT / exp_cfg["output"].get("logs", "outputs/locomo/logs")
+    logs_dir = _PROJECT_ROOT / exp_cfg["output"]["logs"]
     for d in (answers_dir, metrics_dir, tables_dir, logs_dir):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -177,17 +164,17 @@ def run_main(
         ),
     )
 
-    methods = build_methods(exp_cfg, hesm_cfg, enabled_methods)
+    methods = build_methods(exp_cfg, enabled_methods)
     if not methods:
-        logger.error("No methods enabled — check experiment.yaml")
+        logger.error("No methods enabled — check experiments/config/locomo.yaml")
         return []
 
     def _run_method(method: MemorySystem) -> MethodMetrics:
         method_name = method.method_name
         runner = QARunner(
             method=method,
-            answer_generator=LLMAnswerGenerator(hesm_cfg),
-            judge=LLMJudge(hesm_cfg),
+            answer_generator=LLMAnswerGenerator(exp_cfg),
+            judge=LLMJudge(exp_cfg),
             output_dir=answers_dir,
             metrics_dir=metrics_dir,
             logs_dir=logs_dir,
@@ -195,11 +182,10 @@ def run_main(
             method_factory=lambda name=method_name: build_method(
                 name,
                 exp_cfg,
-                hesm_cfg,
                 parallel_query_mode=True,
             ),
-            answer_generator_factory=lambda: LLMAnswerGenerator(hesm_cfg),
-            judge_factory=lambda: LLMJudge(hesm_cfg),
+            answer_generator_factory=lambda: LLMAnswerGenerator(exp_cfg),
+            judge_factory=lambda: LLMJudge(exp_cfg),
             top_k_values=top_k_values,
             token_encoding=token_encoding,
         )
@@ -240,7 +226,11 @@ def run_main(
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="LoCoMo Benchmark — Main Experiment (Part 1)")
-    p.add_argument("--config", default=None, help="Path to experiment.yaml")
+    p.add_argument(
+        "--config",
+        default=None,
+        help="Path to experiments/config/locomo.yaml",
+    )
     p.add_argument(
         "--methods",
         nargs="+",
@@ -252,13 +242,13 @@ def _parse_args() -> argparse.Namespace:
         "--method-workers",
         type=int,
         default=None,
-        help="Concurrent main-method workers (overrides experiment.yaml)",
+        help="Concurrent main-method workers (overrides experiments/config/locomo.yaml)",
     )
     p.add_argument(
         "--qa-workers",
         type=int,
         default=None,
-        help="Concurrent QA workers per method (overrides experiment.yaml)",
+        help="Concurrent QA workers per method (overrides experiments/config/locomo.yaml)",
     )
     p.add_argument(
         "--max-conversations",

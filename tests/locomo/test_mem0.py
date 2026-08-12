@@ -5,7 +5,7 @@ Mem0 Test Pipeline — 与 HESM test_pipeline.py 流程完全一致。
     构建/挂载 Mem0 记忆 → Retrieval → Answer Generation → Evaluate
 
 【设计约束】
-- 记忆路径：outputs/locomo/memory/mem0_{conv_id}/chroma/（与主实验一致）
+- 记忆路径：experiments/outputs/locomo/memory/mem0_{conv_id}/chroma/（与主实验一致）
   首次运行自动构建并写 .built 标记；后续跳过重建。
 - 问题集：共用 tests/locomo/questions.json（与 HESM 测试相同题目）。
 - 完全隔离：所有测试产物写到 tests/locomo/results/mem0/。
@@ -42,7 +42,9 @@ _RESULTS_DIR   = _TESTS_DIR / "results" / "mem0"
 _QUESTIONS_FILE = _TESTS_DIR / "questions.json"
 
 # Mem0 记忆存在主实验目录（与 run_main.py 路径一致）
-_MAIN_MEMORY_ROOT = _PROJECT_ROOT / "outputs" / "locomo" / "memory"
+_MAIN_MEMORY_ROOT = (
+    _PROJECT_ROOT / "experiments" / "outputs" / "locomo" / "memory"
+)
 
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -107,7 +109,7 @@ def _get_or_build_mem0(
     from experiments.locomo.methods.mem0_adapter import Mem0Memory
 
     exp_cfg_path = (
-        _PROJECT_ROOT / "experiments" / "locomo" / "config" / "experiment.yaml"
+        _PROJECT_ROOT / "experiments" / "config" / "locomo.yaml"
     )
     import yaml
     with open(exp_cfg_path, encoding="utf-8") as f:
@@ -118,7 +120,7 @@ def _get_or_build_mem0(
 
     mem0 = Mem0Memory(
         memory_root=_MAIN_MEMORY_ROOT,
-        hesm_config=hesm_cfg,
+        experiment_config=hesm_cfg,
         collection_prefix=collection_prefix,
     )
 
@@ -397,14 +399,12 @@ def run_test(
     logger.info("=" * 66)
 
     # ── 加载配置 ────────────────────────────────────────────────────────
-    with open(_PROJECT_ROOT / "configs" / "config.yaml", encoding="utf-8") as f:
-        hesm_cfg: dict[str, Any] = yaml.safe_load(f)
-
     exp_cfg_path = (
-        _PROJECT_ROOT / "experiments" / "locomo" / "config" / "experiment.yaml"
+        _PROJECT_ROOT / "experiments" / "config" / "locomo.yaml"
     )
     with open(exp_cfg_path, encoding="utf-8") as f:
         exp_cfg: dict[str, Any] = yaml.safe_load(f)
+    hesm_cfg = exp_cfg
 
     # ── 加载问题集 ────────────────────────────────────────────────────────
     if not _QUESTIONS_FILE.exists():

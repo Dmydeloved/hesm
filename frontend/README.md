@@ -1,6 +1,6 @@
 # HESM Memory Manager 前端原型
 
-这是一个不连接后端接口的 HESM 存量记忆管理原型，用于查看已经写入的三级记忆结构，而不是执行记忆检索。
+该目录包含 HESM 存量记忆管理界面和真实记忆检索界面。
 
 ## 页面功能
 
@@ -16,7 +16,7 @@
 页面使用 [memory-data.js](memory-data.js) 中的完整静态快照，来源为：
 
 ```text
-outputs/locomo/memory/hesm_conv-26/memory.sqlite3
+memory/hesm.sqlite3
 ```
 
 当前快照包含：
@@ -29,20 +29,57 @@ outputs/locomo/memory/hesm_conv-26/memory.sqlite3
 
 ## 启动
 
+需要使用真实检索时，在 HESM 项目根目录启动本地 API 与静态服务：
+
+```powershell
+python -m frontend.server
+```
+
+然后访问：
+
+- 记忆管理：`http://127.0.0.1:8080/index.html`
+- 记忆检索：`http://127.0.0.1:8080/retrieval.html`
+
+检索接口会真实执行：
+
+```text
+用户问题
+→ TopicExtractor.extract
+→ HybridRetriever.recall
+→ Experience → Segment → QA 来源树
+```
+
+服务对外提供两个写实接口，均使用 `config/hesm.yaml` 和 `memory/`：
+
+- `POST /api/memories`：添加一条交互记忆；
+- `POST /api/retrieve`：检索层级记忆。
+
+添加记忆示例：
+
+```json
+{
+  "user_input": "Alice 搬到了巴黎。",
+  "assistant_output": "已记录。",
+  "state_key": "alice"
+}
+```
+
+仅浏览离线管理快照时，也可以直接打开 `index.html`，或启动普通静态服务：
+
 可以直接打开 `index.html`，也可以在 HESM 项目根目录启动静态服务：
 
 ```powershell
 python -m http.server 8080 -d frontend
 ```
 
-然后访问 `http://localhost:8080`。
+普通静态服务不提供 `/api/retrieve`，因此不能执行真实检索。
 
 ## 重新生成数据快照
 
 SQLite 数据变化后，在项目根目录运行：
 
 ```powershell
-python frontend/export_memory_snapshot.py outputs/locomo/memory/hesm_conv-26/memory.sqlite3 frontend/memory-data.js
+python frontend/export_memory_snapshot.py memory/hesm.sqlite3 frontend/memory-data.js
 ```
 
 该脚本以 SQLite 只读模式打开数据库，并重新生成前端可直接加载的完整嵌套数据：

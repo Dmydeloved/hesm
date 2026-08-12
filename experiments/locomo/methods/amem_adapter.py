@@ -14,14 +14,13 @@ Retrieval: keyword overlap + dense vector similarity → graph expansion
 
 Storage: SQLite for note graph, ChromaDB for dense vectors.
 All LLM calls use memory_methods.amem.llm, and embeddings use
-memory_methods.amem.embedding, with legacy top-level fallbacks.
+memory_methods.amem.embedding.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import sqlite3
 import time
@@ -98,11 +97,11 @@ class AMEMMemory(MemorySystem):
     def __init__(
         self,
         memory_root: str | Path,
-        hesm_config: dict[str, Any],
+        experiment_config: dict[str, Any],
         amem_cfg: dict[str, Any],
     ) -> None:
         self._memory_root = Path(memory_root)
-        self._hesm_config = hesm_config
+        self._experiment_config = experiment_config
         self._top_related: int = int(amem_cfg.get("top_related", 5))
         self._link_threshold: float = float(amem_cfg.get("link_threshold", 0.7))
         self._alpha: float = 0.4  # keyword vs vector weight
@@ -250,8 +249,8 @@ class AMEMMemory(MemorySystem):
     # ─── Internal: storage setup ──────────────────────────────────────────────
 
     def _setup_components(self, conv_id: str) -> None:
-        from memory.embedder import BailianEmbedder
-        from memory.vector_store import ChromaVectorStore
+        from hesm.embedder import BailianEmbedder
+        from hesm.vector_store import ChromaVectorStore
 
         base = self._memory_root / f"amem_{conv_id}"
         base.mkdir(parents=True, exist_ok=True)
@@ -277,13 +276,23 @@ class AMEMMemory(MemorySystem):
             persist_path=str(base / "chroma")
         )
 
-        method_cfg = self._hesm_config.get("memory_methods", {}).get("amem", {})
-        te = method_cfg.get("llm") or self._hesm_config.get(
-            "topic_extraction", {}
-        )
-        embedding_cfg = method_cfg.get("embedding") or self._hesm_config.get(
-            "embedding", {}
-        )
+        method_cfg = self._experiment_config.get("memory_methods", {}).get("amem", {})
+        te = method_cfg.get("llm", {})
+        embedding_cfg = method_cfg.get("embedding", {})
+        if not all(
+            (
+                te.get("api_key"),
+                te.get("model"),
+                te.get("base_url"),
+                embedding_cfg.get("api_key"),
+                embedding_cfg.get("model"),
+                embedding_cfg.get("base_url"),
+            )
+        ):
+            raise ValueError(
+                "experiments/config/locomo.yaml must define complete "
+                "memory_methods.amem settings"
+            )
         self._embedder = BailianEmbedder(
             api_key=embedding_cfg.get("api_key"),
             model=embedding_cfg.get("model"),
@@ -291,9 +300,9 @@ class AMEMMemory(MemorySystem):
         )
 
         # Method-isolated A-MEM LLM client.
-        api_key = te.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
-        base_url = te.get("base_url", "https://api.openai.com/v1/")
-        self._llm_model = te.get("model", "gpt-4")
+        api_key = te["api_key"]
+        base_url = te["base_url"]
+        self._llm_model = te["model"]
         self._max_retries = int(te.get("max_retries", 3))
         self._retry_delay = float(te.get("retry_delay", 2.0))
         self._llm_client = openai.OpenAI(api_key=api_key, base_url=base_url)

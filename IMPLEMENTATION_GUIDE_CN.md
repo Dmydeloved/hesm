@@ -13,19 +13,24 @@
 
 ## 1. 实现边界
 
-HESM 核心实现全部位于 memory/，由三条主线组成：
+HESM 核心实现全部位于 hesm/，由三条主线组成：
 
-1. 主题提取：memory/extractor.py；
-2. 记忆管理：memory/manager.py；
-3. 记忆检索：memory/retriever.py。
+1. 主题提取：hesm/extractor.py；
+2. 记忆管理：hesm/manager.py；
+3. 记忆检索：hesm/retriever.py。
 
 以下模块是三条主线使用的内部基础设施：
 
-- memory/storage.py：结构化存储；
-- memory/vector_store.py：向量索引；
-- memory/embedder.py：三层向量表示；
-- memory/summarizer.py：Segment 和 Experience 摘要；
-- prompts/：主题提取、摘要和检索 Prompt。
+- hesm/storage.py：结构化存储；
+- hesm/vector_store.py：向量索引；
+- hesm/embedder.py：三层向量表示；
+- hesm/summarizer.py：Segment 和 Experience 摘要；
+- hesm/service.py：对外记忆添加与检索接口；
+- hesm/prompts/：主题提取、摘要和检索 Prompt。
+
+生产 HESM 只读取 `config/hesm.yaml`，并将 SQLite/Chroma 数据写入根目录
+`memory/`。LoCoMo 实验只读取 `experiments/config/locomo.yaml`，所有实验记忆、
+答案、指标、日志和表格均写入 `experiments/outputs/`。两套配置和存储不互相回退。
 
 ## 2. HESM 设计
 
@@ -142,7 +147,7 @@ context               历史上下文，可为空
 domain_knowledge      领域知识图谱或领域约束，可为空
 ~~~
 
-build_extractor_prompt() 将它们填入 prompts/extractor_prompt.txt：
+build_extractor_prompt() 将它们填入 hesm/prompts/extractor_prompt.txt：
 
 ~~~text
 {user_input}
@@ -171,7 +176,7 @@ TopicExtractor 本身不规定历史窗口长度，历史上下文的选择由�
 
 ### 3.4 Prompt 设计
 
-完整主题提取 Prompt 位于 [prompts/extractor_prompt.txt](prompts/extractor_prompt.txt)。其关键约束如下。
+完整主题提取 Prompt 位于 [hesm/prompts/extractor_prompt.txt](hesm/prompts/extractor_prompt.txt)。其关键约束如下。
 
 #### Topic 规则
 
@@ -421,7 +426,7 @@ QA 插入 SQLite 后立即构造向量并 upsert。
 
 ### 4.9 Segment 摘要 Prompt
 
-完整模板：[prompts/segment_summary_prompt.txt](prompts/segment_summary_prompt.txt)。
+完整模板：[hesm/prompts/segment_summary_prompt.txt](hesm/prompts/segment_summary_prompt.txt)。
 
 它要求同时提炼：
 
@@ -445,7 +450,7 @@ QA 插入 SQLite 后立即构造向量并 upsert。
 
 ### 4.10 Experience 摘要 Prompt
 
-完整模板：[prompts/experience_summary_prompt.txt](prompts/experience_summary_prompt.txt)。
+完整模板：[hesm/prompts/experience_summary_prompt.txt](hesm/prompts/experience_summary_prompt.txt)。
 
 它要求保持长期目标不变，聚合阶段推进、整体状态、长期信息类别和基于证据的下一步：
 
@@ -616,7 +621,7 @@ query_confidence 低于默认阈值 0.8 时：
 
 新版检索器把完整候选树一次性交给模型，联合选择 Experience、Segment 和 QA。
 
-运行时 Prompt 由 memory/retriever.py 的 build_hierarchical_retrieval_prompt() 动态生成。核心规则：
+运行时 Prompt 由 hesm/retriever.py 的 build_hierarchical_retrieval_prompt() 动态生成。核心规则：
 
 ~~~text
 1. 联合判断完整 Experience → Segment → QA 路径。
@@ -693,34 +698,34 @@ debug 包含候选来源、低置信度救援、裁剪前后数量、token 预�
 
 ### 6.1 主题提取
 
-- 完整 Prompt：[prompts/extractor_prompt.txt](prompts/extractor_prompt.txt)
-- Prompt 构建：[prompts/topic_memory.py](prompts/topic_memory.py) 的 build_extractor_prompt()
-- 调用、解析与校验：[memory/extractor.py](memory/extractor.py)
+- 完整 Prompt：[hesm/prompts/extractor_prompt.txt](hesm/prompts/extractor_prompt.txt)
+- Prompt 构建：[hesm/prompts/topic_memory.py](hesm/prompts/topic_memory.py) 的 build_extractor_prompt()
+- 调用、解析与校验：[hesm/extractor.py](hesm/extractor.py)
 
 ### 6.2 Segment 摘要
 
-- 完整 Prompt：[prompts/segment_summary_prompt.txt](prompts/segment_summary_prompt.txt)
-- Prompt 构建：[prompts/topic_memory.py](prompts/topic_memory.py) 的 build_segment_summary_prompt()
-- 调用与降级：[memory/summarizer.py](memory/summarizer.py)
+- 完整 Prompt：[hesm/prompts/segment_summary_prompt.txt](hesm/prompts/segment_summary_prompt.txt)
+- Prompt 构建：[hesm/prompts/topic_memory.py](hesm/prompts/topic_memory.py) 的 build_segment_summary_prompt()
+- 调用与降级：[hesm/summarizer.py](hesm/summarizer.py)
 
 ### 6.3 Experience 摘要
 
-- 完整 Prompt：[prompts/experience_summary_prompt.txt](prompts/experience_summary_prompt.txt)
-- Prompt 构建：[prompts/topic_memory.py](prompts/topic_memory.py) 的 build_experience_summary_prompt()
-- 调用与降级：[memory/summarizer.py](memory/summarizer.py)
+- 完整 Prompt：[hesm/prompts/experience_summary_prompt.txt](hesm/prompts/experience_summary_prompt.txt)
+- Prompt 构建：[hesm/prompts/topic_memory.py](hesm/prompts/topic_memory.py) 的 build_experience_summary_prompt()
+- 调用与降级：[hesm/summarizer.py](hesm/summarizer.py)
 
 ### 6.4 层级检索
 
 当前实际使用的联合层级 Prompt：
 
-- 构建：[memory/retriever.py](memory/retriever.py) 的 build_hierarchical_retrieval_prompt()
+- 构建：[hesm/retriever.py](hesm/retriever.py) 的 build_hierarchical_retrieval_prompt()
 - 调用：LLMRetrievalReranker.rerank_hierarchy()
 - 解析：parse_hierarchical_rerank_response()
 
 兼容保留的旧版逐层 Prompt：
 
-- 模板：[prompts/retrieval_prompt.txt](prompts/retrieval_prompt.txt)
-- 构建：[prompts/topic_memory.py](prompts/topic_memory.py)
+- 模板：[hesm/prompts/retrieval_prompt.txt](hesm/prompts/retrieval_prompt.txt)
+- 构建：[hesm/prompts/topic_memory.py](hesm/prompts/topic_memory.py)
 - 调用：LLMRetrievalReranker.rerank()
 
 新版 HybridRetriever.recall() 正常使用联合层级 Prompt。
@@ -729,13 +734,13 @@ debug 包含候选来源、低置信度救援、裁剪前后数量、token 预�
 
 | 核心过程 | 文件 |
 |---|---|
-| 主题提取 | [memory/extractor.py](memory/extractor.py) |
-| 记忆管理 | [memory/manager.py](memory/manager.py) |
-| 检索 | [memory/retriever.py](memory/retriever.py) |
-| 结构存储 | [memory/storage.py](memory/storage.py) |
-| 向量索引 | [memory/vector_store.py](memory/vector_store.py) |
-| 向量表示 | [memory/embedder.py](memory/embedder.py) |
-| 摘要 | [memory/summarizer.py](memory/summarizer.py) |
+| 主题提取 | [hesm/extractor.py](hesm/extractor.py) |
+| 记忆管理 | [hesm/manager.py](hesm/manager.py) |
+| 检索 | [hesm/retriever.py](hesm/retriever.py) |
+| 结构存储 | [hesm/storage.py](hesm/storage.py) |
+| 向量索引 | [hesm/vector_store.py](hesm/vector_store.py) |
+| 向量表示 | [hesm/embedder.py](hesm/embedder.py) |
+| 摘要 | [hesm/summarizer.py](hesm/summarizer.py) |
 
 # 第二部分：实验实现文档
 
@@ -832,12 +837,11 @@ HESM 使用第一部分描述的三层构建和 Experience-first 检索，返回
 
 ### 13.1 初始化
 
-1. 读取 experiment.yaml；
-2. 读取 configs/config.yaml；
-3. 设置随机种子；
-4. 创建 answers、metrics、tables、logs 目录；
-5. 加载 LoCoMo conversations；
-6. 构造启用的 MemorySystem；
+1. 读取 `experiments/config/locomo.yaml`；
+2. 设置随机种子；
+3. 创建 answers、metrics、tables、logs 目录；
+4. 加载 LoCoMo conversations；
+5. 构造启用的 MemorySystem；
 7. 为每个方法构造同配置的答案模型和 Judge。
 
 ### 13.2 BUILD 阶段
@@ -892,8 +896,8 @@ Judge 接收问题、标准答案和预测答案，不接收检索上下文。�
 一个方法的全部 conversation 完成后，aggregate() 对逐题指标做宏平均并生成：
 
 ~~~text
-outputs/locomo/metrics/<method>_metrics.json
-outputs/locomo/tables/main_results.{md,csv,json}
+experiments/outputs/locomo/metrics/<method>_metrics.json
+experiments/outputs/locomo/tables/main_results.{md,csv,json}
 ~~~
 
 ## 14. 并发实现
@@ -912,7 +916,7 @@ outputs/locomo/tables/main_results.{md,csv,json}
 每个 (method, conv_id) 对应：
 
 ~~~text
-outputs/locomo/answers/<method>_<conv_id>.json
+experiments/outputs/locomo/answers/<method>_<conv_id>.json
 ~~~
 
 只有以下条件全部满足，问题才标记为成功：
@@ -928,7 +932,7 @@ outputs/locomo/answers/<method>_<conv_id>.json
 每种方法写入：
 
 ~~~text
-outputs/locomo/logs/<method>.log
+experiments/outputs/locomo/logs/<method>.log
 ~~~
 
 事件阶段包括 BUILD、RETRIEVAL、ANSWER、JUDGE。每个阶段记录 STARTED、SUCCESS、FAILED 或 SKIPPED，以及 conversation、问题下标、耗时和错误原因。日志用于区分“指标低”和“API/构建失败”。
@@ -1099,7 +1103,7 @@ Runner 会保留失败问题记录：
 ## 19. 输出文件
 
 ~~~text
-outputs/locomo/
+experiments/outputs/locomo/
 ├── memory/                 # 各方法、各 conversation 的持久记忆
 ├── answers/                # 逐问题 checkpoint 和完整上下文
 ├── logs/                   # 四阶段 JSONL 日志

@@ -268,6 +268,25 @@ svg { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: 
 .brand small { font-size: 9px; }
 .header-title small { font-size: 9px; }
 .header-title strong { font-size: 14px; }
+.mode-nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 10px;
+  background: rgba(255,255,255,.035);
+}
+.mode-nav a {
+  padding: 7px 13px;
+  color: #8ea099;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 700;
+  text-decoration: none;
+}
+.mode-nav a:hover { color: #eaf2ee; }
+.mode-nav a.active { color: #fff; background: rgba(117,99,232,.38); }
 .snapshot-chip, .secondary-button { font-size: 11px; }
 .pane-heading p, .section-label { font-size: 9px; }
 .pane-heading h1 { font-size: 22px; }
@@ -412,6 +431,7 @@ svg { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: 
   .app-header { padding: 0 14px; }
   .brand { width: auto; }
   .header-title { display: none; }
+  .mode-nav { margin-left: 18px; }
   .header-actions { margin-left: auto; }
   .snapshot-chip { display: none; }
   .workspace { display: block; height: auto; }
@@ -426,6 +446,9 @@ svg { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: 
 
 @media (max-width: 590px) {
   .secondary-button { padding: 0 9px; }
+  .mode-nav { margin-left: auto; }
+  .mode-nav a { padding: 7px 9px; }
+  .header-actions { display: none; }
   .experience-list { display: block; }
   .overview-grid { grid-template-columns: 1fr; }
   .global-stats { grid-template-columns: 1fr; }

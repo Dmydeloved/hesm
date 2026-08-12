@@ -31,16 +31,21 @@ class VectorRAGMemory(MemorySystem):
     in HESM so embeddings are in a comparable space).
 
     Storage isolation: each (conv_id) gets its own Chroma directory under
-    outputs/locomo/memory/vector_rag_{conv_id}/chroma/.
+    experiments/outputs/locomo/memory/vector_rag_{conv_id}/chroma/.
     """
 
-    def __init__(self, memory_root: str | Path) -> None:
+    def __init__(
+        self,
+        memory_root: str | Path,
+        experiment_config: dict[str, Any],
+    ) -> None:
         """
         Args:
             memory_root: base directory for isolated Chroma stores,
-                         e.g. "outputs/locomo/memory"
+                         e.g. "experiments/outputs/locomo/memory"
         """
         self._memory_root = Path(memory_root)
+        self._experiment_config = experiment_config
         self._vector_store: Any = None
         self._embedder: Any = None
         self._conv_id: str = ""
@@ -63,15 +68,20 @@ class VectorRAGMemory(MemorySystem):
         speaker_a: str,
         speaker_b: str,
     ) -> None:
-        from memory.embedder import BailianEmbedder
-        from memory.vector_store import ChromaVectorStore
+        from hesm.embedder import BailianEmbedder
+        from hesm.vector_store import ChromaVectorStore
 
         self._conv_id = conv_id
         chroma_path = self._memory_root / f"vector_rag_{conv_id}" / "chroma"
         chroma_path.mkdir(parents=True, exist_ok=True)
 
         self._vector_store = ChromaVectorStore(persist_path=str(chroma_path))
-        self._embedder = BailianEmbedder()
+        embedding_config = self._experiment_config.get("embedding", {})
+        self._embedder = BailianEmbedder(
+            api_key=embedding_config.get("api_key"),
+            model=embedding_config.get("model"),
+            base_url=embedding_config.get("base_url"),
+        )
         self._turn_texts = {}
 
         expected_count = sum(

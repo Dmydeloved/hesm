@@ -13,8 +13,8 @@ Usage (from d:/code/hesm):
     python -m experiments.locomo.run_cache --num-samples 100
 
 Outputs:
-    outputs/locomo/tables/cache_results.{md,csv,json}
-    outputs/locomo/metrics/cache_raw.json
+    experiments/outputs/locomo/tables/cache_results.{md,csv,json}
+    experiments/outputs/locomo/metrics/cache_raw.json
 """
 
 from __future__ import annotations
@@ -30,8 +30,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-import yaml
-
+from experiments.config import DEFAULT_CONFIG_PATH, load_experiment_config
 from experiments.locomo.data.loader import LoCoMoLoader
 from experiments.locomo.methods.hesm_adapter import HESMMemory
 from experiments.locomo.reporting.table_generator import TableGenerator
@@ -50,12 +49,9 @@ def run_cache_eval(
     num_samples: int | None = None,
 ) -> dict[str, Any]:
     if config_path is None:
-        config_path = _PROJECT_ROOT / "experiments" / "locomo" / "config" / "experiment.yaml"
+        config_path = DEFAULT_CONFIG_PATH
 
-    with open(config_path, encoding="utf-8") as f:
-        exp_cfg: dict[str, Any] = yaml.safe_load(f)
-    with open(_PROJECT_ROOT / "configs" / "config.yaml", encoding="utf-8") as f:
-        hesm_cfg: dict[str, Any] = yaml.safe_load(f)
+    exp_cfg: dict[str, Any] = load_experiment_config(config_path)
 
     random.seed(exp_cfg.get("experiment", {}).get("seed", 42))
 
@@ -79,7 +75,7 @@ def run_cache_eval(
         hesm_cfg=hesm_section,
         use_llm_summarizer=hesm_section.get("use_llm_summarizer", True),
         use_llm_reranker=hesm_section.get("use_llm_reranker", True),
-        model_config=hesm_cfg,
+        experiment_config=exp_cfg,
     )
 
     runner = CacheEvalRunner(

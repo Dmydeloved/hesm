@@ -1,6 +1,6 @@
 """Per-method, four-stage experiment logging.
 
-Each method writes to ``outputs/locomo/logs/<method>.log``.  Every line is a
+Each method writes to ``experiments/outputs/locomo/logs/<method>.log``.  Every line is a
 single JSON object so logs remain both human-readable and easy to aggregate.
 The ``stage`` field is one of BUILD, RETRIEVAL, ANSWER, or JUDGE.
 """

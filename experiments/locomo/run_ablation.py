@@ -17,9 +17,9 @@ Usage (from d:/code/hesm):
     python -m experiments.locomo.run_ablation --max-conversations 2
 
 Outputs:
-    outputs/locomo/answers/ablation_{variant}_{conv_id}.json
-    outputs/locomo/metrics/ablation_{variant}_metrics.json
-    outputs/locomo/tables/ablation_results.{md,csv,json}
+    experiments/outputs/locomo/answers/ablation_{variant}_{conv_id}.json
+    experiments/outputs/locomo/metrics/ablation_{variant}_metrics.json
+    experiments/outputs/locomo/tables/ablation_results.{md,csv,json}
 """
 
 from __future__ import annotations
@@ -35,8 +35,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-import yaml
-
+from experiments.config import DEFAULT_CONFIG_PATH, load_experiment_config
 from experiments.locomo.data.loader import LoCoMoLoader
 from experiments.locomo.evaluation.aggregator import MethodMetrics
 from experiments.locomo.evaluation.judge import LLMJudge
@@ -68,19 +67,16 @@ def run_ablation(
     qa_workers: int | None = None,
 ) -> list[MethodMetrics]:
     if config_path is None:
-        config_path = _PROJECT_ROOT / "experiments" / "locomo" / "config" / "experiment.yaml"
+        config_path = DEFAULT_CONFIG_PATH
 
-    with open(config_path, encoding="utf-8") as f:
-        exp_cfg: dict[str, Any] = yaml.safe_load(f)
-    with open(_PROJECT_ROOT / "configs" / "config.yaml", encoding="utf-8") as f:
-        hesm_cfg: dict[str, Any] = yaml.safe_load(f)
+    exp_cfg: dict[str, Any] = load_experiment_config(config_path)
 
     random.seed(exp_cfg.get("experiment", {}).get("seed", 42))
 
     answers_dir = _PROJECT_ROOT / exp_cfg["output"]["answers"]
     metrics_dir = _PROJECT_ROOT / exp_cfg["output"]["metrics"]
     tables_dir  = _PROJECT_ROOT / exp_cfg["output"]["tables"]
-    logs_dir = _PROJECT_ROOT / exp_cfg["output"].get("logs", "outputs/locomo/logs")
+    logs_dir = _PROJECT_ROOT / exp_cfg["output"]["logs"]
     memory_root = _PROJECT_ROOT / exp_cfg["output"]["memory"]
     for d in (answers_dir, metrics_dir, tables_dir, logs_dir):
         d.mkdir(parents=True, exist_ok=True)
@@ -89,8 +85,8 @@ def run_ablation(
     loader = LoCoMoLoader(_PROJECT_ROOT / exp_cfg["dataset"]["path"])
     conversations = loader.load(max_conversations=max_conv)
 
-    answer_generator = LLMAnswerGenerator(hesm_cfg)
-    judge = LLMJudge(hesm_cfg)
+    answer_generator = LLMAnswerGenerator(exp_cfg)
+    judge = LLMJudge(exp_cfg)
     top_k_values: list[int] = exp_cfg.get("retrieval", {}).get("top_k_values", [1, 3, 5])
     token_encoding: str = exp_cfg.get("token_counter", {}).get("encoding", "cl100k_base")
     concurrency_cfg = exp_cfg.get("concurrency", {})
@@ -119,7 +115,7 @@ def run_ablation(
             memory_root=memory_root,
             hesm_cfg=hesm_section,
             variant_cfg=ablation_cfg[variant],
-            model_config=hesm_cfg,
+            experiment_config=exp_cfg,
         )
         runner = QARunner(
             method=method,
@@ -134,10 +130,10 @@ def run_ablation(
                 memory_root=memory_root,
                 hesm_cfg=hesm_section,
                 variant_cfg={**ablation_cfg[name], "use_cache": False},
-                model_config=hesm_cfg,
+                experiment_config=exp_cfg,
             ),
-            answer_generator_factory=lambda: LLMAnswerGenerator(hesm_cfg),
-            judge_factory=lambda: LLMJudge(hesm_cfg),
+            answer_generator_factory=lambda: LLMAnswerGenerator(exp_cfg),
+            judge_factory=lambda: LLMJudge(exp_cfg),
             top_k_values=top_k_values,
             token_encoding=token_encoding,
         )
@@ -161,7 +157,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-conversations", type=int, default=None)
     p.add_argument(
         "--qa-workers", type=int, default=None,
-        help="Concurrent QA workers (overrides experiment.yaml)",
+        help="Concurrent QA workers (overrides experiments/config/locomo.yaml)",
     )
     return p.parse_args()
 

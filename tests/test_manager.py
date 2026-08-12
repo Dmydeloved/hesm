@@ -7,11 +7,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from memory.embedder import HashingEmbedder
-from memory.manager import MemoryManager
-from memory.storage import MemoryStorage
-from memory.summarizer import LLMSummarizer, TemplateSummarizer
-from memory.vector_store import ChromaVectorStore
+from hesm.embedder import HashingEmbedder
+from hesm.manager import MemoryManager
+from hesm.storage import MemoryStorage
+from hesm.summarizer import LLMSummarizer, TemplateSummarizer
+from hesm.vector_store import ChromaVectorStore
 
 
 def build_cases() -> list[dict]:

@@ -8,11 +8,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-from memory.config import config_path
-from memory.retriever import HybridRetriever
-from memory.storage import MemoryStorage
-from memory.embedder import BailianEmbedder
-from memory.vector_store import ChromaVectorStore
+from hesm.config import config_path
+from hesm.retriever import HybridRetriever
+from hesm.storage import MemoryStorage
+from hesm.embedder import BailianEmbedder
+from hesm.vector_store import ChromaVectorStore
 
 import logging
 

@@ -8,7 +8,7 @@ Analysis script for hesm_conv-26.json
 import json
 from collections import defaultdict
 
-DATA_PATH = "d:/code/hesm/outputs/locomo/answers/hesm_conv-26.json"
+DATA_PATH = "d:/code/hesm/experiments/outputs/locomo/answers/hesm_conv-26.json"
 
 CATEGORY_NAMES = {
     1: "Single-hop",

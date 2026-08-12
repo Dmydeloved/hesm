@@ -5,7 +5,7 @@ HESM Test Pipeline — QA-only, 挂载已构建的主实验记忆。
     加载已有记忆 → Topic Extraction → Retrieval → Answer Generation → Evaluate
 
 【设计约束】
-- 记忆只读：直接挂载 outputs/locomo/memory/hesm_{conv_id}，不做任何写入/构建。
+- 记忆只读：直接挂载 experiments/outputs/locomo/memory/hesm_{conv_id}，不做任何写入/构建。
 - 完全隔离：所有日志和产物写到 tests/locomo/results/，不污染主实验目录。
 - 流程一致：Topic Extractor → HybridRetriever → LLMAnswerGenerator，
             指标：Token-F1 / LLM-Judge(0/1) / Retrieval@K(1,3,5)。
@@ -42,7 +42,9 @@ _TESTS_DIR    = Path(__file__).parent
 _RESULTS_DIR  = _TESTS_DIR / "results"
 
 # 硬编码：主实验已构建的记忆根目录
-_MAIN_MEMORY_ROOT = _PROJECT_ROOT / "outputs" / "locomo" / "memory"
+_MAIN_MEMORY_ROOT = (
+    _PROJECT_ROOT / "experiments" / "outputs" / "locomo" / "memory"
+)
 
 # 测试输入
 _QUESTIONS_FILE = _TESTS_DIR / "questions.json"
@@ -107,7 +109,10 @@ class StepTracer:
 # 附加到已有记忆（只读挂载）
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _attach_hesm_memory(conv_id: str, hesm_cfg: dict[str, Any]) -> Any:
+def _attach_hesm_memory(
+    conv_id: str,
+    experiment_config: dict[str, Any],
+) -> Any:
     """
     打开主实验已构建的 HESM 存储，返回配置好 _retriever/_extractor 的 HESMMemory。
 
@@ -132,12 +137,14 @@ def _attach_hesm_memory(conv_id: str, hesm_cfg: dict[str, Any]) -> Any:
     logger.info("  Chroma : %s", chroma_dir)
 
     # 构造 HESMMemory 对象，然后调用内部方法附加到已有存储
+    hesm_cfg = experiment_config.get("hesm", {})
     hesm_memory = HESMMemory(
         memory_root=_MAIN_MEMORY_ROOT,
         hesm_cfg=hesm_cfg,
         use_llm_summarizer=hesm_cfg.get("use_llm_summarizer", True),
         use_llm_reranker=hesm_cfg.get("use_llm_reranker", True),
         use_cache=True,
+        experiment_config=experiment_config,
     )
     # 直接调用 _setup_components 打开已有 SQLite/Chroma，不触发任何构建逻辑
     hesm_memory._conv_id = conv_id
@@ -429,11 +436,8 @@ def run_test(dry_run: bool = False) -> dict[str, Any]:
     logger.info("=" * 66)
 
     # ── 加载配置 ────────────────────────────────────────────────────────
-    with open(_PROJECT_ROOT / "configs" / "config.yaml", encoding="utf-8") as f:
-        hesm_cfg_raw: dict[str, Any] = yaml.safe_load(f)
-
     exp_cfg_path = (
-        _PROJECT_ROOT / "experiments" / "locomo" / "config" / "experiment.yaml"
+        _PROJECT_ROOT / "experiments" / "config" / "locomo.yaml"
     )
     with open(exp_cfg_path, encoding="utf-8") as f:
         exp_cfg: dict[str, Any] = yaml.safe_load(f)
@@ -469,7 +473,7 @@ def run_test(dry_run: bool = False) -> dict[str, Any]:
         logger.info("  Category %d: %d 题", cat, cat_dist[cat])
 
     # ── 挂载已有记忆（只读）─────────────────────────────────────────────
-    hesm_memory = _attach_hesm_memory(conv_id, hesm_section)
+    hesm_memory = _attach_hesm_memory(conv_id, exp_cfg)
 
     # ── 计算对话总 token 数（用于压缩比）───────────────────────────────
     dataset_path = _PROJECT_ROOT / exp_cfg["dataset"]["path"]
@@ -484,8 +488,8 @@ def run_test(dry_run: bool = False) -> dict[str, Any]:
     )
 
     # ── 初始化共享组件 ───────────────────────────────────────────────────
-    answer_generator = LLMAnswerGenerator(hesm_cfg_raw)
-    judge = LLMJudge(hesm_cfg_raw)
+    answer_generator = LLMAnswerGenerator(exp_cfg)
+    judge = LLMJudge(exp_cfg)
 
     # ── 打开步骤追踪器 ───────────────────────────────────────────────────
     tracer = StepTracer(_STEPS_FILE)

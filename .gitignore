@@ -10,7 +10,7 @@ __MACOSX/
 *.log
 
 # Local generated memory/vector stores
-data/memory/
+memory/
 
 # Generated checkpoints and temporary outputs
 data/topic_extracted/*checkpoint*.json
@@ -21,5 +21,6 @@ results/
 # Local test cache files
 tests/__pycache__/
 scripts/__pycache__/
-configs/__pycache__/
-memory/__pycache__/
+config/__pycache__/
+hesm/__pycache__/
+experiments/config/__pycache__/

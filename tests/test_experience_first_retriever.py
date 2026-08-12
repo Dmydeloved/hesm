@@ -5,9 +5,9 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from memory.retriever import HybridRetriever
-from memory.storage import MemoryStorage
-from memory.vector_store import ChromaVectorStore
+from hesm.retriever import HybridRetriever
+from hesm.storage import MemoryStorage
+from hesm.vector_store import ChromaVectorStore
 
 
 def _experience(memory_id: str, topic: str, entity: str) -> dict[str, Any]:
@@ -170,6 +170,21 @@ def test_high_confidence_uses_only_initial_experience_tree() -> None:
     assert storage.qa_search_calls == 0
     assert storage.descendant_loads == [["e1"]]
     assert result["debug"]["low_confidence_qa_rescue"] is False
+    assert result["debug"]["total_retrieval_ms"] >= 0
+    assert result["debug"]["embedding"]["vector_dimensions"] == 2
+    collection_timing = result["debug"]["candidate_collection"]
+    assert set(collection_timing) >= {
+        "sql_recall",
+        "chroma_vector_recall",
+        "ranking_processing",
+    }
+    assert result["debug"]["candidate_trees"]["original"]
+    assert result["debug"]["candidate_trees"]["pruned"]
+    assert result["debug"]["constraints"]["requested_top_k"] == {
+        "experience": 3,
+        "segment": 5,
+        "qa": 8,
+    }
     assert [node["id"] for node in result["candidate_tree"]] == ["e1"]
     assert result["candidate_tree"][0]["segments"][0]["qas"][0]["id"] == "q1"
 
@@ -192,6 +207,12 @@ def test_low_confidence_adds_only_rescued_qa_ancestor_path() -> None:
     # e2 is never passed to the bulk descendant loader.
     assert storage.descendant_loads == [["e1"]]
     assert result["debug"]["low_confidence_qa_rescue"] is True
+    assert "qa_rescue" in result["debug"]["candidate_collection"][
+        "chroma_vector_recall"
+    ]["by_layer"]
+    assert "qa_rescue" in result["debug"]["candidate_collection"][
+        "sql_recall"
+    ]["by_layer"]
     tree_by_id = {node["id"]: node for node in result["candidate_tree"]}
     assert set(tree_by_id) == {"e1", "e2"}
     rescued_segments = tree_by_id["e2"]["segments"]

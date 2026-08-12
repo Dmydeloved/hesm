@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import time
 from typing import Any
@@ -58,46 +57,27 @@ Output JSON only:
 class LLMJudge:
     """
     Calls the LLM to score (question, ground_truth, prediction) triples.
-    Reads API settings from the evaluation section of configs/config.yaml.
+    Reads API settings from the evaluation section of experiments/config/locomo.yaml.
 
-    Missing evaluation fields fall back to the legacy judge-prefixed keys and
-    then topic_extraction for compatibility with older configuration files.
+    The complete provider settings come from the experiment-owned evaluation
+    section.
 
     Returns 1 (CORRECT) or 0 (WRONG). Returns -1 on total failure (excluded
     from averages by the aggregator).
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
-        te: dict[str, Any] = config.get("topic_extraction", {})
         evaluation: dict[str, Any] = config.get("evaluation", {})
-        api_key = (
-            evaluation.get("api_key")
-            or evaluation.get("judge_api_key")
-            or te.get("api_key")
-            or os.environ.get("OPENAI_API_KEY", "")
-        )
-        base_url = evaluation.get(
-            "base_url",
-            evaluation.get(
-                "judge_base_url",
-                te.get("base_url", "https://api.openai.com/v1/"),
-            ),
-        )
-        self.model: str = evaluation.get(
-            "model", evaluation.get("judge_model", te.get("model", "gpt-4"))
-        )
-        self.max_retries: int = int(
-            evaluation.get(
-                "max_retries",
-                evaluation.get("judge_max_retries", te.get("max_retries", 3)),
+        api_key = evaluation.get("api_key")
+        base_url = evaluation.get("base_url")
+        self.model: str = evaluation.get("model")
+        if not all((api_key, base_url, self.model)):
+            raise ValueError(
+                "experiments/config/locomo.yaml must define complete "
+                "evaluation provider settings"
             )
-        )
-        self.retry_delay: float = float(
-            evaluation.get(
-                "retry_delay",
-                evaluation.get("judge_retry_delay", te.get("retry_delay", 2.0)),
-            )
-        )
+        self.max_retries = int(evaluation.get("max_retries", 3))
+        self.retry_delay = float(evaluation.get("retry_delay", 2.0))
         self.last_error: str | None = None
         self._client = openai.OpenAI(api_key=api_key, base_url=base_url)
 

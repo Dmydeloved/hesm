@@ -109,6 +109,7 @@ class _TestHESMMemory(HESMMemory):
         super().__init__(
             memory_root=memory_root,
             hesm_cfg={},
+            experiment_config={},
             use_llm_summarizer=False,
             use_llm_reranker=False,
         )
@@ -232,7 +233,12 @@ class MemoryBuildResumeTests(unittest.TestCase):
         )
         retriever = RetrieverWithoutCacheArgument()
 
-        method = HESMMemory(self.root, {}, use_cache=True)
+        method = HESMMemory(
+            self.root,
+            {},
+            experiment_config={},
+            use_cache=True,
+        )
         method._extractor = extractor
         method._retriever = retriever
         result = method.retrieve("question", use_cache=True)
@@ -244,6 +250,7 @@ class MemoryBuildResumeTests(unittest.TestCase):
             memory_root=self.root,
             hesm_cfg={},
             variant_cfg={"retrieval_layers": ["experience", "segment", "qa"]},
+            experiment_config={},
         )
         ablation._extractor = extractor
         ablation._retriever = retriever
@@ -254,7 +261,9 @@ class MemoryBuildResumeTests(unittest.TestCase):
     def test_memory_method_llms_have_complete_isolated_config(self) -> None:
         project_root = Path(__file__).resolve().parents[2]
         config = yaml.safe_load(
-            (project_root / "configs" / "config.yaml").read_text("utf-8")
+            (
+                project_root / "experiments" / "config" / "locomo.yaml"
+            ).read_text("utf-8")
         )
         methods = config["memory_methods"]
         profiles = config["_llm_profiles"]

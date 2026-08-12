@@ -1,4 +1,4 @@
-﻿"""
+"""
 Mini memory builder — 100 turns，验证 Experience/Segment 聚合效果。
 
 用途：在修改 MemoryManager 路由逻辑后，用少量数据快速验证三层结构
@@ -135,12 +135,12 @@ def main() -> None:
     parser.add_argument("--clean", action="store_true", help="Delete existing mini memory before building")
     args = parser.parse_args()
 
-    from memory.embedder import BailianEmbedder
-    from memory.extractor import TopicExtractor
-    from memory.manager import MemoryManager
-    from memory.storage import MemoryStorage
-    from memory.summarizer import TemplateSummarizer
-    from memory.vector_store import ChromaVectorStore
+    from hesm.embedder import BailianEmbedder
+    from hesm.extractor import TopicExtractor
+    from hesm.manager import MemoryManager
+    from hesm.storage import MemoryStorage
+    from hesm.summarizer import TemplateSummarizer
+    from hesm.vector_store import ChromaVectorStore
 
     # Output dir
     out_dir = _RESULTS_DIR / "hesm_mini"
