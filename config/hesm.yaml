@@ -45,6 +45,9 @@ retrieval:
 
 summarization: *strong_llm
 
+# Final answer generation for the Web Console chat page.
+chat: *nano_llm
+
 memory_management:
   segment_qa_threshold: 5
   experience_segment_threshold: 5

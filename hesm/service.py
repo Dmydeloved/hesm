@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 from threading import RLock
+import time
 from typing import Any
 
 from .config import PROJECT_ROOT, load_config
+from .chat import LLMAnswerer, build_chat_prompt
 from .embedder import BailianEmbedder
 from .extractor import TopicExtractor
 from .manager import MemoryManager
 from .retriever import HybridRetriever
+from .session import SessionManager
 from .storage import MemoryStorage
 from .summarizer import LLMSummarizer
 from .vector_store import ChromaVectorStore
@@ -30,6 +33,7 @@ class HESMService:
         embedding_config = self.config.get("embedding", {})
         topic_config = self.config.get("topic_extraction", {})
         summary_config = self.config.get("summarization", {})
+        chat_config = self.config.get("chat", summary_config)
         retrieval_config = self.config.get("retrieval", {})
         management_config = self.config.get("memory_management", {})
         self.api_config = self.config.get("api", {})
@@ -38,6 +42,7 @@ class HESMService:
             database_path,
             check_same_thread=False,
         )
+        self.sessions = SessionManager(database_path)
         self.vector_store = ChromaVectorStore(persist_path=chroma_path)
         self.embedder = BailianEmbedder(
             api_key=embedding_config.get("api_key"),
@@ -86,6 +91,14 @@ class HESMService:
             retrieval_retry_delay=retrieval_config.get("retry_delay"),
             retrieval_config=retrieval_config,
         )
+        self.answerer = LLMAnswerer(
+            api_key=str(chat_config.get("api_key") or ""),
+            model=str(chat_config.get("model") or ""),
+            base_url=str(chat_config.get("base_url") or ""),
+            max_retries=int(chat_config.get("max_retries", 3)),
+            retry_delay=float(chat_config.get("retry_delay", 2.0)),
+        )
+        self.chat_model = str(chat_config.get("model") or "")
 
     def add_memory(
         self,
@@ -146,12 +159,18 @@ class HESMService:
             "top_segment": int(top_segment or self.api_config.get("top_segment", 3)),
             "top_qa": int(top_qa or self.api_config.get("top_qa", 8)),
         }
+        started_at = time.perf_counter()
         with self._lock:
+            extraction_started_at = time.perf_counter()
             extracted = self.extractor.extract(user_input=text)
+            extraction_ms = round(
+                (time.perf_counter() - extraction_started_at) * 1000, 3
+            )
             candidates = extracted if isinstance(extracted, list) else [extracted]
             if not candidates or not isinstance(candidates[0], dict):
                 raise ValueError("Topic extraction returned no valid query")
             primary = candidates[0]
+            retrieval_started_at = time.perf_counter()
             result = self.retriever.recall(
                 topic=str(primary.get("topic") or ""),
                 core_entity=str(primary.get("core_entity") or ""),
@@ -161,12 +180,119 @@ class HESMService:
                 query_confidence=float(primary.get("confidence") or 0.0),
                 **limits,
             )
+            retrieval_ms = round(
+                (time.perf_counter() - retrieval_started_at) * 1000, 3
+            )
+        total_ms = round((time.perf_counter() - started_at) * 1000, 3)
         return {
             "question": text,
             "query_extraction": primary,
             "query_candidates": candidates,
             "limits": limits,
+            "timing": {
+                "topic_extraction_ms": extraction_ms,
+                "retrieval_ms": retrieval_ms,
+                "response_assembly_ms": round(
+                    max(0.0, total_ms - extraction_ms - retrieval_ms), 3
+                ),
+                "total_ms": total_ms,
+            },
             **result,
+        }
+
+    def chat(
+        self,
+        *,
+        message: str,
+        history: list[dict[str, str]] | None = None,
+        state_key: str = "default",
+        session_id: str | None = None,
+        top_experience: int | None = None,
+        top_segment: int | None = None,
+        top_qa: int | None = None,
+    ) -> dict[str, Any]:
+        """Retrieve memory, answer the user, then persist the complete turn."""
+        text = str(message).strip()
+        if not text:
+            raise ValueError("message must not be empty")
+        session_identifier = str(session_id or state_key or "web_chat")
+        session = self.sessions.ensure(session_identifier)
+        persisted_history = session.get("messages") or []
+        requested_history = history or []
+        history_source = persisted_history if persisted_history else requested_history
+        normalized_history = [
+            {
+                "role": str(item.get("role") or ""),
+                "content": str(item.get("content") or "")[:20_000],
+            }
+            for item in history_source[-20:]
+            if item.get("role") in {"user", "assistant"}
+            and str(item.get("content") or "").strip()
+        ]
+
+        total_started_at = time.perf_counter()
+        with self._lock:
+            retrieval_result = self.retrieve(
+                question=text,
+                top_experience=top_experience,
+                top_segment=top_segment,
+                top_qa=top_qa,
+            )
+            prompt_started_at = time.perf_counter()
+            prompt = build_chat_prompt(
+                question=text,
+                extraction=retrieval_result["query_extraction"],
+                memory_context=retrieval_result.get("context_text") or "",
+                history=normalized_history,
+            )
+            prompt_ms = round((time.perf_counter() - prompt_started_at) * 1000, 3)
+
+            generation_started_at = time.perf_counter()
+            answer = self.answerer.answer(prompt)
+            generation_ms = round(
+                (time.perf_counter() - generation_started_at) * 1000, 3
+            )
+
+            storage_started_at = time.perf_counter()
+            stored = self.add_memory(
+                user_input=text,
+                assistant_output=answer,
+                context=prompt,
+                topic_result=retrieval_result["query_extraction"],
+                # tools is reserved exclusively for actual tool invocations.
+                # Topic extraction, retrieval and prompt diagnostics are not tools.
+                tools=[],
+                state_key=state_key,
+            )
+            storage_ms = round((time.perf_counter() - storage_started_at) * 1000, 3)
+            self.sessions.append_turn(
+                session_identifier,
+                user_content=text,
+                assistant_content=answer,
+                metadata={
+                    "last_qa_id": stored["memories"][0].get("qa_id", ""),
+                    "model": self.chat_model,
+                },
+            )
+
+        total_ms = round((time.perf_counter() - total_started_at) * 1000, 3)
+        return {
+            "message": text,
+            "answer": answer,
+            "prompt": prompt,
+            "history": normalized_history,
+            "extraction": retrieval_result["query_extraction"],
+            "retrieval": retrieval_result,
+            "stored": stored,
+            "timing": {
+                **retrieval_result.get("timing", {}),
+                "prompt_assembly_ms": prompt_ms,
+                "generation_ms": generation_ms,
+                "storage_ms": storage_ms,
+                "chat_total_ms": total_ms,
+            },
+            "model": self.chat_model,
+            "session_id": session_identifier,
         }
 
     def close(self) -> None:

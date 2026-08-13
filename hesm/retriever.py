@@ -2423,6 +2423,92 @@ class _BaseHybridRetriever:
             if not key.startswith("_") and key != "descendant_similarity"
         }
 
+    def _public_candidate_tree(
+        self,
+        prompt_tree: list[dict[str, Any]],
+        candidate_data: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Hydrate the recall tree with complete E/S/QA records for API callers."""
+        experiences = {
+            str(item["experience_id"]): item
+            for item in candidate_data["experiences"]
+        }
+        segments = {
+            str(item["segment_id"]): item for item in candidate_data["segments"]
+        }
+        qas = {str(item["qa_id"]): item for item in candidate_data["qas"]}
+        result: list[dict[str, Any]] = []
+        for experience_node in prompt_tree:
+            experience_id = str(experience_node["id"])
+            source_experience = experiences.get(experience_id)
+            if source_experience is None:
+                continue
+            experience = self._public_candidate(source_experience)
+            experience["id"] = experience_id
+            experience["local_score"] = float(
+                experience_node.get("local_score") or 0.0
+            )
+            experience["segments"] = []
+            for segment_node in experience_node.get("segments") or []:
+                segment_id = str(segment_node["id"])
+                source_segment = segments.get(segment_id)
+                if source_segment is None:
+                    continue
+                segment = self._public_candidate(source_segment)
+                segment["id"] = segment_id
+                segment["local_score"] = float(
+                    segment_node.get("local_score") or 0.0
+                )
+                segment["qas"] = []
+                for qa_node in segment_node.get("qas") or []:
+                    qa_id = str(qa_node["id"])
+                    source_qa = qas.get(qa_id)
+                    if source_qa is None:
+                        continue
+                    qa = self._public_candidate(source_qa)
+                    qa["id"] = qa_id
+                    qa["local_score"] = float(
+                        qa_node.get("local_score") or 0.0
+                    )
+                    segment["qas"].append(qa)
+                experience["segments"].append(segment)
+            result.append(experience)
+        return result
+
+    def _selected_result_tree(
+        self,
+        experiences: list[dict[str, Any]],
+        segments: list[dict[str, Any]],
+        qas: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return the final selection as the same explicit three-level tree."""
+        segments_by_experience: dict[str, list[dict[str, Any]]] = {}
+        qas_by_segment: dict[str, list[dict[str, Any]]] = {}
+        for qa in qas:
+            qas_by_segment.setdefault(str(qa["segment_id"]), []).append(qa)
+        for segment in segments:
+            segments_by_experience.setdefault(
+                str(segment["experience_id"]), []
+            ).append(segment)
+        tree: list[dict[str, Any]] = []
+        for source_experience in experiences:
+            experience = dict(source_experience)
+            experience["id"] = str(experience["experience_id"])
+            experience["segments"] = []
+            for source_segment in segments_by_experience.get(
+                experience["experience_id"], []
+            ):
+                segment = dict(source_segment)
+                segment["id"] = str(segment["segment_id"])
+                segment["qas"] = []
+                for source_qa in qas_by_segment.get(segment["segment_id"], []):
+                    qa = dict(source_qa)
+                    qa["id"] = str(qa["qa_id"])
+                    segment["qas"].append(qa)
+                experience["segments"].append(segment)
+            tree.append(experience)
+        return tree
+
     def _apply_selection_metadata(
         self, item: dict[str, Any], selection: dict[str, Any]
     ) -> dict[str, Any]:
@@ -2638,8 +2724,14 @@ class _BaseHybridRetriever:
             "intents": parse_intents(item.get("intents_link")),
             "summary": parse_summary(item.get("summary")),
             "state": parse_state(item.get("state")),
+            "segment_ids": list(item.get("segment_ids") or []),
             "vector_recalled": item["experience_id"] in vector_candidate_ids,
+            "created_at": item.get("created_at", ""),
             "updated_at": item.get("updated_at", ""),
+            "version": int(item.get("version") or 0),
+            "last_summarized_segment_count": int(
+                item.get("last_summarized_segment_count") or 0
+            ),
         }
 
     def _prepare_segment(
@@ -2653,8 +2745,14 @@ class _BaseHybridRetriever:
             "intent": str(item.get("intent") or ""),
             "status": item.get("status", ""),
             "summary": str(item.get("summary") or ""),
+            "qa_ids": list(item.get("qa_ids") or []),
             "vector_recalled": item["segment_id"] in vector_candidate_ids,
+            "created_at": item.get("created_at", ""),
             "updated_at": item.get("updated_at", ""),
+            "version": int(item.get("version") or 0),
+            "last_summarized_qa_count": int(
+                item.get("last_summarized_qa_count") or 0
+            ),
         }
 
     def _prepare_qa(
@@ -2670,6 +2768,7 @@ class _BaseHybridRetriever:
             "core_entity": item.get("core_entity", ""),
             "intent": item.get("intent", ""),
             "entities": parse_entities(item.get("entities")),
+            "status": item.get("status", ""),
             "confidence": clamp01(float(item.get("confidence") or 0.0)),
             "vector_recalled": item["qa_id"] in vector_candidate_ids,
             "reasoning": item.get("reasoning", ""),
@@ -3007,6 +3106,10 @@ class HybridRetriever(_BaseHybridRetriever):
             self.max_context_tokens,
         )
         context_text = build_context_text(experiences, segments, qas)
+        public_candidate_tree = self._public_candidate_tree(
+            candidate_tree, fitted_data
+        )
+        selected_tree = self._selected_result_tree(experiences, segments, qas)
         result = {
             "query": {
                 "topic": topic,
@@ -3018,7 +3121,8 @@ class HybridRetriever(_BaseHybridRetriever):
             "experiences": experiences,
             "segments": segments,
             "qas": qas,
-            "candidate_tree": candidate_tree,
+            "candidate_tree": public_candidate_tree,
+            "selected_tree": selected_tree,
             "context_text": context_text,
             "debug": {
                 "total_retrieval_ms": 0.0,
@@ -3294,6 +3398,7 @@ class HybridRetriever(_BaseHybridRetriever):
             segment_id = str(row["segment_id"])
             item = self._prepare_segment(row, set(segment_vectors))
             item["vector_similarity"] = segment_vectors.get(segment_id, 0.0)
+            ### TODO 关键字打分
             item["keyword_score"] = self._candidate_keyword_score(
                 item, query_text, topic, core_entity, intent
             )

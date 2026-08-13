@@ -68,6 +68,16 @@ CREATE TABLE IF NOT EXISTS runtime_state (
     retrieval_cache_json TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS chat_session (
+    session_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    messages_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE INDEX IF NOT EXISTS idx_qa_segment_id ON qa_memory(segment_id);
 CREATE INDEX IF NOT EXISTS idx_qa_topic_entity_intent
 ON qa_memory(topic, core_entity, intent);
@@ -79,6 +89,8 @@ CREATE INDEX IF NOT EXISTS idx_experience_core_entity
 ON experience_memory(core_entity);
 CREATE INDEX IF NOT EXISTS idx_qa_topic
 ON qa_memory(topic);
+CREATE INDEX IF NOT EXISTS idx_chat_session_updated_at
+ON chat_session(updated_at DESC);
 """
 
 
@@ -92,6 +104,8 @@ JSON_FIELDS = {
     "summary_json",
     "retrieval_cache_json",
     "vector_json",
+    "messages_json",
+    "metadata_json",
 }
 
 JSON_DEFAULTS: dict[str, Any] = {
@@ -103,6 +117,8 @@ JSON_DEFAULTS: dict[str, Any] = {
     "state_json": {},
     "retrieval_cache_json": {},
     "vector_json": [],
+    "messages_json": [],
+    "metadata_json": {},
 }
 
 
@@ -660,6 +676,8 @@ class MemoryStorage:
             "qa_memory",
             "segment_memory",
             "experience_memory",
-            "runtime_state",        }:
+            "runtime_state",
+            "chat_session",
+        }:
             raise ValueError(f"Unsupported table: {table}")
         return int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])

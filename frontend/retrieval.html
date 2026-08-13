@@ -1,144 +1,53 @@
 <!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="HESM 真实主题提取与层级记忆检索" />
-    <title>HESM Memory Retrieval</title>
-    <link rel="stylesheet" href="styles.css" />
-    <link rel="stylesheet" href="retrieval.css" />
-  </head>
-  <body class="retrieval-page">
-    <div class="app">
-      <header class="app-header">
-        <a class="brand" href="index.html" aria-label="HESM Memory Manager">
-          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-          <span><strong>HESM</strong><small>MEMORY MANAGER</small></span>
-        </a>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HESM 分步检索与全链路耗时分析">
+  <title>HESM · 检索分析</title>
+  <link rel="stylesheet" href="/styles.css?v=6">
+  <link rel="stylesheet" href="/retrieval.css?v=6">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/index.html"><span class="brand-icon">H</span><span>HESM<small>Hierarchical Episodic & Semantic Memory</small></span></a>
+    <nav><a href="/index.html">数据管理</a><a class="active" href="/retrieval.html">检索分析</a><a href="/chat.html?v=6">智能对话</a></nav>
+    <div id="health" class="health"><i></i><span>正在连接</span></div>
+  </header>
 
-        <nav class="mode-nav" aria-label="功能导航">
-          <a href="index.html">记忆管理</a>
-          <a class="active" href="retrieval.html">记忆检索</a>
-        </nav>
+  <main class="retrieval-shell">
+    <section class="query-panel">
+      <div class="query-copy"><p class="eyebrow">OBSERVABLE RETRIEVAL</p><h1>层级记忆检索</h1><p>输入问题，查看主题提取、候选召回、层级重排和结果组装的完整过程。</p></div>
+      <form id="retrieval-form">
+        <div class="query-box"><textarea id="query" required placeholder="例如：Caroline 的彩色玻璃窗表达了什么？"></textarea><button id="submit" class="button primary"><span>开始检索</span><b>→</b></button></div>
+        <div class="query-options"><div class="examples"><span>试试：</span><button type="button" data-query="Caroline 的彩色玻璃窗表达了什么？">彩色玻璃窗</button><button type="button" data-query="Caroline 为什么考虑收养？">收养计划</button></div><div class="limits"><label>E <input id="top-e" type="number" min="1" max="10" value="2"></label><label>S <input id="top-s" type="number" min="1" max="20" value="3"></label><label>Q <input id="top-q" type="number" min="1" max="50" value="8"></label></div></div>
+      </form>
+    </section>
 
-        <div class="header-actions">
-          <span id="api-status" class="snapshot-chip"><i></i><span>正在检查服务</span></span>
-          <span class="retrieval-mode">Experience-first</span>
-        </div>
-      </header>
+    <section id="pipeline" class="pipeline">
+      <article data-stage="extract"><span>01</span><div><strong>主题提取</strong><small>TopicExtractor</small></div><time>—</time></article>
+      <i></i><article data-stage="recall"><span>02</span><div><strong>层级检索</strong><small>HybridRetriever</small></div><time>—</time></article>
+      <i></i><article data-stage="assemble"><span>03</span><div><strong>结果组装</strong><small>Evidence tree</small></div><time>—</time></article>
+    </section>
 
-      <main class="retrieval-main">
-        <section class="retrieval-hero">
-          <div class="hero-copy">
-            <p class="retrieval-eyebrow">REAL HESM PIPELINE</p>
-            <h1>记忆检索</h1>
-            <p>先调用 TopicExtractor 提取主题，再通过 HybridRetriever 执行 Experience → Segment → QA 层级检索。</p>
-          </div>
+    <section id="welcome" class="welcome"><div class="orbit"><span>E</span><span>S</span><span>Q</span></div><h2>等待检索任务</h2><p>结果将在这里按步骤展开，并显示每一个关键操作的真实耗时。</p></section>
 
-          <form id="retrieval-form" class="retrieval-form">
-            <label for="retrieval-query">输入需要查询的记忆问题</label>
-            <div class="retrieval-input-row">
-              <textarea id="retrieval-query" rows="3" required placeholder="例如：Caroline 的彩色玻璃窗想表达什么？"></textarea>
-              <button id="retrieve-button" type="submit">
-                <span>开始检索</span>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"></path></svg>
-              </button>
-            </div>
-
-            <div class="query-options-row">
-              <div class="example-queries">
-                <span>示例：</span>
-                <button type="button" data-query="Caroline 的彩色玻璃窗想表达什么？">彩色玻璃窗寓意</button>
-                <button type="button" data-query="Melanie 和家人露营时做了什么？">家庭露营活动</button>
-                <button type="button" data-query="Caroline 最喜欢什么颜色，为什么？">颜色偏好</button>
-              </div>
-              <details class="limit-settings">
-                <summary>召回数量设置</summary>
-                <div>
-                  <label>Experience <input id="top-experience" type="number" min="1" max="10" value="2" /></label>
-                  <label>Segment <input id="top-segment" type="number" min="1" max="20" value="3" /></label>
-                  <label>QA <input id="top-qa" type="number" min="1" max="50" value="8" /></label>
-                </div>
-              </details>
-            </div>
-          </form>
-        </section>
-
-        <section id="pipeline-progress" class="pipeline-progress" aria-label="检索步骤">
-          <div class="pipeline-step" data-stage="extract">
-            <span>01</span><div><strong>主题提取</strong><small>TopicExtractor.extract</small></div><i></i>
-          </div>
-          <div class="pipeline-connector"></div>
-          <div class="pipeline-step" data-stage="retrieve">
-            <span>02</span><div><strong>层级检索</strong><small>HybridRetriever.recall</small></div><i></i>
-          </div>
-          <div class="pipeline-connector"></div>
-          <div class="pipeline-step" data-stage="trace">
-            <span>03</span><div><strong>来源组装</strong><small>Experience → Segment → QA</small></div><i></i>
-          </div>
-        </section>
-
-        <section id="retrieval-empty" class="retrieval-empty">
-          <div class="empty-orbit"><span>E</span><span>S</span><span>Q</span></div>
-          <h2>等待执行真实记忆检索</h2>
-          <p>提交问题后，这里会展示主题抽取标签、召回统计、层级结果和每条证据的完整来源路径。</p>
-        </section>
-
-        <section id="retrieval-workspace" class="retrieval-workspace" hidden>
-          <aside class="analysis-column">
-            <article class="analysis-card extraction-card">
-              <div class="analysis-card-head">
-                <div><span class="analysis-number">01</span><h2>主题提取结果</h2></div>
-                <span id="extraction-confidence" class="confidence-chip">—</span>
-              </div>
-              <div id="extraction-fields" class="extraction-fields"></div>
-              <div class="extraction-reason">
-                <small>REASONING</small>
-                <p id="extraction-reasoning">—</p>
-              </div>
-            </article>
-
-            <article class="analysis-card timing-card">
-              <div class="analysis-card-head"><div><span class="analysis-number">02</span><h2>执行耗时</h2></div></div>
-              <div id="timing-grid" class="timing-grid"></div>
-            </article>
-
-            <article class="analysis-card debug-card">
-              <div class="analysis-card-head"><div><span class="analysis-number">03</span><h2>检索追踪</h2></div></div>
-              <dl id="debug-list" class="debug-list"></dl>
-              <div class="source-legend">
-                <small>来源标识</small>
-                <span><i class="source-vector"></i>向量召回</span>
-                <span><i class="source-relation"></i>关系召回</span>
-                <span><i class="source-descendant"></i>层级后代</span>
-              </div>
-            </article>
-          </aside>
-
-          <div class="result-column">
-            <div class="result-toolbar">
-              <div>
-                <span class="retrieval-eyebrow">RETRIEVAL RESULT</span>
-                <h2>召回结果与来源链</h2>
-              </div>
-              <div class="result-summary" id="result-summary"></div>
-              <div class="view-switch" role="group" aria-label="结果视图">
-                <button class="active" type="button" data-view="tree">层级结果</button>
-                <button type="button" data-view="context">拼接上下文</button>
-              </div>
-            </div>
-
-            <div id="tree-view" class="tree-view"></div>
-            <div id="context-view" class="context-view" hidden>
-              <div class="context-head"><span>最终提供给回答模型的上下文</span><button id="copy-context" type="button">复制上下文</button></div>
-              <pre id="context-text"></pre>
-            </div>
-          </div>
-        </section>
-      </main>
-    </div>
-
-    <div id="retrieval-toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="retrieval.js"></script>
-  </body>
+    <section id="results" class="results" hidden>
+      <aside class="analysis-stack">
+        <article class="panel"><header><span class="step-no">01</span><div><small>QUERY UNDERSTANDING</small><h2>主题提取结果</h2></div><b id="confidence" class="confidence">—</b></header><div id="extraction" class="extraction"></div><details open><summary>判断依据</summary><p id="reasoning"></p></details></article>
+        <article class="panel"><header><span class="step-no">02</span><div><small>LATENCY PROFILE</small><h2>全链路耗时</h2></div><b id="total-time" class="total-time">—</b></header><div id="timing" class="timing-list"></div></article>
+        <article class="panel"><header><span class="step-no">03</span><div><small>RETRIEVAL TRACE</small><h2>检索诊断</h2></div></header><div id="diagnostics" class="diagnostics"></div></article>
+      </aside>
+      <div class="evidence-column">
+        <div class="result-toolbar"><div><p class="eyebrow">RETRIEVAL PIPELINE</p><h2>候选树与最终选择</h2></div><div><button class="view-button active" data-view="candidate">① Candidate Tree</button><button class="view-button" data-view="selected">② 最终选中</button><button class="view-button" data-view="context">③ 上下文</button></div></div>
+        <div id="summary" class="result-summary"></div>
+        <section id="candidate-view" class="result-view"><div class="view-heading"><div><span>RECALL OUTPUT</span><h3>Candidate Tree</h3></div><p>来自 recall，经上下文预算裁剪后送入重排器的完整候选树。</p></div><div id="candidate-tree" class="candidate-tree"></div></section>
+        <section id="selected-view" class="result-view" hidden><div class="view-heading"><div><span>RERANK OUTPUT</span><h3>最终选中的 Experience / Segment / QA</h3></div><p>经过层级重排与 Top-K 约束后的最终证据。</p></div><div id="tree" class="tree"></div></section>
+        <div id="context" class="context-panel" hidden><div><span>注入模型的上下文</span><button id="copy">复制</button></div><pre id="context-text"></pre></div>
+      </div>
+    </section>
+  </main>
+  <div id="toast" class="toast"></div>
+  <script src="/retrieval.js?v=6"></script>
+</body>
 </html>

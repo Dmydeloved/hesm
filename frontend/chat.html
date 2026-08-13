@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="基于 HESM 长期记忆的可观测智能对话">
+  <title>HESM · 智能对话</title>
+  <link rel="stylesheet" href="/styles.css?v=6">
+  <link rel="stylesheet" href="/chat.css?v=6">
+</head>
+<body class="chat-page">
+  <header class="topbar">
+    <a class="brand" href="/index.html"><span class="brand-icon">H</span><span>HESM<small>Hierarchical Episodic & Semantic Memory</small></span></a>
+    <nav><a href="/index.html">数据管理</a><a href="/retrieval.html">检索分析</a><a class="active" href="/chat.html?v=6">智能对话</a></nav>
+    <div id="health" class="health"><i></i><span>正在连接</span></div>
+  </header>
+
+  <main class="chat-shell">
+    <aside class="session-sidebar">
+      <header><div><p class="eyebrow">CHAT SESSIONS</p><h2>历史会话</h2></div><button id="new-chat" title="新建会话">＋</button></header>
+      <div id="session-list" class="session-list"><p class="session-loading">正在加载历史会话…</p></div>
+    </aside>
+    <section class="conversation-panel">
+      <header class="conversation-head">
+        <div><p class="eyebrow">MEMORY AUGMENTED CHAT</p><h1 id="current-session-title">智能对话</h1><p>每轮回答都会读取长期记忆，并在回答后自动沉淀为新的 HESM 记忆。</p></div>
+      </header>
+      <div id="messages" class="messages">
+        <div class="welcome-message"><span class="assistant-avatar">H</span><div><strong>HESM Assistant</strong><p>你好，我会先理解你的主题、检索相关长期记忆，再结合上下文回答。右侧可以查看每一步的完整过程。</p></div></div>
+      </div>
+      <form id="chat-form" class="composer">
+        <textarea id="message" rows="2" required placeholder="输入消息，Enter 发送，Shift + Enter 换行…"></textarea>
+        <div class="composer-foot"><div class="limits"><label>E <input id="top-e" type="number" min="1" max="10" value="2"></label><label>S <input id="top-s" type="number" min="1" max="20" value="3"></label><label>Q <input id="top-q" type="number" min="1" max="50" value="8"></label></div><span id="save-hint">回答后自动存储</span><button id="send" class="button primary" type="submit"><span>发送</span><b>↑</b></button></div>
+      </form>
+    </section>
+
+    <aside class="trace-panel">
+      <header><div><p class="eyebrow">LIVE EXECUTION TRACE</p><h2>处理过程</h2></div><span id="total-time">等待输入</span></header>
+      <div id="trace-empty" class="trace-empty"><span>◇</span><p>发送消息后，这里会实时展示主题提取、记忆检索、Prompt、LLM 回答和存储结果。</p></div>
+      <div id="trace" class="trace" hidden>
+        <article class="trace-step" data-step="extract"><header><span>01</span><div><strong>主题提取</strong><small>TopicExtractor</small></div><time>—</time></header><div id="topic-result" class="trace-body"></div></article>
+        <article class="trace-step" data-step="retrieve"><header><span>02</span><div><strong>记忆检索</strong><small>Experience → Segment → QA</small></div><time>—</time></header><div id="retrieval-result" class="trace-body"></div></article>
+        <article class="trace-step" data-step="prompt"><header><span>03</span><div><strong>Prompt 拼接</strong><small>Memory + history + question</small></div><time>—</time></header><div class="trace-body"><button class="inspect-button" data-dialog="prompt-dialog">查看完整 Prompt</button><p id="prompt-preview">—</p></div></article>
+        <article class="trace-step" data-step="generate"><header><span>04</span><div><strong>LLM 回答</strong><small id="model-name">Answer model</small></div><time>—</time></header><div class="trace-body"><p id="answer-preview">—</p></div></article>
+        <article class="trace-step" data-step="store"><header><span>05</span><div><strong>记忆存储</strong><small>QA → Segment → Experience</small></div><time>—</time></header><div id="store-result" class="trace-body"></div></article>
+      </div>
+    </aside>
+  </main>
+
+  <dialog id="prompt-dialog" class="prompt-dialog"><header><div><p class="eyebrow">FINAL LLM INPUT</p><h2>完整 Prompt</h2></div><button data-close-dialog>×</button></header><pre id="prompt-text"></pre></dialog>
+  <div id="toast" class="toast"></div>
+  <script src="/chat.js?v=6"></script>
+</body>
+</html>

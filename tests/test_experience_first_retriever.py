@@ -187,6 +187,10 @@ def test_high_confidence_uses_only_initial_experience_tree() -> None:
     }
     assert [node["id"] for node in result["candidate_tree"]] == ["e1"]
     assert result["candidate_tree"][0]["segments"][0]["qas"][0]["id"] == "q1"
+    assert result["candidate_tree"][0]["experience_id"] == "e1"
+    assert result["candidate_tree"][0]["segments"][0]["segment_id"] == "s1"
+    assert result["selected_tree"][0]["experience_id"] == "e1"
+    assert result["selected_tree"][0]["segments"][0]["qas"][0]["qa_id"] == "q1"
 
 
 def test_low_confidence_adds_only_rescued_qa_ancestor_path() -> None:
