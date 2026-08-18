@@ -1,3 +1,0 @@
-mode,avg_latency_ms,p50_ms,p90_ms,p99_ms,cache_hit_rate,latency_reduction
-cache_off,10056.2,8166.6,17960.47,26945.52,0.0,-15.00%
-cache_on,11564.47,10437.97,21848.97,26205.59,0.0,-15.00%

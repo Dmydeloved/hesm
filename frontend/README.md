@@ -1,13 +1,13 @@
 # HESM Web Console
 
-这是 HESM 的本地 Web 管理与检索界面，由同一个 FastAPI WebServer 提供 API 和静态页面。
+这是 HESM 的纯静态前端。FastAPI 后端位于独立的 `service/` 包，并负责提供 API 和托管本目录中的页面资源。
 
 ## 启动
 
 在项目根目录执行：
 
 ```powershell
-python -m frontend.server
+python -m service.server
 ```
 
 然后访问：
@@ -24,12 +24,12 @@ python -m frontend.server
 检索分析页面执行真实的 HESM 流程：
 
 1. `TopicExtractor` 提取主题、核心实体、意图和相关实体；
-2. `HybridRetriever` 执行 Experience → Segment → QA 层级召回；
+2. `HybridRetriever` 按主题和核心实体定位当前 Experience，并读取最近的 Segment 与 QA；
 3. 展示最终证据树和注入模型的上下文。
 
-耗时面板展示主题提取、查询向量、SQLite 召回、Chroma 召回、候选评分、候选树构建、上下文裁剪、LLM 重排、结果处理和响应组装等真实指标。
+耗时面板展示主题提取、Experience/上下文查询和响应组装的真实耗时。
 
-智能对话页面执行“主题提取 → HESM 检索 → Prompt 拼接 → LLM 回答 → 记忆存储”。每轮成功回答会作为 QA 写入 HESM，并在 `tools_json` 中保留完整 Prompt、会话历史、主题结果、召回树、检索诊断、生成模型和耗时数据。
+智能对话页面执行“主题提取 → HESM 检索 → Prompt 拼接 → LLM 回答 → 记忆存储”。每轮成功回答会作为 QA 写入 HESM；`tools_json` 只保存真实工具调用，不混入检索诊断。
 
 聊天历史由独立的 `chat_session` 表管理，并保留浏览器本地缓存作为离线回退。刷新页面后会通过 `session_id` 自动恢复；“新建会话”会生成独立的会话标识，页面左侧可以切换或归档已保存会话。该表只负责会话历史，不改变 Experience、Segment、QA 的业务逻辑。
 

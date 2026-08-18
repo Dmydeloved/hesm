@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS experience_memory (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     version INTEGER NOT NULL,
-    last_summarized_segment_count INTEGER NOT NULL
+    last_summarized_segment_count INTEGER NOT NULL,
+    history_experience_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS runtime_state (
@@ -102,6 +103,7 @@ JSON_FIELDS = {
     "segment_ids_json",
     "state_json",
     "summary_json",
+    "history_experience_json",
     "retrieval_cache_json",
     "vector_json",
     "messages_json",
@@ -115,6 +117,7 @@ JSON_DEFAULTS: dict[str, Any] = {
     "intents_link_json": [],
     "segment_ids_json": [],
     "state_json": {},
+    "history_experience_json": {},
     "retrieval_cache_json": {},
     "vector_json": [],
     "messages_json": [],
@@ -153,6 +156,7 @@ class MemoryStorage:
         if not read_only:
             self.connection.executescript(SCHEMA)
             self._ensure_runtime_state_columns()
+            self._ensure_experience_columns()
             self.connection.commit()
         logger.info("结构化记忆库已初始化 db=%s", self.db_path.resolve())
 
@@ -165,6 +169,20 @@ class MemoryStorage:
             self.connection.execute(
                 "ALTER TABLE runtime_state "
                 "ADD COLUMN retrieval_cache_json TEXT NOT NULL DEFAULT '{}'"
+            )
+
+    def _ensure_experience_columns(self) -> None:
+        """Migrate existing databases without rebuilding their memory tables."""
+        columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(experience_memory)"
+            ).fetchall()
+        }
+        if "history_experience_json" not in columns:
+            self.connection.execute(
+                "ALTER TABLE experience_memory "
+                "ADD COLUMN history_experience_json TEXT NOT NULL DEFAULT '{}'"
             )
 
     def close(self) -> None:
@@ -436,6 +454,23 @@ class MemoryStorage:
         ).fetchone()
         return self._row_to_dict(row)
 
+    def find_active_experience(
+        self, topic: str, core_entity: str
+    ) -> dict[str, Any] | None:
+        """Return the latest in-progress Experience with an exact identity match."""
+        row = self.connection.execute(
+            """
+            SELECT * FROM experience_memory
+            WHERE topic = ?
+              AND core_entity = ?
+              AND json_extract(state_json, '$.status') = 'in_progress'
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (str(topic or "").strip(), str(core_entity or "").strip()),
+        ).fetchone()
+        return self._row_to_dict(row)
+
     def find_experience_by_topic(self, topic: str) -> dict[str, Any] | None:
         """topic 精确匹配回退查询（向量检索嵌入失败时使用）。
         不依赖 core_entity，避免同一主题不同说话人造成匹配失败。
@@ -510,6 +545,47 @@ class MemoryStorage:
             SELECT *, ({' + '.join(score_parts)}) AS relation_score
             FROM experience_memory
             WHERE {' OR '.join(conditions)}
+            ORDER BY relation_score DESC, updated_at DESC, created_at DESC
+            LIMIT ?
+            """,
+            (*score_parameters, *parameters, max(1, int(limit))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def search_completed_experiences(
+        self,
+        topic: str,
+        core_entity: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Recall completed Experiences matching topic, entity, or both."""
+        topic = str(topic or "").strip()
+        core_entity = str(core_entity or "").strip()
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        score_parts: list[str] = []
+        score_parameters: list[Any] = []
+        if topic:
+            conditions.append("topic = ?")
+            parameters.append(topic)
+            score_parts.append("CASE WHEN topic = ? THEN 1 ELSE 0 END")
+            score_parameters.append(topic)
+        if core_entity:
+            conditions.append("core_entity = ?")
+            parameters.append(core_entity)
+            score_parts.append(
+                "CASE WHEN core_entity = ? THEN 1 ELSE 0 END"
+            )
+            score_parameters.append(core_entity)
+        if not conditions:
+            return []
+
+        rows = self.connection.execute(
+            f"""
+            SELECT *, ({' + '.join(score_parts)}) AS relation_score
+            FROM experience_memory
+            WHERE json_extract(state_json, '$.status') = 'completed'
+              AND ({' OR '.join(conditions)})
             ORDER BY relation_score DESC, updated_at DESC, created_at DESC
             LIMIT ?
             """,
@@ -597,8 +673,9 @@ class MemoryStorage:
             INSERT INTO experience_memory (
                 experience_id, topic, core_entity, intents_link_json,
                 segment_ids_json, summary_json, state_json, created_at,
-                updated_at, version, last_summarized_segment_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                updated_at, version, last_summarized_segment_count,
+                history_experience_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 experience["experience_id"],
@@ -612,6 +689,10 @@ class MemoryStorage:
                 experience["updated_at"],
                 experience["version"],
                 experience["last_summarized_segment_count"],
+                json.dumps(
+                    experience.get("history_experience") or {},
+                    ensure_ascii=False,
+                ),
             ),
         )
 
@@ -625,7 +706,8 @@ class MemoryStorage:
                 state_json = ?,
                 updated_at = ?,
                 version = ?,
-                last_summarized_segment_count = ?
+                last_summarized_segment_count = ?,
+                history_experience_json = ?
             WHERE experience_id = ?
             """,
             (
@@ -636,6 +718,10 @@ class MemoryStorage:
                 experience["updated_at"],
                 experience["version"],
                 experience["last_summarized_segment_count"],
+                json.dumps(
+                    experience.get("history_experience") or {},
+                    ensure_ascii=False,
+                ),
                 experience["experience_id"],
             ),
         )
@@ -668,6 +754,37 @@ class MemoryStorage:
             WHERE segment_id IN ({placeholders}) AND status = 'active'
             """,
             segment_ids,
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def list_latest_segments(
+        self, experience_id: str, limit: int = 2
+    ) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT * FROM segment_memory
+            WHERE experience_id = ? AND status != 'deleted'
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT ?
+            """,
+            (experience_id, max(1, int(limit))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def list_latest_qas(
+        self, segment_ids: list[str], limit: int = 5
+    ) -> list[dict[str, Any]]:
+        if not segment_ids:
+            return []
+        placeholders = ", ".join("?" for _ in segment_ids)
+        rows = self.connection.execute(
+            f"""
+            SELECT * FROM qa_memory
+            WHERE segment_id IN ({placeholders}) AND status = 'active'
+            ORDER BY timestamp DESC, qa_id DESC
+            LIMIT ?
+            """,
+            (*segment_ids, max(1, int(limit))),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 

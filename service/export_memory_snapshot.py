@@ -1,4 +1,4 @@
-"""Export a read-only HESM SQLite snapshot for the static memory manager UI."""
+"""Export a read-only HESM SQLite snapshot for the static frontend."""
 
 from __future__ import annotations
 
@@ -72,6 +72,9 @@ def export_snapshot(database: Path, output: Path) -> None:
                 "intents": parse_json(row["intents_link_json"], []),
                 "summary": parse_json(row["summary_json"], ""),
                 "state": parse_json(row["state_json"], {}),
+                "historyExperience": parse_json(
+                    row["history_experience_json"], {}
+                ),
                 "createdAt": row["created_at"],
                 "updatedAt": row["updated_at"],
                 "version": row["version"],

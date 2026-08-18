@@ -14,13 +14,13 @@ from fastapi.responses import RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from hesm.config import config_path
-from hesm.service import HESMService
+from hesm.config import PROJECT_ROOT, config_path
 from hesm.session import SessionManager
+from service.hesm_service import HESMService
 
 
-LOGGER = logging.getLogger("hesm.frontend")
-FRONTEND_DIR = Path(__file__).resolve().parent
+LOGGER = logging.getLogger("hesm.service")
+FRONTEND_DIR = PROJECT_ROOT / "frontend"
 DATABASE_PATH = config_path("paths", "memory_db")
 CHROMA_PATH = config_path("paths", "chroma")
 
@@ -71,6 +71,9 @@ class MemoryRepository:
         item["segment_ids"] = _json(item.pop("segment_ids_json", "[]"), [])
         item["summary"] = _json(item.pop("summary_json", '""'), "")
         item["state"] = _json(item.pop("state_json", "{}"), {})
+        item["history_experience"] = _json(
+            item.pop("history_experience_json", "{}"), {}
+        )
         item["segment_count"] = int(item.get("segment_count") or len(item["segment_ids"]))
         item["qa_count"] = int(item.get("qa_count") or 0)
         return item
@@ -332,9 +335,6 @@ class MemoryAddRequest(BaseModel):
 
 class RetrievalRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2_000)
-    top_experience: int | None = Field(default=None, ge=1, le=10)
-    top_segment: int | None = Field(default=None, ge=1, le=20)
-    top_qa: int | None = Field(default=None, ge=1, le=50)
 
 
 class StatusRequest(BaseModel):
@@ -351,9 +351,6 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = Field(default_factory=list, max_length=20)
     state_key: str = Field(default="web_chat", min_length=1, max_length=200)
     session_id: str | None = Field(default=None, min_length=1, max_length=200)
-    top_experience: int | None = Field(default=None, ge=1, le=10)
-    top_segment: int | None = Field(default=None, ge=1, le=20)
-    top_qa: int | None = Field(default=None, ge=1, le=50)
 
 
 app = FastAPI(title="HESM Memory Console API", version="3.0.0")
@@ -547,4 +544,4 @@ app.mount("/", NoCacheStaticFiles(directory=FRONTEND_DIR, html=True), name="fron
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("frontend.server:app", host="127.0.0.1", port=8080, reload=False)
+    uvicorn.run("service.server:app", host="127.0.0.1", port=8080, reload=False)

@@ -1,5 +1,7 @@
-"""HESM hierarchical memory system."""
+"""Core components of the HESM hierarchical memory system."""
 
-from .service import HESMService
+from .manager import MemoryManager
+from .recaller import ExperienceRecaller
+from .retriever import HybridRetriever
 
-__all__ = ["HESMService"]
+__all__ = ["ExperienceRecaller", "HybridRetriever", "MemoryManager"]

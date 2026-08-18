@@ -188,8 +188,6 @@
         body: JSON.stringify({
           message, history: state.history.slice(-20), state_key: state.stateKey,
           session_id: state.stateKey,
-          top_experience: Number($("#top-e").value),
-          top_segment: Number($("#top-s").value), top_qa: Number($("#top-q").value),
         }),
       });
       typing.remove();

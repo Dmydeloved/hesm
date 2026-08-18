@@ -84,6 +84,11 @@ def build_experience_embedding_text(experience: dict[str, Any]) -> str:
     """Build a bounded Experience vector document without aggregating QA entities."""
 
     state = experience.get("state") if isinstance(experience.get("state"), dict) else {}
+    history = (
+        experience.get("history_experience")
+        if isinstance(experience.get("history_experience"), dict)
+        else {}
+    )
     recent_segments = experience.get("recent_segments") or []
     recent_text = "；".join(
         " / ".join(
@@ -108,6 +113,11 @@ def build_experience_embedding_text(experience: dict[str, Any]) -> str:
             f"核心实体：{experience.get('core_entity', '')}",
             f"相关意图：{'、'.join(_text_list(experience.get('intents_link')))}",
             f"长期摘要：{experience.get('summary', '')}",
+            "历史经验：" + " / ".join(
+                str(history.get(key) or "").strip()
+                for key in ("topic", "core_entity", "summary")
+                if str(history.get(key) or "").strip()
+            ),
             f"当前状态：{state_text}",
             f"最近阶段：{recent_text}",
         ]

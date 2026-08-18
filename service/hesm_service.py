@@ -7,16 +7,17 @@ from threading import RLock
 import time
 from typing import Any
 
-from .config import PROJECT_ROOT, load_config
-from .chat import LLMAnswerer, build_chat_prompt
-from .embedder import BailianEmbedder
-from .extractor import TopicExtractor
-from .manager import MemoryManager
-from .retriever import HybridRetriever
-from .session import SessionManager
-from .storage import MemoryStorage
-from .summarizer import LLMSummarizer
-from .vector_store import ChromaVectorStore
+from hesm.chat import LLMAnswerer, build_chat_prompt
+from hesm.config import PROJECT_ROOT, load_config
+from hesm.embedder import BailianEmbedder
+from hesm.extractor import TopicExtractor
+from hesm.manager import MemoryManager
+from hesm.recaller import ExperienceRecaller
+from hesm.retriever import HybridRetriever
+from hesm.session import SessionManager
+from hesm.storage import MemoryStorage
+from hesm.summarizer import LLMSummarizer
+from hesm.vector_store import ChromaVectorStore
 
 
 class HESMService:
@@ -34,7 +35,6 @@ class HESMService:
         topic_config = self.config.get("topic_extraction", {})
         summary_config = self.config.get("summarization", {})
         chat_config = self.config.get("chat", summary_config)
-        retrieval_config = self.config.get("retrieval", {})
         management_config = self.config.get("memory_management", {})
         self.api_config = self.config.get("api", {})
 
@@ -63,6 +63,11 @@ class HESMService:
             max_retries=summary_config.get("max_retries"),
             retry_delay=summary_config.get("retry_delay"),
         )
+        self.recaller = ExperienceRecaller(
+            storage=self.storage,
+            vector_store=self.vector_store,
+            embedder=self.embedder,
+        )
         self.manager = MemoryManager(
             storage=self.storage,
             vector_store=self.vector_store,
@@ -78,18 +83,11 @@ class HESMService:
                 management_config.get("experience_similarity_threshold", 0.82)
             ),
             min_segment_qas=int(management_config.get("min_segment_qas", 2)),
+            experience_recall=self.recaller.recall,
         )
         self.retriever = HybridRetriever(
             storage=self.storage,
-            vector_store=self.vector_store,
-            embedder=self.embedder,
-            rerank_with_llm=True,
-            retrieval_api_key=retrieval_config.get("api_key"),
-            retrieval_model=retrieval_config.get("model"),
-            retrieval_base_url=retrieval_config.get("base_url"),
-            retrieval_max_retries=retrieval_config.get("max_retries"),
-            retrieval_retry_delay=retrieval_config.get("retry_delay"),
-            retrieval_config=retrieval_config,
+            create_experience=self.manager.create_experience,
         )
         self.answerer = LLMAnswerer(
             api_key=str(chat_config.get("api_key") or ""),
@@ -144,20 +142,15 @@ class HESMService:
         self,
         *,
         question: str,
-        top_experience: int | None = None,
-        top_segment: int | None = None,
-        top_qa: int | None = None,
     ) -> dict[str, Any]:
         """Extract a query and retrieve a bounded hierarchical memory tree."""
         text = str(question).strip()
         if not text:
             raise ValueError("question must not be empty")
         limits = {
-            "top_experience": int(
-                top_experience or self.api_config.get("top_experience", 2)
-            ),
-            "top_segment": int(top_segment or self.api_config.get("top_segment", 3)),
-            "top_qa": int(top_qa or self.api_config.get("top_qa", 8)),
+            "top_experience": 1,
+            "top_segment": max(1, int(self.api_config.get("top_segment", 2))),
+            "top_qa": 4,
         }
         started_at = time.perf_counter()
         with self._lock:
@@ -171,14 +164,10 @@ class HESMService:
                 raise ValueError("Topic extraction returned no valid query")
             primary = candidates[0]
             retrieval_started_at = time.perf_counter()
-            result = self.retriever.recall(
+            result = self.retriever.retriever(
                 topic=str(primary.get("topic") or ""),
                 core_entity=str(primary.get("core_entity") or ""),
-                intent=str(primary.get("intent") or ""),
-                entities=list(primary.get("entities") or []),
                 query=text,
-                query_confidence=float(primary.get("confidence") or 0.0),
-                **limits,
             )
             retrieval_ms = round(
                 (time.perf_counter() - retrieval_started_at) * 1000, 3
@@ -207,9 +196,6 @@ class HESMService:
         history: list[dict[str, str]] | None = None,
         state_key: str = "default",
         session_id: str | None = None,
-        top_experience: int | None = None,
-        top_segment: int | None = None,
-        top_qa: int | None = None,
     ) -> dict[str, Any]:
         """Retrieve memory, answer the user, then persist the complete turn."""
         text = str(message).strip()
@@ -234,15 +220,12 @@ class HESMService:
         with self._lock:
             retrieval_result = self.retrieve(
                 question=text,
-                top_experience=top_experience,
-                top_segment=top_segment,
-                top_qa=top_qa,
             )
             prompt_started_at = time.perf_counter()
             prompt = build_chat_prompt(
                 question=text,
                 extraction=retrieval_result["query_extraction"],
-                memory_context=retrieval_result.get("context_text") or "",
+                memory_context=retrieval_result.get("context") or "",
                 history=normalized_history,
             )
             prompt_ms = round((time.perf_counter() - prompt_started_at) * 1000, 3)

@@ -24,24 +24,10 @@ embedding: &embedding_defaults
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 
 retrieval:
-  # Retrieval-specific tuning extends the shared nano LLM profile.
-  <<: *nano_llm
-  qa_full_search_confidence_threshold: 0.8
+  # Completed-Experience recall only: SQLite relation path + Chroma path.
   experience_vector_recall_limit: 12
   experience_relational_recall_limit: 12
-  experience_candidate_limit: 8
-  scoped_segment_vector_limit: 32
-  scoped_qa_vector_limit: 64
-  qa_rescue_vector_limit: 40
-  qa_rescue_relational_limit: 40
-  max_context_tokens: 30000
-  min_retained_experiences: 1
-  min_retained_segments: 2
-  summary_soft_experience_chars: 800
-  summary_soft_segment_chars: 400
-  summary_extreme_experience_chars: 300
-  summary_extreme_segment_chars: 160
-  token_encoding: cl100k_base
+  experience_similarity_threshold: 0.82
 
 summarization: *strong_llm
 
@@ -55,6 +41,6 @@ memory_management:
   min_segment_qas: 2
 
 api:
-  top_experience: 2
-  top_segment: 3
-  top_qa: 8
+  top_experience: 1
+  top_segment: 2
+  top_qa: 4

@@ -1,31 +1,264 @@
-(function(){
-"use strict";
-const $=s=>document.querySelector(s);const esc=v=>String(v??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;");
-const state={running:false,result:null,timer:null};const els={health:$("#health"),form:$("#retrieval-form"),query:$("#query"),submit:$("#submit"),pipeline:$("#pipeline"),welcome:$("#welcome"),results:$("#results"),confidence:$("#confidence"),extraction:$("#extraction"),reasoning:$("#reasoning"),total:$("#total-time"),timing:$("#timing"),diagnostics:$("#diagnostics"),summary:$("#summary"),tree:$("#tree"),context:$("#context"),contextText:$("#context-text"),toast:$("#toast")};
-function toast(message){els.toast.textContent=message;els.toast.classList.add("show");clearTimeout(toast.timer);toast.timer=setTimeout(()=>els.toast.classList.remove("show"),1800)}
-function setHealth(ok,label){els.health.className=`health ${ok?"ready":"error"}`;els.health.querySelector("span").textContent=label}
-async function health(){try{const r=await fetch("/api/health");const d=await r.json();setHealth(r.ok&&d.status!=="degraded",d.status==="ready"?"检索服务就绪":"记忆库为空")}catch(_){setHealth(false,"请启动 WebServer")}}
-function ms(value){const n=Number(value||0);return n>=1000?`${(n/1000).toFixed(2)} s`:`${n.toFixed(n>=100?0:1)} ms`}
-function pct(value){const n=Number(value);return Number.isFinite(n)?`${Math.round(n*100)}%`:"—"}
-function setStage(stage,error=false){const order=["extract","recall","assemble"],index=order.indexOf(stage);els.pipeline.querySelectorAll("article").forEach((el,i)=>{el.classList.toggle("active",!error&&i===index);el.classList.toggle("done",!error&&(stage==="done"||i<index));el.classList.toggle("error",error&&i===index)})}
-function setPipelineTimes(timing){const values={extract:timing.topic_extraction_ms,recall:timing.retrieval_ms,assemble:timing.response_assembly_ms};Object.entries(values).forEach(([key,value])=>els.pipeline.querySelector(`[data-stage="${key}"] time`).textContent=ms(value))}
-function renderExtraction(data){els.confidence.textContent=`置信度 ${pct(data.confidence)}`;const items=[["主题",data.topic],["核心实体",data.core_entity],["意图",data.intent],["相关实体",(data.entities||[]).join("、")||"—"]];els.extraction.innerHTML=items.map(([k,v])=>`<div><small>${k}</small><strong>${esc(v||"—")}</strong></div>`).join("");els.reasoning.textContent=data.reasoning||"未返回判断依据"}
-function flattenOperations(byLayer){const rows=[];Object.entries(byLayer||{}).forEach(([layer,operations])=>Object.entries(operations||{}).forEach(([operation,value])=>rows.push([`${layer} · ${operation}`,Number(value||0)])));return rows.sort((a,b)=>b[1]-a[1])}
-function renderTimings(result){const timing=result.timing||{},debug=result.debug||{},collection=debug.candidate_collection||{};const groups=[{name:"主题提取",value:timing.topic_extraction_ms,children:[]},{name:"查询向量生成",value:debug.embedding?.elapsed_ms,children:[["向量维度",debug.embedding?.vector_dimensions?`${debug.embedding.vector_dimensions} dim`:"—"]]},{name:"SQLite 结构化召回",value:collection.sql_recall?.total_ms,children:flattenOperations(collection.sql_recall?.by_layer)},{name:"Chroma 向量召回",value:collection.chroma_vector_recall?.total_ms,children:flattenOperations(collection.chroma_vector_recall?.by_layer)},{name:"候选评分与排序",value:collection.ranking_processing?.total_ms,children:flattenOperations(collection.ranking_processing?.by_layer)},{name:"候选树构建",value:debug.candidate_tree_build?.elapsed_ms,children:[]},{name:"上下文裁剪",value:debug.tree_pruning?.elapsed_ms,children:[]},{name:"LLM 层级重排",value:debug.reranking?.elapsed_ms,children:[["LLM 调用",`${debug.reranking?.llm_calls||0} 次`],["是否执行",debug.reranking?.attempted?"是":"否"]]},{name:"响应组装",value:timing.response_assembly_ms,children:[]}];const max=Math.max(1,...groups.map(g=>Number(g.value||0)));els.total.textContent=ms(timing.total_ms);els.timing.innerHTML=groups.map((g,i)=>`<div class="timing-group ${i===2||i===3?"open":""}"><button type="button"><span>${esc(g.name)}</span><b>${typeof g.value==="number"?ms(g.value):"—"}</b><i>${g.children.length?"⌄":""}</i></button><div class="timing-bar"><i style="width:${Math.max(1,Number(g.value||0)/max*100)}%"></i></div>${g.children.length?`<div class="timing-children">${g.children.map(([name,value])=>`<div><span>${esc(name)}</span><b>${typeof value==="number"?ms(value):esc(value)}</b></div>`).join("")}</div>`:""}</div>`).join("")}
-function countTree(tree){return {e:(tree||[]).length,s:(tree||[]).reduce((n,e)=>n+(e.segments||[]).length,0),q:(tree||[]).reduce((n,e)=>n+(e.segments||[]).reduce((m,s)=>m+(s.qas||[]).length,0),0)}}
-function renderDiagnostics(result){const debug=result.debug||{},before=countTree(debug.candidate_trees?.original),after=countTree(debug.candidate_trees?.pruned),dims=debug.embedding?.vector_dimensions||0,requested=debug.constraints?.requested_top_k||result.limits||{};const items=[["候选树",`${before.e}E / ${before.s}S / ${before.q}Q`],["裁剪后",`${after.e}E / ${after.s}S / ${after.q}Q`],["最终返回",`${result.experiences.length}E / ${result.segments.length}S / ${result.qas.length}Q`],["查询向量",dims?`${dims} 维`:`无`],["Top-K",`${requested.experience||requested.top_experience||0} / ${requested.segment||requested.top_segment||0} / ${requested.qa||requested.top_qa||0}`],["重排调用",`${debug.reranking?.llm_calls||0} 次`]];els.diagnostics.innerHTML=items.map(([k,v])=>`<div><small>${k}</small><strong>${esc(v)}</strong></div>`).join("")}
-function sources(items){return `<div class="source-tags">${(items||[]).map(v=>`<span>${esc(v.replaceAll("_"," "))}</span>`).join("")}</div>`}
-function candidateMetrics(item){const metrics=[["local",item.local_score],["vector",item.vector_similarity],["keyword",item.keyword_score],["relation",item.relation_score]].filter(([,value])=>value!==undefined);return `<div class="candidate-metrics">${metrics.map(([name,value])=>`<span>${name} ${pct(value)}</span>`).join("")}${(item.retrieval_sources||[]).map(source=>`<span>${esc(source)}</span>`).join("")}</div>`}
-function infoGrid(rows){return `<dl class="node-info">${rows.filter(([,value])=>value!==undefined&&value!==null&&value!=="").map(([label,value])=>`<div><dt>${esc(label)}</dt><dd>${esc(Array.isArray(value)?value.join("、")||"—":value)}</dd></div>`).join("")}</dl>`}
-function nodeDetails(level,item){if(level==="experience")return `${infoGrid([["Experience ID",item.experience_id||item.id],["主题",item.topic],["核心实体",item.core_entity],["关联意图",item.intents],["状态",item.state?.status],["创建时间",item.created_at],["更新时间",item.updated_at],["版本",item.version],["Segment 数",(item.segment_ids||item.segments||[]).length],["重排理由",item.llm_reason]])}${item.summary?`<section class="node-summary"><b>Experience 摘要</b><p>${esc(item.summary)}</p></section>`:""}`;if(level==="segment")return `${infoGrid([["Segment ID",item.segment_id||item.id],["所属 Experience",item.experience_id],["主题",item.topic],["核心实体",item.core_entity],["意图",item.intent],["状态",item.status],["创建时间",item.created_at],["更新时间",item.updated_at],["版本",item.version],["QA 数",(item.qa_ids||item.qas||[]).length],["重排理由",item.llm_reason]])}${item.summary?`<section class="node-summary"><b>Segment 摘要</b><p>${esc(item.summary)}</p></section>`:""}`;return `${infoGrid([["QA ID",item.qa_id||item.id],["所属 Segment",item.segment_id],["时间",item.timestamp],["主题",item.topic],["核心实体",item.core_entity],["意图",item.intent],["状态",item.status],["置信度",pct(item.confidence)],["相关实体",item.entities],["重排理由",item.llm_reason]])}<section class="qa-content"><b>用户输入</b><p>${esc(item.user_input||"—")}</p>${item.assistant_output?`<b>助手输出</b><p>${esc(item.assistant_output)}</p>`:""}${item.reasoning?`<b>判断依据</b><p>${esc(item.reasoning)}</p>`:""}${item.tools?.length?`<b>工具调用链</b><pre>${esc(JSON.stringify(item.tools,null,2))}</pre>`:""}</section>`}
-function qaNode(q,index,selected){return `<article class="tree-qa"><header><span>Q${index+1}</span><div><strong>${esc(q.intent||q.topic||"QA 证据")}</strong><small>${esc(q.qa_id||q.id)}</small></div><b>${pct(selected?q.score:q.local_score)}</b></header>${candidateMetrics(q)}<details><summary>查看 QA 完整信息</summary>${nodeDetails("qa",q)}</details></article>`}
-function segmentNode(s,index,selected){return `<section class="tree-segment"><header><span>S${index+1}</span><div><strong>${esc(s.intent||s.topic||"Segment")}</strong><small>${esc(s.segment_id||s.id)}</small></div><b>${pct(selected?s.score:s.local_score)}</b></header>${candidateMetrics(s)}<details open><summary>查看 Segment 完整信息</summary>${nodeDetails("segment",s)}</details><div class="tree-qas">${(s.qas||[]).map((q,i)=>qaNode(q,i,selected)).join("")||'<p class="tree-empty">无 QA 节点</p>'}</div></section>`}
-function experienceNode(e,index,selected){return `<article class="tree-experience ${selected?"selected":"candidate"}"><header><span>E${index+1}</span><div><strong>${esc(e.topic||"Experience")}</strong><small>${esc(e.core_entity||"—")} · ${esc(e.experience_id||e.id)}</small></div><b>${pct(selected?e.score:e.local_score)}</b></header>${candidateMetrics(e)}<details open><summary>查看 Experience 完整信息</summary>${nodeDetails("experience",e)}</details><div class="tree-segments">${(e.segments||[]).map((s,i)=>segmentNode(s,i,selected)).join("")||'<p class="tree-empty">无 Segment 节点</p>'}</div></article>`}
-function renderHierarchy(container,tree,selected,emptyText){container.innerHTML=tree.length?tree.map((e,i)=>experienceNode(e,i,selected)).join(""):`<div class="error-box">${esc(emptyText)}</div>`}
-function renderCandidateTree(result){renderHierarchy($("#candidate-tree"),result.candidate_tree||[],false,"Recall 未返回 Candidate Tree。")}
-function renderTree(result){renderHierarchy(els.tree,result.selected_tree||[],true,"没有找到相关记忆，请尝试更换问题表达或扩大 Top-K。")}
-function render(result){state.result=result;els.welcome.hidden=true;els.results.hidden=false;renderExtraction(result.query_extraction||result.query||{});renderTimings(result);renderDiagnostics(result);setPipelineTimes(result.timing||{});const candidate=countTree(result.candidate_tree);els.summary.innerHTML=`<span>候选 <b>${candidate.e}</b>E / <b>${candidate.s}</b>S / <b>${candidate.q}</b>Q</span><span>最终 <b>${result.experiences.length}</b>E / <b>${result.segments.length}</b>S / <b>${result.qas.length}</b>Q</span>`;renderCandidateTree(result);renderTree(result);els.contextText.textContent=result.context_text||"未生成上下文"}
-function renderError(message){els.welcome.hidden=false;els.results.hidden=true;els.welcome.innerHTML=`<div class="error-box"><h2>检索执行失败</h2><p>${esc(message)}</p><small>请检查模型、向量服务配置和 HESM 数据。</small></div>`}
-async function run(question){if(state.running)return;state.running=true;els.submit.disabled=true;els.submit.querySelector("span").textContent="正在检索";setStage("extract");state.timer=setTimeout(()=>setStage("recall"),500);try{const response=await fetch("/api/retrieve",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question,top_experience:Number($("#top-e").value),top_segment:Number($("#top-s").value),top_qa:Number($("#top-q").value)})});const payload=await response.json().catch(()=>({}));if(!response.ok)throw new Error(payload.detail||`HTTP ${response.status}`);setStage("assemble");render(payload);setTimeout(()=>setStage("done"),180);setHealth(true,"检索服务就绪")}catch(error){setStage("recall",true);renderError(error.message||String(error))}finally{clearTimeout(state.timer);state.running=false;els.submit.disabled=false;els.submit.querySelector("span").textContent="开始检索"}}
-els.form.addEventListener("submit",e=>{e.preventDefault();const q=els.query.value.trim();if(q)run(q)});document.querySelectorAll("[data-query]").forEach(b=>b.addEventListener("click",()=>{els.query.value=b.dataset.query;els.query.focus()}));els.timing.addEventListener("click",e=>{const button=e.target.closest(".timing-group>button");if(button)button.parentElement.classList.toggle("open")});document.querySelector(".result-toolbar").addEventListener("click",e=>{const b=e.target.closest("[data-view]");if(!b)return;document.querySelectorAll("[data-view]").forEach(x=>x.classList.toggle("active",x===b));const view=b.dataset.view;$("#candidate-view").hidden=view!=="candidate";$("#selected-view").hidden=view!=="selected";els.context.hidden=view!=="context"});$("#copy").addEventListener("click",async()=>{try{await navigator.clipboard.writeText(state.result?.context_text||"");toast("上下文已复制")}catch(_){toast("复制失败")}});setStage("idle");health();
+(function () {
+  "use strict";
+
+  const $ = (selector) => document.querySelector(selector);
+  const escapeHtml = (value) => String(value ?? "")
+    .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;").replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+  const state = { running: false, result: null, timer: null };
+  const elements = {
+    health: $("#health"), form: $("#retrieval-form"), query: $("#query"),
+    submit: $("#submit"), pipeline: $("#pipeline"), welcome: $("#welcome"),
+    results: $("#results"), confidence: $("#confidence"),
+    extraction: $("#extraction"), reasoning: $("#reasoning"),
+    total: $("#total-time"), timing: $("#timing"),
+    diagnostics: $("#diagnostics"), summary: $("#summary"),
+    tree: $("#tree"), context: $("#context"),
+    contextText: $("#context-text"), toast: $("#toast"),
+  };
+
+  function toast(message) {
+    elements.toast.textContent = message;
+    elements.toast.classList.add("show");
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(() => elements.toast.classList.remove("show"), 1800);
+  }
+
+  function setHealth(ok, label) {
+    elements.health.className = `health ${ok ? "ready" : "error"}`;
+    elements.health.querySelector("span").textContent = label;
+  }
+
+  async function health() {
+    try {
+      const response = await fetch("/api/health");
+      const data = await response.json();
+      const ready = response.ok && data.status !== "degraded";
+      setHealth(ready, ready ? "检索服务就绪" : "记忆库为空");
+    } catch (_) {
+      setHealth(false, "请启动 WebServer");
+    }
+  }
+
+  function milliseconds(value) {
+    const number = Number(value || 0);
+    return number >= 1000
+      ? `${(number / 1000).toFixed(2)} s`
+      : `${number.toFixed(number >= 100 ? 0 : 1)} ms`;
+  }
+
+  function percentage(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? `${Math.round(number * 100)}%` : "—";
+  }
+
+  function setStage(stage, error = false) {
+    const order = ["extract", "recall", "assemble"];
+    const index = order.indexOf(stage);
+    elements.pipeline.querySelectorAll("article").forEach((item, position) => {
+      item.classList.toggle("active", !error && position === index);
+      item.classList.toggle("done", !error && (stage === "done" || position < index));
+      item.classList.toggle("error", error && position === index);
+    });
+  }
+
+  function setPipelineTimes(timing) {
+    const values = {
+      extract: timing.topic_extraction_ms,
+      recall: timing.retrieval_ms,
+      assemble: timing.response_assembly_ms,
+    };
+    Object.entries(values).forEach(([key, value]) => {
+      elements.pipeline.querySelector(`[data-stage="${key}"] time`).textContent = milliseconds(value);
+    });
+  }
+
+  function renderExtraction(data) {
+    elements.confidence.textContent = `置信度 ${percentage(data.confidence)}`;
+    const items = [
+      ["主题", data.topic],
+      ["核心实体", data.core_entity],
+      ["意图", data.intent],
+      ["相关实体", (data.entities || []).join("、") || "—"],
+    ];
+    elements.extraction.innerHTML = items.map(([key, value]) => (
+      `<div><small>${key}</small><strong>${escapeHtml(value || "—")}</strong></div>`
+    )).join("");
+    elements.reasoning.textContent = data.reasoning || "未返回判断依据";
+  }
+
+  function renderTimings(result) {
+    const timing = result.timing || {};
+    const groups = [
+      ["主题提取", timing.topic_extraction_ms],
+      ["Experience 与上下文查询", timing.retrieval_ms],
+      ["响应组装", timing.response_assembly_ms],
+    ];
+    const maximum = Math.max(1, ...groups.map(([, value]) => Number(value || 0)));
+    elements.total.textContent = milliseconds(timing.total_ms);
+    elements.timing.innerHTML = groups.map(([name, value]) => (
+      `<div class="timing-group"><button type="button"><span>${name}</span><b>${milliseconds(value)}</b></button>`
+      + `<div class="timing-bar"><i style="width:${Math.max(1, Number(value || 0) / maximum * 100)}%"></i></div></div>`
+    )).join("");
+  }
+
+  function renderDiagnostics(result) {
+    const limits = result.limits || {};
+    const items = [
+      ["Experience", result.experiences?.length || 0],
+      ["Segment", result.segments?.length || 0],
+      ["QA", result.qas?.length || 0],
+      ["检索范围", `${limits.top_experience || 1}E / ${limits.top_segment || 2}S / ${limits.top_qa || 4}Q`],
+      ["排序", "时间升序"],
+      ["上下文", result.context ? "已生成" : "为空"],
+    ];
+    elements.diagnostics.innerHTML = items.map(([key, value]) => (
+      `<div><small>${key}</small><strong>${escapeHtml(value)}</strong></div>`
+    )).join("");
+  }
+
+  function informationGrid(rows) {
+    return `<dl class="node-info">${rows.filter(([, value]) => (
+      value !== undefined && value !== null && value !== ""
+    )).map(([label, value]) => (
+      `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(Array.isArray(value) ? value.join("、") || "—" : value)}</dd></div>`
+    )).join("")}</dl>`;
+  }
+
+  function qaNode(qa, index) {
+    return `<article class="tree-qa"><header><span>Q${index + 1}</span><div>`
+      + `<strong>${escapeHtml(qa.intent || qa.topic || "QA")}</strong><small>${escapeHtml(qa.qa_id)}</small>`
+      + `</div></header><details><summary>查看 QA 完整信息</summary>`
+      + informationGrid([
+        ["时间", qa.timestamp], ["主题", qa.topic], ["核心实体", qa.core_entity],
+        ["意图", qa.intent], ["状态", qa.status], ["相关实体", qa.entities],
+      ])
+      + `<section class="qa-content"><b>用户输入</b><p>${escapeHtml(qa.user_input || "—")}</p>`
+      + `${qa.assistant_output ? `<b>助手输出</b><p>${escapeHtml(qa.assistant_output)}</p>` : ""}`
+      + `</section></details></article>`;
+  }
+
+  function segmentNode(segment, index) {
+    return `<section class="tree-segment"><header><span>S${index + 1}</span><div>`
+      + `<strong>${escapeHtml(segment.intent || segment.topic || "Segment")}</strong>`
+      + `<small>${escapeHtml(segment.segment_id)}</small></div></header>`
+      + `<details open><summary>查看 Segment 完整信息</summary>`
+      + informationGrid([
+        ["主题", segment.topic], ["核心实体", segment.core_entity],
+        ["意图", segment.intent], ["状态", segment.status],
+        ["更新时间", segment.updated_at],
+      ])
+      + `${segment.summary ? `<section class="node-summary"><b>Segment 摘要</b><p>${escapeHtml(segment.summary)}</p></section>` : ""}`
+      + `</details><div class="tree-qas">${segment.qas.map(qaNode).join("") || '<p class="tree-empty">无 QA 节点</p>'}</div></section>`;
+  }
+
+  function experienceNode(experience, index) {
+    return `<article class="tree-experience selected"><header><span>E${index + 1}</span><div>`
+      + `<strong>${escapeHtml(experience.topic || "Experience")}</strong>`
+      + `<small>${escapeHtml(experience.core_entity || "—")} · ${escapeHtml(experience.experience_id)}</small>`
+      + `</div></header><details open><summary>查看 Experience 完整信息</summary>`
+      + informationGrid([
+        ["状态", experience.state?.status], ["关联意图", experience.intents_link || experience.intents],
+        ["创建时间", experience.created_at], ["更新时间", experience.updated_at], ["版本", experience.version],
+      ])
+      + `${experience.summary ? `<section class="node-summary"><b>Experience 摘要</b><p>${escapeHtml(experience.summary)}</p></section>` : ""}`
+      + `${experience.history_experience ? `<section class="node-summary"><b>历史经验</b><p>${escapeHtml(typeof experience.history_experience === "string" ? experience.history_experience : JSON.stringify(experience.history_experience, null, 2))}</p></section>` : ""}`
+      + `</details><div class="tree-segments">${experience.segments.map(segmentNode).join("") || '<p class="tree-empty">无 Segment 节点</p>'}</div></article>`;
+  }
+
+  function buildTree(result) {
+    const qas = result.qas || [];
+    const segments = (result.segments || []).map((segment) => ({
+      ...segment,
+      qas: qas.filter((qa) => qa.segment_id === segment.segment_id),
+    }));
+    return (result.experiences || []).map((experience) => ({
+      ...experience,
+      segments: segments.filter((segment) => segment.experience_id === experience.experience_id),
+    }));
+  }
+
+  function render(result) {
+    state.result = result;
+    elements.welcome.hidden = true;
+    elements.results.hidden = false;
+    renderExtraction(result.query_extraction || {});
+    renderTimings(result);
+    renderDiagnostics(result);
+    setPipelineTimes(result.timing || {});
+    elements.summary.innerHTML = `<span>返回 <b>${result.experiences?.length || 0}</b>E / <b>${result.segments?.length || 0}</b>S / <b>${result.qas?.length || 0}</b>Q</span>`;
+    const tree = buildTree(result);
+    elements.tree.innerHTML = tree.length
+      ? tree.map(experienceNode).join("")
+      : '<div class="error-box">没有可用的 Experience。</div>';
+    elements.contextText.textContent = result.context || "未生成上下文";
+  }
+
+  function renderError(message) {
+    elements.welcome.hidden = false;
+    elements.results.hidden = true;
+    elements.welcome.innerHTML = `<div class="error-box"><h2>检索执行失败</h2><p>${escapeHtml(message)}</p><small>请检查模型、向量服务配置和 HESM 数据。</small></div>`;
+  }
+
+  async function run(question) {
+    if (state.running) return;
+    state.running = true;
+    elements.submit.disabled = true;
+    elements.submit.querySelector("span").textContent = "正在检索";
+    setStage("extract");
+    state.timer = setTimeout(() => setStage("recall"), 500);
+    try {
+      const response = await fetch("/api/retrieve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+      setStage("assemble");
+      render(payload);
+      setTimeout(() => setStage("done"), 180);
+      setHealth(true, "检索服务就绪");
+    } catch (error) {
+      setStage("recall", true);
+      renderError(error.message || String(error));
+    } finally {
+      clearTimeout(state.timer);
+      state.running = false;
+      elements.submit.disabled = false;
+      elements.submit.querySelector("span").textContent = "开始检索";
+    }
+  }
+
+  elements.form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const question = elements.query.value.trim();
+    if (question) run(question);
+  });
+  document.querySelectorAll("[data-query]").forEach((button) => {
+    button.addEventListener("click", () => {
+      elements.query.value = button.dataset.query;
+      elements.query.focus();
+    });
+  });
+  document.querySelector(".result-toolbar").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-view]");
+    if (!button) return;
+    document.querySelectorAll("[data-view]").forEach((item) => item.classList.toggle("active", item === button));
+    const showContext = button.dataset.view === "context";
+    $("#selected-view").hidden = showContext;
+    elements.context.hidden = !showContext;
+  });
+  $("#copy").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(state.result?.context || "");
+      toast("上下文已复制");
+    } catch (_) {
+      toast("复制失败");
+    }
+  });
+
+  setStage("idle");
+  health();
 })();
