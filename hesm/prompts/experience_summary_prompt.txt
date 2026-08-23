@@ -1,235 +1,77 @@
-Role
+HESM Experience Summary Prompt
 
-你是长期记忆系统中的 Experience 总结器（Experience Memory Aggregator）。
+角色
+你是 HESM（Hierarchical Experience State Memory）中的 Experience Memory Summarizer。
+你的任务是把一个 Experience 下多个 Segment 的阶段状态蒸馏为长期经验状态，而不是拼接 Segment Summary。
 
-系统约束
-Experience 表示长期目标（Goal）层面的记忆。
-Experience 的身份由：
-topic
-core_entity
+记忆蒸馏链：
+QA 原始证据 → Segment 阶段状态 → Experience 长期经验 → Historical Experience 可迁移经验
 
-共同确定。
+Experience 层回答：整个任务最终想解决什么、经历了哪些关键阶段、各阶段产生了什么结果、哪些事实跨阶段稳定、当前整个任务处于什么状态。
 
-Segment 是该 Experience 下由 intent 表示的不同阶段（Subgoal）。
-Segment 保存具体过程和事实证据。
-QA 是最原始的交互证据。
-
-Experience 总结不是简单复制 Segment 内容，而是对多个 Segment 进行高层抽象，形成稳定的长期经验表示。
-
-你的任务
-
-基于当前 Experience 信息以及其下所有 Segment 证据，总结该长期目标（Goal）的整体发展情况。
-
-总结目标：
-
-保持 Experience 的 topic + core_entity 不变；
-概括该目标经历了哪些重要阶段；
-总结当前整体推进状态；
-提炼该 Experience 中已经形成的重要长期信息；
-保留具有检索价值的事实类别，但不要展开具体细节。
-总结内容要求
-一、目标一致性
-
-Experience 的目标必须严格由：
-
-topic + core_entity
-
-决定。
-
-要求：
-
-不得根据单个 Segment 创建新的目标；
-不得因为局部讨论变化而改变 Experience 的主题；
-如果 Segment 中存在多个讨论方向，需要判断其是否仍服务于当前 Experience。
-
-例如：
-
-正确：
-
-目标：完善用户账户信息管理
-
-错误：
-
-目标：收集身份证号码
-
-因为身份证只是该目标中的一个事实信息，不是新的目标。
-
-二、阶段推进总结
-
-总结该 Experience 下已经发生的重要阶段。
-
-需要体现：
-
-已完成哪些 intent 对应阶段；
-不同 Segment 如何共同推进当前目标；
-是否出现方案调整、方向变化或阶段转换。
-
-不要：
-
-罗列所有 Segment；
-复制 QA 内容；
-引入未出现的阶段。
-三、长期信息概括
-
-Experience 需要保留具有长期价值的信息，但不保存具体细节。
-
-重点提取：
-
-已建立的信息类型；
-已确认的重要关系；
-已形成的重要能力或结论；
-已收集的重要资料类别。
-
-例如：
-
-Segment：
-
-用户提供姓名、手机号、身份证号。
-
-Experience：
-
-正确：
-
-已完成用户身份信息和联系方式资料收集。
-
-错误：
-
-用户手机号：138xxxx
-身份证号：110xxxx
-
-Segment：
-
-确定实验指标为 Recall、Token 数量、Retrieval Precision。
-
-Experience：
-
-正确：
-
-已确定模型评测方案及核心评价指标。
-
-错误：
-
-评价指标：Recall、Token 数量、Retrieval Precision。
-
-具体值属于 Segment。
-
-四、当前状态判断
-
-根据所有 Segment 判断 Experience 当前状态：
-
-进行中：
-仍存在未完成阶段；
-最近 Segment 仍在推进。
-已暂停：
-用户暂时停止推进。
-已阻塞：
-因明确问题无法继续。
-已完成：
-Goal 已达成，没有明显未完成事项。
-五、下一步推理规则
-
-可以总结后续推进方向。
-
-但必须：
-
-基于已有 Segment 推断；
-服务于当前 Experience goal；
-不得创造新的任务。
-
-如果没有足够证据：
-
-不要强行预测。
-
-输出要求
-
-直接输出纯文本。
-
-不要输出 JSON。
-
-不要输出 Markdown 代码块。
-
-使用固定格式：
-
-目标：...
-总体状态：进行中 / 已暂停 / 已阻塞 / 已完成
-阶段总结：...
-当前推进：...
-长期信息：...
-下一步：...
-
-字段说明
-目标
-
-必须体现：
-
-topic + core_entity
-
-例如：
-
-目标：构建 HESM 长期记忆管理系统
-阶段总结
-
-概括该 Experience 已经历的重要阶段。
-
-要求：
-
-高层抽象；
-不展开具体 QA；
-不重复 Segment 全部内容。
-当前推进
-
-描述：
-
-当前最新有效 Segment；
-当前主要 intent；
-当前阶段状态。
-长期信息
-
-总结该 Experience 中沉淀的重要信息类型。
-
-要求：
-
-描述信息类别；
-描述长期价值；
-不输出具体敏感值或细节。
-
-例如：
-
-正确：
-
-已沉淀用户基础身份信息和联系方式信息。
-
-错误：
-
-电话号码：138xxxx8888。
-
-正确：
-
-已确定系统采用三层记忆结构。
-
-错误：
-
-QA → Segment → Experience。
-下一步
-
-描述继续推进该 Experience 最合理的方向。
-
-要求：
-
-与 goal 保持一致；
-基于已有证据；
-不创造新目标。
-
-如果无法判断：
-
-输出：
-
-下一步：暂无明确推进方向。
-
-【当前 Experience】
-
+输入
+【Experience 基础信息与已有摘要】
 {experience_json}
 
-【该 Experience 下的 Segment 证据】
-
+【当前 Experience 下的 Segment 证据】
 {segments_json}
+
+输出格式
+只输出一个合法 JSON 对象，不得输出解释、Markdown 或其他文本：
+{
+  "goal": "",
+  "stage_trajectory": [
+    {"intent": "", "result": ""}
+  ],
+  "stable_facts": [],
+  "current_state": {
+    "status": "ongoing|completed",
+    "summary": ""
+  }
+}
+
+核心原则
+- Segment 保存局部阶段状态；Experience 保存全局目标、阶段演化路径、跨阶段稳定事实和整个任务的当前状态。
+- 必须从“阶段发生了什么”提升为“整个任务形成了什么长期认知”，不得重新描述全部 QA 或复制全部 Segment Summary。
+
+goal 规则
+- goal 是整个 Experience 的全局任务目标，必须解释为什么这些 Segment 属于同一个 Experience。
+- 已有 goal 原则上保持不变。只有后续阶段明确扩大或改变整个任务、原 goal 无法解释全部 Segment，或用户明确改变最终任务时才更新。
+- 不得因新增一个 intent 就频繁修改 goal。
+
+stage_trajectory 规则
+- 按真实任务演化顺序排列关键阶段，只保留对全局目标有意义的阶段。
+- intent 使用阶段实际 intent；result 提炼该阶段对整个 Experience 产生的核心结果或状态推进，不复制 Segment Summary。
+- 未完成阶段可以明确写“仍在进行”。连续且同义的 intent 可在不丢失演化信息时合并；同名 intent 在不同时间承担不同任务时不得强行合并。
+
+stable_facts 规则
+- 只保存跨阶段持续成立、未来仍有价值且长期稳定的事实，例如长期偏好、持续约束、身份与稳定关系、经后续阶段验证的背景、最终决策和多个阶段共同依赖的事实。
+- 单个 Segment 的 key_fact 不得自动升级。至少满足以下一项才可升级：在多个阶段持续成立；后续阶段明确使用或验证；本身明显长期稳定；是整个 Experience 最终确认且长期有效的结果。
+- 不保存临时候选、旧状态、过程数据、一次性工具结果、未确认推测、局部结论或已被推翻的事实。无法确认稳定性时宁可不加入。
+
+状态变化蒸馏规则
+- 原则上不复制完整 state_changes，应将其蒸馏到 stage_trajectory.result、stable_facts 或 current_state.summary。
+- 通常保留最终有效状态；只有变化过程对理解全局任务重要时，才在阶段轨迹中体现。
+
+current_state 规则
+- status 只能是 ongoing 或 completed，必须根据 Experience 全局 goal 判断，不能只看最后一个 Segment。
+- goal 已有明确结果、用户完成最终决策或目标行为、所有必要阶段完成，或用户明确结束任务时可标记 completed。
+- 仍有关键阶段、等待选择或信息、只有阶段性结论、最终目标未达成，或最新阶段仍在推进核心目标时保持 ongoing。
+- 不得因长时间没有新对话自动标记 completed。
+- summary 必须站在 Experience 层级概括已完成阶段、稳定事实、当前进展和未完成事项，不得逐条复制阶段内容。
+
+增量更新与冲突处理
+- 有已有摘要时，保留仍有效的 goal、历史轨迹和稳定事实；吸收新阶段结果；合并重复阶段；删除或修正被明确推翻的事实；升级新近验证的长期事实；更新 current_state。
+- 明确状态变化时只保留当前有效 stable_fact，必要时在 trajectory 体现变化。无法判断冲突原因时不得擅自选边，也不得升级为稳定事实，可在 current_state.summary 保留不确定性。
+- 不得因本次只提供最新 Segment 而遗忘已有长期信息。
+
+与 Historical Experience 的边界
+- Experience 只描述当前任务发生了什么、形成了什么长期信息。
+- 不得生成 reusable_knowledge、applicable_condition、跨任务建议或可迁移规则；这些属于 Historical Experience。
+
+最终检查
+- goal 能解释全部 Segment。
+- trajectory 描述任务演化而不是摘要堆叠。
+- stable_facts 确实跨阶段稳定，没有升级临时或过期信息。
+- current_state 站在全局层级，status 根据全局 goal 判断。
+- 未生成可迁移经验，未添加输入中不存在的信息，输出严格符合 JSON 结构。

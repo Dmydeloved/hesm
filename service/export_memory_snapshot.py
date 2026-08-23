@@ -41,7 +41,7 @@ def export_snapshot(database: Path, output: Path) -> None:
             "entities": parse_json(row["entities_json"], []),
             "status": row["status"],
             "confidence": row["confidence"],
-            "reasoning": row["reasoning"],
+            "reasoning": row["reason"],
         }
         qa_by_segment.setdefault(row["segment_id"], []).append(qa)
 
@@ -53,7 +53,7 @@ def export_snapshot(database: Path, output: Path) -> None:
             "intent": row["intent"],
             "coreEntity": row["core_entity"],
             "status": row["status"],
-            "summary": row["summary"],
+            "summary": parse_json(row["summary_json"], {}),
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
             "version": row["version"],
@@ -70,8 +70,8 @@ def export_snapshot(database: Path, output: Path) -> None:
                 "topic": row["topic"],
                 "coreEntity": row["core_entity"],
                 "intents": parse_json(row["intents_link_json"], []),
-                "summary": parse_json(row["summary_json"], ""),
-                "state": parse_json(row["state_json"], {}),
+                "summary": parse_json(row["summary_json"], {}),
+                "state": {"status": row["status"]},
                 "historyExperience": parse_json(
                     row["history_experience_json"], {}
                 ),

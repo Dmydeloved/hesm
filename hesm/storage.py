@@ -6,6 +6,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from .time_utils import format_timestamp
+
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +26,9 @@ CREATE TABLE IF NOT EXISTS qa_memory (
     core_entity TEXT NOT NULL,
     entities_json TEXT NOT NULL,
     segment_id TEXT NOT NULL,
-    status TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('open', 'deleted')),
     confidence REAL NOT NULL,
-    reasoning TEXT NOT NULL,
+    reason TEXT NOT NULL,
     FOREIGN KEY (segment_id) REFERENCES segment_memory(segment_id)
 );
 
@@ -36,29 +38,29 @@ CREATE TABLE IF NOT EXISTS segment_memory (
     intent TEXT NOT NULL,
     core_entity TEXT NOT NULL,
     qa_ids_json TEXT NOT NULL,
-    status TEXT NOT NULL,
-    summary TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
     experience_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     version INTEGER NOT NULL,
     last_summarized_qa_count INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('open', 'completed', 'deleted')),
     FOREIGN KEY (experience_id) REFERENCES experience_memory(experience_id)
 );
 
 CREATE TABLE IF NOT EXISTS experience_memory (
     experience_id TEXT PRIMARY KEY,
+    history_experience_json TEXT NOT NULL DEFAULT '{}',
     topic TEXT NOT NULL,
     core_entity TEXT NOT NULL,
     intents_link_json TEXT NOT NULL,
     segment_ids_json TEXT NOT NULL,
     summary_json TEXT NOT NULL,
-    state_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     version INTEGER NOT NULL,
     last_summarized_segment_count INTEGER NOT NULL,
-    history_experience_json TEXT NOT NULL DEFAULT '{}'
+    status TEXT NOT NULL CHECK (status IN ('open', 'completed', 'deleted'))
 );
 
 CREATE TABLE IF NOT EXISTS runtime_state (
@@ -101,7 +103,6 @@ JSON_FIELDS = {
     "qa_ids_json",
     "intents_link_json",
     "segment_ids_json",
-    "state_json",
     "summary_json",
     "history_experience_json",
     "retrieval_cache_json",
@@ -116,7 +117,7 @@ JSON_DEFAULTS: dict[str, Any] = {
     "qa_ids_json": [],
     "intents_link_json": [],
     "segment_ids_json": [],
-    "state_json": {},
+    "summary_json": {},
     "history_experience_json": {},
     "retrieval_cache_json": {},
     "vector_json": [],
@@ -126,7 +127,7 @@ JSON_DEFAULTS: dict[str, Any] = {
 
 
 class MemoryStorage:
-    """Small SQLite repository for QA, Segment, Experience and runtime state."""
+    """管理 QA、Segment、Experience 以及运行时状态的 SQLite 仓储。"""
 
     def __init__(
         self,
@@ -156,7 +157,8 @@ class MemoryStorage:
         if not read_only:
             self.connection.executescript(SCHEMA)
             self._ensure_runtime_state_columns()
-            self._ensure_experience_columns()
+            self._ensure_memory_columns()
+            self._normalize_stored_timestamps()
             self.connection.commit()
         logger.info("结构化记忆库已初始化 db=%s", self.db_path.resolve())
 
@@ -171,19 +173,137 @@ class MemoryStorage:
                 "ADD COLUMN retrieval_cache_json TEXT NOT NULL DEFAULT '{}'"
             )
 
-    def _ensure_experience_columns(self) -> None:
-        """Migrate existing databases without rebuilding their memory tables."""
-        columns = {
-            row["name"]
-            for row in self.connection.execute(
-                "PRAGMA table_info(experience_memory)"
-            ).fetchall()
+    def _table_columns(self, table: str) -> set[str]:
+        """读取表字段，用于兼容已有数据库的增量迁移。"""
+        return {
+            str(row["name"])
+            for row in self.connection.execute(f"PRAGMA table_info({table})").fetchall()
         }
-        if "history_experience_json" not in columns:
+
+    def _ensure_memory_columns(self) -> None:
+        """为旧版数据库补齐文档定义的字段，并迁移可复用的数据。"""
+        qa_columns = self._table_columns("qa_memory")
+        if "reason" not in qa_columns:
+            self.connection.execute(
+                "ALTER TABLE qa_memory ADD COLUMN reason TEXT NOT NULL DEFAULT ''"
+            )
+            if "reasoning" in qa_columns:
+                self.connection.execute(
+                    "UPDATE qa_memory SET reason = reasoning WHERE reason = ''"
+                )
+        self.connection.execute(
+            "UPDATE qa_memory SET status = 'open' WHERE status = 'active'"
+        )
+
+        segment_columns = self._table_columns("segment_memory")
+        if "summary_json" not in segment_columns:
+            self.connection.execute(
+                "ALTER TABLE segment_memory "
+                "ADD COLUMN summary_json TEXT NOT NULL DEFAULT '{}'"
+            )
+            if "summary" in segment_columns:
+                rows = self.connection.execute(
+                    "SELECT segment_id, summary FROM segment_memory"
+                ).fetchall()
+                for row in rows:
+                    payload = self._segment_summary_payload(row["summary"])
+                    self.connection.execute(
+                        "UPDATE segment_memory SET summary_json = ? WHERE segment_id = ?",
+                        (json.dumps(payload, ensure_ascii=False), row["segment_id"]),
+                    )
+
+        experience_columns = self._table_columns("experience_memory")
+        if "history_experience_json" not in experience_columns:
             self.connection.execute(
                 "ALTER TABLE experience_memory "
                 "ADD COLUMN history_experience_json TEXT NOT NULL DEFAULT '{}'"
             )
+        if "status" not in experience_columns:
+            self.connection.execute(
+                "ALTER TABLE experience_memory "
+                "ADD COLUMN status TEXT NOT NULL DEFAULT 'open'"
+            )
+            if "state_json" in experience_columns:
+                self.connection.execute(
+                    """
+                    UPDATE experience_memory
+                    SET status = CASE
+                        WHEN json_extract(state_json, '$.status') = 'completed'
+                            THEN 'completed'
+                        WHEN json_extract(state_json, '$.status') = 'deleted'
+                            THEN 'deleted'
+                        ELSE 'open'
+                    END
+                    """
+                )
+
+    def _normalize_stored_timestamps(self) -> None:
+        """将已有记忆及会话中的时间统一迁移为标准格式。"""
+        time_columns = {
+            "qa_memory": ("timestamp",),
+            "segment_memory": ("created_at", "updated_at"),
+            "experience_memory": ("created_at", "updated_at"),
+            "runtime_state": ("updated_at",),
+            "chat_session": ("created_at", "updated_at"),
+        }
+        for table, columns in time_columns.items():
+            selected_columns = ", ".join(columns)
+            if table == "chat_session":
+                selected_columns = f"{selected_columns}, messages_json"
+            rows = self.connection.execute(
+                f"SELECT rowid, {selected_columns} FROM {table}"
+            ).fetchall()
+            for row in rows:
+                updates: dict[str, str] = {}
+                for column in columns:
+                    original = str(row[column] or "").strip()
+                    if not original:
+                        continue
+                    try:
+                        normalized = format_timestamp(original)
+                    except ValueError:
+                        logger.warning(
+                            "跳过无法识别的历史时间 table=%s column=%s value=%s",
+                            table,
+                            column,
+                            original,
+                        )
+                        continue
+                    if normalized != original:
+                        updates[column] = normalized
+
+                # 会话消息的创建时间存放在 JSON 中，也需要随表字段一起迁移。
+                if table == "chat_session":
+                    try:
+                        messages = json.loads(row["messages_json"] or "[]")
+                    except (json.JSONDecodeError, TypeError):
+                        messages = []
+                    messages_changed = False
+                    if isinstance(messages, list):
+                        for message in messages:
+                            if not isinstance(message, dict) or not message.get("created_at"):
+                                continue
+                            original = str(message["created_at"]).strip()
+                            try:
+                                normalized = format_timestamp(original)
+                            except ValueError:
+                                continue
+                            if normalized != original:
+                                message["created_at"] = normalized
+                                messages_changed = True
+                    if messages_changed:
+                        updates["messages_json"] = json.dumps(
+                            messages,
+                            ensure_ascii=False,
+                        )
+
+                if not updates:
+                    continue
+                assignments = ", ".join(f"{column} = ?" for column in updates)
+                self.connection.execute(
+                    f"UPDATE {table} SET {assignments} WHERE rowid = ?",
+                    (*updates.values(), row["rowid"]),
+                )
 
     def close(self) -> None:
         self.connection.close()
@@ -200,26 +320,6 @@ class MemoryStorage:
         data: dict[str, Any] = {}
         for key in row.keys():
             value = row[key]
-            if key == 'summary_json':
-                if not value:
-                    data['summary'] = ''
-                else:
-                    try:
-                        parsed = json.loads(value)
-                    except (json.JSONDecodeError, TypeError):
-                        parsed = value
-                    if isinstance(parsed, str):
-                        data['summary'] = parsed
-                    elif isinstance(parsed, dict):
-                        data['summary'] = (
-                            parsed.get('summary')
-                            or parsed.get('long')
-                            or parsed.get('short')
-                            or ''
-                        )
-                    else:
-                        data['summary'] = ''
-                continue
             if key in JSON_FIELDS:
                 default = JSON_DEFAULTS[key]
                 try:
@@ -228,7 +328,72 @@ class MemoryStorage:
                     data[key[:-5]] = default.copy()
             else:
                 data[key] = value
+        # 旧库可能仍保留旧字段；对外只暴露文档定义的统一名称。
+        if "reason" not in data and "reasoning" in data:
+            data["reason"] = data["reasoning"]
+        if "reasoning" not in data and "reason" in data:
+            data["reasoning"] = data["reason"]
+        row_keys = set(row.keys())
+        if "summary_json" in row_keys and "summary" not in data:
+            data["summary"] = {}
+        if (
+            "status" in data
+            and "state" not in data
+            and {"history_experience_json", "state_json"}.intersection(row_keys)
+        ):
+            data["state"] = {
+                "status": "in_progress" if data["status"] == "open" else data["status"]
+            }
         return data
+
+    @staticmethod
+    def _json_object(value: Any) -> dict[str, Any]:
+        """把模型文本或字典规范化为可落库的 JSON 对象。"""
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    @classmethod
+    def _segment_summary_payload(cls, value: Any) -> dict[str, Any]:
+        """生成符合设计文档的 Segment Summary 默认结构。"""
+        payload = cls._json_object(value)
+        if payload:
+            return payload
+        conclusion = str(value or "").strip()
+        return {
+            "goal": "",
+            "key_facts": [],
+            "state_changes": [],
+            "state": {"status": "ongoing", "current_conclusion": conclusion},
+        }
+
+    @classmethod
+    def _experience_summary_payload(cls, value: Any) -> dict[str, Any]:
+        """生成符合设计文档的 Experience Summary 默认结构。"""
+        payload = cls._json_object(value)
+        if payload:
+            return payload
+        summary = str(value or "").strip()
+        return {
+            "goal": "",
+            "stage_trajectory": [],
+            "stable_facts": [],
+            "current_state": {"status": "ongoing", "summary": summary},
+        }
+
+    @staticmethod
+    def _normalize_status(value: Any) -> str:
+        """把旧版状态值映射为文档约定的状态枚举。"""
+        status = str(value or "").strip()
+        if status in {"active", "in_progress", "ongoing"}:
+            return "open"
+        return status if status in {"open", "completed", "deleted"} else "open"
 
     def get_runtime_state(self, state_key: str) -> dict[str, Any] | None:
         row = self.connection.execute(
@@ -245,6 +410,7 @@ class MemoryStorage:
         updated_at: str,
         retrieval_cache: dict[str, Any] | None = None,
     ) -> None:
+        updated_at = format_timestamp(updated_at)
         retrieval_cache_json = json.dumps(retrieval_cache or {}, ensure_ascii=False)
         if retrieval_cache is None:
             self.connection.execute(
@@ -295,6 +461,7 @@ class MemoryStorage:
         retrieval_cache: dict[str, Any],
         updated_at: str,
     ) -> None:
+        updated_at = format_timestamp(updated_at)
         self.connection.execute(
             """
             INSERT INTO runtime_state (
@@ -312,29 +479,35 @@ class MemoryStorage:
         )
 
     def insert_qa(self, qa: dict[str, Any]) -> None:
+        columns = [
+            "qa_id", "timestamp", "user_input", "assistant_output", "tools_json",
+            "topic", "intent", "core_entity", "entities_json", "segment_id",
+            "status", "confidence", "reason",
+        ]
+        reason = qa.get("reason", qa.get("reasoning", ""))
+        values: list[Any] = [
+            qa["qa_id"],
+            format_timestamp(qa["timestamp"]),
+            qa["user_input"],
+            qa["assistant_output"],
+            json.dumps(qa["tools"], ensure_ascii=False),
+            qa["topic"],
+            qa["intent"],
+            qa["core_entity"],
+            json.dumps(qa["entities"], ensure_ascii=False),
+            qa["segment_id"],
+            self._normalize_status(qa.get("status")),
+            qa["confidence"],
+            reason,
+        ]
+        # 旧库的 reasoning 字段仍为必填，迁移期同步写入以保持可用。
+        if "reasoning" in self._table_columns("qa_memory"):
+            columns.append("reasoning")
+            values.append(reason)
+        placeholders = ", ".join("?" for _ in columns)
         self.connection.execute(
-            """
-            INSERT INTO qa_memory (
-                qa_id, timestamp, user_input, assistant_output, tools_json,
-                topic, intent, core_entity, entities_json, segment_id, status,
-                confidence, reasoning
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                qa["qa_id"],
-                qa["timestamp"],
-                qa["user_input"],
-                qa["assistant_output"],
-                json.dumps(qa["tools"], ensure_ascii=False),
-                qa["topic"],
-                qa["intent"],
-                qa["core_entity"],
-                json.dumps(qa["entities"], ensure_ascii=False),
-                qa["segment_id"],
-                qa["status"],
-                qa["confidence"],
-                qa["reasoning"],
-            ),
+            f"INSERT INTO qa_memory ({', '.join(columns)}) VALUES ({placeholders})",
+            values,
         )
 
     def get_qa(self, qa_id: str) -> dict[str, Any] | None:
@@ -374,51 +547,68 @@ class MemoryStorage:
         return [self._row_to_dict(row) for row in rows]
 
     def insert_segment(self, segment: dict[str, Any]) -> None:
+        summary = self._segment_summary_payload(segment.get("summary"))
+        columns = [
+            "segment_id", "topic", "intent", "core_entity", "qa_ids_json",
+            "summary_json", "experience_id", "created_at", "updated_at",
+            "version", "last_summarized_qa_count", "status",
+        ]
+        values: list[Any] = [
+            segment["segment_id"],
+            segment["topic"],
+            segment["intent"],
+            segment["core_entity"],
+            json.dumps(segment["qa_ids"], ensure_ascii=False),
+            json.dumps(summary, ensure_ascii=False),
+            segment["experience_id"],
+            format_timestamp(segment["created_at"]),
+            format_timestamp(segment["updated_at"]),
+            segment["version"],
+            segment["last_summarized_qa_count"],
+            self._normalize_status(segment.get("status")),
+        ]
+        # 旧库的 summary 字段仍为必填，保留一份 JSON 文本兼容旧读端。
+        if "summary" in self._table_columns("segment_memory"):
+            columns.append("summary")
+            values.append(json.dumps(summary, ensure_ascii=False))
+        placeholders = ", ".join("?" for _ in columns)
         self.connection.execute(
-            """
-            INSERT INTO segment_memory (
-                segment_id, topic, intent, core_entity, qa_ids_json, status,
-                summary, experience_id, created_at, updated_at, version,
-                last_summarized_qa_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                segment["segment_id"],
-                segment["topic"],
-                segment["intent"],
-                segment["core_entity"],
-                json.dumps(segment["qa_ids"], ensure_ascii=False),
-                segment["status"],
-                segment["summary"],
-                segment["experience_id"],
-                segment["created_at"],
-                segment["updated_at"],
-                segment["version"],
-                segment["last_summarized_qa_count"],
-            ),
+            f"INSERT INTO segment_memory ({', '.join(columns)}) "
+            f"VALUES ({placeholders})",
+            values,
         )
 
     def update_segment(self, segment: dict[str, Any]) -> None:
+        summary = self._segment_summary_payload(segment.get("summary"))
+        legacy_assignment = (
+            ", summary = ?"
+            if "summary" in self._table_columns("segment_memory")
+            else ""
+        )
+        parameters: list[Any] = [
+            json.dumps(segment["qa_ids"], ensure_ascii=False),
+            json.dumps(summary, ensure_ascii=False),
+            format_timestamp(segment["updated_at"]),
+            segment["version"],
+            segment["last_summarized_qa_count"],
+            self._normalize_status(segment.get("status")),
+        ]
+        if legacy_assignment:
+            parameters.append(json.dumps(summary, ensure_ascii=False))
+        parameters.append(segment["segment_id"])
         self.connection.execute(
-            """
+            f"""
             UPDATE segment_memory SET
                 qa_ids_json = ?,
-                status = ?,
-                summary = ?,
+                summary_json = ?,
                 updated_at = ?,
                 version = ?,
-                last_summarized_qa_count = ?
+                last_summarized_qa_count = ?,
+                status = ?
+                {legacy_assignment}
             WHERE segment_id = ?
             """,
-            (
-                json.dumps(segment["qa_ids"], ensure_ascii=False),
-                segment["status"],
-                segment["summary"],
-                segment["updated_at"],
-                segment["version"],
-                segment["last_summarized_qa_count"],
-                segment["segment_id"],
-            ),
+            parameters,
         )
 
     def find_latest_segment(self, experience_id: str) -> dict[str, Any] | None:
@@ -463,7 +653,7 @@ class MemoryStorage:
             SELECT * FROM experience_memory
             WHERE topic = ?
               AND core_entity = ?
-              AND json_extract(state_json, '$.status') = 'in_progress'
+              AND status = 'open'
             ORDER BY updated_at DESC, created_at DESC
             LIMIT 1
             """,
@@ -584,7 +774,7 @@ class MemoryStorage:
             f"""
             SELECT *, ({' + '.join(score_parts)}) AS relation_score
             FROM experience_memory
-            WHERE json_extract(state_json, '$.status') = 'completed'
+            WHERE status = 'completed'
               AND ({' OR '.join(conditions)})
             ORDER BY relation_score DESC, updated_at DESC, created_at DESC
             LIMIT ?
@@ -649,7 +839,7 @@ class MemoryStorage:
             f"""
             SELECT q.*
             FROM qa_memory AS q
-            WHERE q.status = 'active' AND ({' OR '.join(conditions)})
+            WHERE q.status = 'open' AND ({' OR '.join(conditions)})
             ORDER BY q.timestamp DESC
             LIMIT ?
             """,
@@ -668,62 +858,87 @@ class MemoryStorage:
         return [self._row_to_dict(row) for row in rows]
 
     def insert_experience(self, experience: dict[str, Any]) -> None:
+        summary = self._experience_summary_payload(experience.get("summary"))
+        status = self._normalize_status(
+            experience.get("status")
+            or (experience.get("state") or {}).get("status")
+        )
+        history = json.dumps(
+            experience.get("history_experience") or {},
+            ensure_ascii=False,
+        )
+        columns = [
+            "experience_id", "history_experience_json", "topic", "core_entity",
+            "intents_link_json", "segment_ids_json", "summary_json", "created_at",
+            "updated_at", "version", "last_summarized_segment_count", "status",
+        ]
+        values: list[Any] = [
+            experience["experience_id"],
+            history,
+            experience["topic"],
+            experience["core_entity"],
+            json.dumps(experience["intents_link"], ensure_ascii=False),
+            json.dumps(experience["segment_ids"], ensure_ascii=False),
+            json.dumps(summary, ensure_ascii=False),
+            format_timestamp(experience["created_at"]),
+            format_timestamp(experience["updated_at"]),
+            experience["version"],
+            experience["last_summarized_segment_count"],
+            status,
+        ]
+        # 旧库的 state_json 字段仍为必填，同步生成兼容状态对象。
+        if "state_json" in self._table_columns("experience_memory"):
+            columns.append("state_json")
+            values.append(json.dumps({"status": status}, ensure_ascii=False))
+        placeholders = ", ".join("?" for _ in columns)
         self.connection.execute(
-            """
-            INSERT INTO experience_memory (
-                experience_id, topic, core_entity, intents_link_json,
-                segment_ids_json, summary_json, state_json, created_at,
-                updated_at, version, last_summarized_segment_count,
-                history_experience_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                experience["experience_id"],
-                experience["topic"],
-                experience["core_entity"],
-                json.dumps(experience["intents_link"], ensure_ascii=False),
-                json.dumps(experience["segment_ids"], ensure_ascii=False),
-                json.dumps(experience["summary"], ensure_ascii=False),
-                json.dumps(experience["state"], ensure_ascii=False),
-                experience["created_at"],
-                experience["updated_at"],
-                experience["version"],
-                experience["last_summarized_segment_count"],
-                json.dumps(
-                    experience.get("history_experience") or {},
-                    ensure_ascii=False,
-                ),
-            ),
+            f"INSERT INTO experience_memory ({', '.join(columns)}) "
+            f"VALUES ({placeholders})",
+            values,
         )
 
     def update_experience(self, experience: dict[str, Any]) -> None:
+        summary = self._experience_summary_payload(experience.get("summary"))
+        status = self._normalize_status(
+            experience.get("status")
+            or (experience.get("state") or {}).get("status")
+        )
+        legacy_assignment = (
+            ", state_json = ?"
+            if "state_json" in self._table_columns("experience_memory")
+            else ""
+        )
+        parameters: list[Any] = [
+            json.dumps(experience["intents_link"], ensure_ascii=False),
+            json.dumps(experience["segment_ids"], ensure_ascii=False),
+            json.dumps(summary, ensure_ascii=False),
+            format_timestamp(experience["updated_at"]),
+            experience["version"],
+            experience["last_summarized_segment_count"],
+            json.dumps(
+                experience.get("history_experience") or {},
+                ensure_ascii=False,
+            ),
+            status,
+        ]
+        if legacy_assignment:
+            parameters.append(json.dumps({"status": status}, ensure_ascii=False))
+        parameters.append(experience["experience_id"])
         self.connection.execute(
-            """
+            f"""
             UPDATE experience_memory SET
                 intents_link_json = ?,
                 segment_ids_json = ?,
                 summary_json = ?,
-                state_json = ?,
                 updated_at = ?,
                 version = ?,
                 last_summarized_segment_count = ?,
-                history_experience_json = ?
+                history_experience_json = ?,
+                status = ?
+                {legacy_assignment}
             WHERE experience_id = ?
             """,
-            (
-                json.dumps(experience["intents_link"], ensure_ascii=False),
-                json.dumps(experience["segment_ids"], ensure_ascii=False),
-                json.dumps(experience["summary"], ensure_ascii=False),
-                json.dumps(experience["state"], ensure_ascii=False),
-                experience["updated_at"],
-                experience["version"],
-                experience["last_summarized_segment_count"],
-                json.dumps(
-                    experience.get("history_experience") or {},
-                    ensure_ascii=False,
-                ),
-                experience["experience_id"],
-            ),
+            parameters,
         )
 
     def list_segments_by_experience_ids(
@@ -751,7 +966,7 @@ class MemoryStorage:
         rows = self.connection.execute(
             f"""
             SELECT * FROM qa_memory
-            WHERE segment_id IN ({placeholders}) AND status = 'active'
+            WHERE segment_id IN ({placeholders}) AND status = 'open'
             """,
             segment_ids,
         ).fetchall()
@@ -780,7 +995,7 @@ class MemoryStorage:
         rows = self.connection.execute(
             f"""
             SELECT * FROM qa_memory
-            WHERE segment_id IN ({placeholders}) AND status = 'active'
+            WHERE segment_id IN ({placeholders}) AND status = 'open'
             ORDER BY timestamp DESC, qa_id DESC
             LIMIT ?
             """,

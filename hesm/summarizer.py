@@ -72,24 +72,48 @@ class TemplateSummarizer:
         for qa in qa_items:
             entities.extend(qa.get("entities") or [])
         top_entities = [name for name, _ in Counter(entities).most_common(8)]
-        return (
-            f"该片段围绕 {segment['topic']} / {segment['core_entity']} 展开，"
-            f"意图为 {segment['intent']}，累计 {len(qa_items)} 条 QA，"
-            f"涉及实体：{', '.join(top_entities) if top_entities else '无'}。"
+        conclusion = (
+            f"该阶段围绕 {segment['topic']} / {segment['core_entity']} 推进"
+            f"{segment['intent']}，已累计 {len(qa_items)} 条 QA 证据。"
         )
+        payload = {
+            "goal": f"完成与“{segment['intent']}”相关的阶段任务",
+            "key_facts": [
+                {
+                    "fact": f"相关实体包括：{'、'.join(top_entities)}",
+                    "source_qa_ids": [
+                        str(item.get("qa_id") or "") for item in qa_items
+                    ],
+                }
+            ] if top_entities else [],
+            "state_changes": [],
+            "state": {"status": "ongoing", "current_conclusion": conclusion},
+        }
+        return json.dumps(payload, ensure_ascii=False)
 
     def summarize_experience(
         self, experience: dict[str, Any], segments: list[dict[str, Any]]
     ) -> str:
         intents = ", ".join(experience.get("intents_link") or [])
-        latest_summary = segments[-1]["summary"] if segments and segments[-1].get("summary") else ""
-        summary = f"用户持续围绕 {experience['topic']} / {experience['core_entity']} 进行交互。"
-        summary += (
-            f"该 Experience 当前累计 {len(segments)} 个 Segment，"
-            f"涉及意图：{intents or '无'}。"
-            f"{'最近片段：' + latest_summary if latest_summary else ''}"
-        )
-        return summary
+        payload = {
+            "goal": f"完成 {experience['topic']} / {experience['core_entity']} 的长期任务",
+            "stage_trajectory": [
+                {
+                    "intent": str(item.get("intent") or ""),
+                    "result": "该阶段已形成结构化状态记忆",
+                }
+                for item in segments
+                if item.get("intent")
+            ],
+            "stable_facts": [],
+            "current_state": {
+                "status": "ongoing",
+                "summary": (
+                    f"当前累计 {len(segments)} 个阶段，涉及意图：{intents or '无'}。"
+                ),
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False)
 
 
 class LLMSummarizer:
@@ -199,12 +223,13 @@ class LLMSummarizer:
                     time.sleep(self.retry_delay * attempt)
 
         if last_error is not None:
+            print(f"segment summary error:{str(last_error)}")
             return fallback
         return fallback
 
     def _normalized_qas(self, qa_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
-        for item in qa_items[-20:]:
+        for item in qa_items[-5:]:
             normalized.append(
                 {
                     "qa_id": item.get("qa_id", ""),
@@ -213,17 +238,19 @@ class LLMSummarizer:
                     "core_entity": item.get("core_entity", ""),
                     "intent": item.get("intent", ""),
                     "entities": item.get("entities", []),
-                    "user_input": str(item.get("user_input") or "")[:1200],
+                    "user_input": str(item.get("user_input") or ""),
                     "assistant_output": str(item.get("assistant_output") or "")[:1200],
                     "confidence": item.get("confidence", 0.0),
-                    "reasoning": str(item.get("reasoning") or "")[:800],
+                    "reason": str(
+                        item.get("reason") or item.get("reasoning") or ""
+                    )[:800],
                 }
             )
         return normalized
 
     def _normalized_segments(self, segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
-        for item in segments[-20:]:
+        for item in segments[-2:]:
             normalized.append(
                 {
                     "segment_id": item.get("segment_id", ""),
@@ -231,7 +258,7 @@ class LLMSummarizer:
                     "core_entity": item.get("core_entity", ""),
                     "intent": item.get("intent", ""),
                     "status": item.get("status", ""),
-                    "summary": str(item.get("summary") or "")[:1500],
+                    "summary_json": item.get("summary") or {},
                     "created_at": item.get("created_at", ""),
                     "updated_at": item.get("updated_at", ""),
                 }

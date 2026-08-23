@@ -9,3 +9,17 @@
 
 /* Readability: management data must remain legible on desktop displays. */
 .brand>span:last-child{font-size:17px}.brand small{font-size:9px}.topbar nav a{font-size:14px}.health{font-size:12px}.eyebrow{font-size:11px}.page-intro p:last-child{font-size:15px}.button.secondary{font-size:14px}.stats small{font-size:11px}.stats strong{font-size:28px}.stats p{font-size:13px}.tabs button{font-size:13px}.search input,.manager-toolbar select{font-size:13px}.context-bar{font-size:13px}th{font-size:11px}td{font-size:13px}td strong{font-size:15px}td p{font-size:12px}td code{font-size:11px}.status-pill,.count-link,.row-action{font-size:12px}.pager,.pager button{font-size:12px}.drawer h2{font-size:23px}.detail-id{font-size:12px}.detail-grid small{font-size:11px}.detail-grid strong,.detail-section h3{font-size:14px}.detail-section p,.detail-section pre{font-size:13px}.tag-list span,.child-list button,.status-control{font-size:13px}.toast{font-size:13px}
+
+/* 三层记忆的字段保持独立列，宽表通过横向滚动完整展示。 */
+.table-wrap table{table-layout:auto;min-width:1320px}
+.table-wrap table[data-level="segment"]{min-width:1580px}
+.table-wrap table[data-level="qa"]{min-width:1960px}
+.table-wrap th,.table-wrap td{white-space:nowrap}
+.table-wrap th:first-child,.table-wrap td.sequence{width:62px;text-align:center}
+.table-wrap th{font-size:12px}
+.table-wrap td{height:66px}
+.cell-text{display:block;max-width:260px;overflow:hidden;text-overflow:ellipsis}
+.memory-id{display:block;max-width:220px;overflow:hidden;color:#66736d!important;text-overflow:ellipsis;white-space:nowrap}
+.count-link{min-width:34px;padding:7px 10px;border:1px solid #dedaf8;border-radius:8px;background:#f8f7ff}
+.count-link:hover,.row-action:hover{color:#4336b5;border-color:#aaa1e9;background:#f0eeff}
+.row-action{display:inline-block;text-decoration:none}

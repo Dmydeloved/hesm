@@ -1,33 +1,260 @@
-(function(){
-"use strict";
-const state={level:"experience",page:1,pageSize:30,total:0,pages:1,search:"",status:"",parentId:"",parentLabel:""};
-const $=s=>document.querySelector(s); const esc=v=>String(v??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;");
-const statusOptions={experience:[["","全部状态"],["in_progress","进行中"],["paused","已暂停"],["completed","已完成"],["archived","已归档"]],segment:[["","全部状态"],["open","开放"],["closed","关闭"],["archived","已归档"],["deleted","已删除"]],qa:[["","全部状态"],["active","有效"],["archived","已归档"],["deleted","已删除"]]};
-const statusLabel={in_progress:"进行中",paused:"已暂停",completed:"已完成",archived:"已归档",open:"开放",closed:"关闭",active:"有效",deleted:"已删除"};
-const fields={experience:["主题 / 核心实体","状态","Segment","QA","更新时间",""],segment:["意图 / 主题","状态","QA","Experience","更新时间",""],qa:["问答内容","主题 / 意图","状态","置信度","时间",""]};
-const els={health:$("#health"),stats:$("#stats"),tabs:$("#level-tabs"),search:$("#search"),status:$("#status"),head:$("#table-head"),body:$("#table-body"),empty:$("#empty"),info:$("#page-info"),prev:$("#prev"),next:$("#next"),context:$("#context-bar"),drawer:$("#drawer"),backdrop:$("#drawer-backdrop"),drawerLevel:$("#drawer-level"),drawerTitle:$("#drawer-title"),drawerContent:$("#drawer-content"),toast:$("#toast")};
-let searchTimer;
-function toast(message){els.toast.textContent=message;els.toast.classList.add("show");clearTimeout(toast.timer);toast.timer=setTimeout(()=>els.toast.classList.remove("show"),1800)}
-function setHealth(ok,label){els.health.className=`health ${ok?"ready":"error"}`;els.health.querySelector("span").textContent=label}
-async function api(url,options){const response=await fetch(url,options);const payload=await response.json().catch(()=>({}));if(!response.ok)throw new Error(payload.detail||`HTTP ${response.status}`);return payload}
-async function loadStats(){try{const data=await api("/api/stats");["experience","segment","qa"].forEach((key,index)=>els.stats.children[index].querySelector("strong").textContent=Number(data.counts[key]||0).toLocaleString());setHealth(true,"在线数据库")}catch(error){setHealth(false,"服务不可用");toast(error.message)}}
-function configureStatus(){els.status.innerHTML=statusOptions[state.level].map(([value,label])=>`<option value="${value}">${label}</option>`).join("");state.status=""}
-function renderHead(){els.head.innerHTML=`<tr>${fields[state.level].map((value,index)=>`<th style="width:${index===0?"34%":index===5?"70px":"auto"}">${value}</th>`).join("")}</tr>`}
-function pill(status){return `<span class="status-pill ${esc(status)}">${esc(statusLabel[status]||status||"未知")}</span>`}
-function short(value,n=14){value=String(value||"");return value.length>n?`${value.slice(0,n)}…`:value}
-function experienceRow(item){const status=item.state?.status||"in_progress";return `<tr><td><strong>${esc(item.topic||"未命名主题")}</strong><p>${esc(item.core_entity||"—")}</p><code>${esc(short(item.experience_id,22))}</code></td><td>${pill(status)}</td><td><button class="count-link" data-drill="segment" data-parent="${esc(item.experience_id)}" data-label="${esc(item.topic)}">${item.segment_count} 个</button></td><td>${item.qa_count}</td><td><p>${esc(item.updated_at||"—")}</p></td><td><button class="row-action" data-detail="experience" data-id="${esc(item.experience_id)}">详情</button></td></tr>`}
-function segmentRow(item){return `<tr><td><strong>${esc(item.intent||"未命名阶段")}</strong><p>${esc(item.topic)} · ${esc(item.core_entity)}</p><code>${esc(short(item.segment_id,22))}</code></td><td>${pill(item.status)}</td><td><button class="count-link" data-drill="qa" data-parent="${esc(item.segment_id)}" data-label="${esc(item.intent)}">${item.qa_count} 条</button></td><td><code>${esc(short(item.experience_id,18))}</code></td><td><p>${esc(item.updated_at||"—")}</p></td><td><button class="row-action" data-detail="segment" data-id="${esc(item.segment_id)}">详情</button></td></tr>`}
-function qaRow(item){return `<tr><td><strong>${esc(item.user_input||"空输入")}</strong><p>${esc(item.assistant_output||"无助手输出")}</p><code>${esc(short(item.qa_id,22))}</code></td><td><strong>${esc(item.topic)}</strong><p>${esc(item.intent)}</p></td><td>${pill(item.status)}</td><td>${Math.round(Number(item.confidence||0)*100)}%</td><td><p>${esc(item.timestamp||"—")}</p></td><td><button class="row-action" data-detail="qa" data-id="${esc(item.qa_id)}">详情</button></td></tr>`}
-async function loadList(){renderHead();els.body.innerHTML=`<tr><td colspan="6"><p>正在加载…</p></td></tr>`;const params=new URLSearchParams({page:state.page,page_size:state.pageSize});if(state.search)params.set("q",state.search);if(state.status)params.set("status",state.status);if(state.parentId)params.set("parent_id",state.parentId);try{const data=await api(`/api/${state.level}?${params}`);Object.assign(state,{total:data.total,pages:data.pages});const render={experience:experienceRow,segment:segmentRow,qa:qaRow}[state.level];els.body.innerHTML=data.items.map(render).join("");els.empty.hidden=data.items.length>0;els.info.textContent=`第 ${data.page} / ${data.pages} 页 · 共 ${data.total} 条`;els.prev.disabled=state.page<=1;els.next.disabled=state.page>=data.pages;els.context.hidden=!state.parentId;if(state.parentId)els.context.innerHTML=`正在查看 <b>${esc(state.parentLabel)}</b> 的下层 ${state.level} <button data-clear-parent>清除范围</button>`}catch(error){els.body.innerHTML="";els.empty.hidden=false;els.empty.querySelector("p").textContent=error.message}}
-function tags(values){return `<div class="tag-list">${(values||[]).map(v=>`<span>${esc(v)}</span>`).join("")||"<span>无</span>"}</div>`}
-function detailGrid(rows){return `<div class="detail-grid">${rows.map(([k,v])=>`<div><small>${esc(k)}</small><strong>${esc(v??"—")}</strong></div>`).join("")}</div>`}
-function statusControl(level,id,current){return `<div class="detail-section"><h3>状态管理</h3><div class="status-control"><select id="detail-status">${statusOptions[level].filter(x=>x[0]).map(([v,l])=>`<option value="${v}" ${v===current?"selected":""}>${l}</option>`).join("")}</select><button class="button secondary" data-save-status="${esc(level)}" data-id="${esc(id)}">保存状态</button></div></div>`}
-function detailHtml(level,item){if(level==="experience"){const status=item.state?.status||"in_progress";return `<div class="detail-id"><span>${esc(item.experience_id)}</span><span>v${item.version}</span></div>${detailGrid([["主题",item.topic],["核心实体",item.core_entity],["状态",status],["更新时间",item.updated_at]])}<section class="detail-section"><h3>意图链</h3>${tags(item.intents)}</section><section class="detail-section"><h3>Experience 总结</h3><p>${esc(typeof item.summary==="string"?item.summary:JSON.stringify(item.summary,null,2))||"暂无总结"}</p></section><section class="detail-section"><h3>Segment 序列（${item.segments?.length||0}）</h3><div class="child-list">${(item.segments||[]).map(s=>`<button data-child="segment" data-id="${esc(s.segment_id)}"><span>${esc(s.intent)}</span><b>${s.qa_count} QA</b></button>`).join("")||"暂无 Segment"}</div></section>${statusControl(level,item.experience_id,status)}`}
-if(level==="segment")return `<div class="detail-id"><span>${esc(item.segment_id)}</span><span>v${item.version}</span></div>${detailGrid([["主题",item.topic],["意图",item.intent],["核心实体",item.core_entity],["状态",item.status]])}<section class="detail-section"><h3>Segment 总结</h3><p>${esc(item.summary)||"暂无总结"}</p></section><section class="detail-section"><h3>QA 证据（${item.qas?.length||0}）</h3><div class="child-list">${(item.qas||[]).map(q=>`<button data-child="qa" data-id="${esc(q.qa_id)}"><span>${esc(short(q.user_input,45))}</span><b>${Math.round(q.confidence*100)}%</b></button>`).join("")||"暂无 QA"}</div></section>${statusControl(level,item.segment_id,item.status)}`;
-return `<div class="detail-id"><span>${esc(item.qa_id)}</span><span>${Math.round(Number(item.confidence||0)*100)}%</span></div>${detailGrid([["主题",item.topic],["意图",item.intent],["核心实体",item.core_entity],["状态",item.status],["时间",item.timestamp],["Segment",item.segment_id]])}<section class="detail-section"><h3>用户输入</h3><p>${esc(item.user_input)}</p></section><section class="detail-section"><h3>助手输出</h3><p>${esc(item.assistant_output)||"无"}</p></section><section class="detail-section"><h3>实体</h3>${tags(item.entities)}</section><section class="detail-section"><h3>主题判断依据</h3><p>${esc(item.reasoning)||"无"}</p></section><section class="detail-section"><h3>工具调用链</h3>${item.tools?.length?`<pre>${esc(JSON.stringify(item.tools,null,2))}</pre>`:"<p>本轮无工具调用</p>"}</section>${statusControl(level,item.qa_id,item.status)}`}
-async function openDetail(level,id){els.drawerLevel.textContent=`${level.toUpperCase()} DETAIL`;els.drawerTitle.textContent="正在加载…";els.drawerContent.innerHTML="";els.backdrop.hidden=false;els.drawer.classList.add("open");els.drawer.setAttribute("aria-hidden","false");try{const item=await api(`/api/${level}/${encodeURIComponent(id)}`);els.drawerTitle.textContent=level==="experience"?(item.topic||"Experience"):level==="segment"?(item.intent||"Segment"):(item.topic||"QA Memory");els.drawerContent.innerHTML=detailHtml(level,item)}catch(error){els.drawerContent.innerHTML=`<p>${esc(error.message)}</p>`}}
-function closeDrawer(){els.drawer.classList.remove("open");els.drawer.setAttribute("aria-hidden","true");setTimeout(()=>els.backdrop.hidden=true,220)}
-function switchLevel(level,parentId="",parentLabel=""){state.level=level;state.page=1;state.parentId=parentId;state.parentLabel=parentLabel;state.status="";configureStatus();els.tabs.querySelectorAll("button").forEach(b=>b.classList.toggle("active",b.dataset.level===level));loadList()}
-els.tabs.addEventListener("click",e=>{const b=e.target.closest("[data-level]");if(b)switchLevel(b.dataset.level)});els.search.addEventListener("input",()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{state.search=els.search.value.trim();state.page=1;loadList()},280)});els.status.addEventListener("change",()=>{state.status=els.status.value;state.page=1;loadList()});els.body.addEventListener("click",e=>{const d=e.target.closest("[data-detail]");if(d)openDetail(d.dataset.detail,d.dataset.id);const drill=e.target.closest("[data-drill]");if(drill)switchLevel(drill.dataset.drill,drill.dataset.parent,drill.dataset.label)});els.context.addEventListener("click",e=>{if(e.target.closest("[data-clear-parent]")){state.parentId="";state.parentLabel="";loadList()}});els.drawerContent.addEventListener("click",async e=>{const child=e.target.closest("[data-child]");if(child)openDetail(child.dataset.child,child.dataset.id);const save=e.target.closest("[data-save-status]");if(save){try{const status=$("#detail-status").value;await api(`/api/${save.dataset.saveStatus}/${encodeURIComponent(save.dataset.id)}/status`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({status})});toast("状态已更新");await openDetail(save.dataset.saveStatus,save.dataset.id);loadList();loadStats()}catch(error){toast(error.message)}}});$("#drawer-close").addEventListener("click",closeDrawer);els.backdrop.addEventListener("click",closeDrawer);$("#refresh").addEventListener("click",()=>{loadStats();loadList()});els.prev.addEventListener("click",()=>{if(state.page>1){state.page--;loadList()}});els.next.addEventListener("click",()=>{if(state.page<state.pages){state.page++;loadList()}});document.addEventListener("keydown",e=>{if(e.key==="Escape")closeDrawer()});
-configureStatus();loadStats();loadList();
+(function () {
+  "use strict";
+
+  const state = {
+    level: "experience",
+    page: 1,
+    pageSize: 30,
+    total: 0,
+    pages: 1,
+    search: "",
+    status: "",
+    parentId: "",
+    experienceId: "",
+    parentLabel: "",
+  };
+
+  const $ = (selector) => document.querySelector(selector);
+  const esc = (value) => String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+
+  const statusOptions = {
+    experience: [["", "全部状态"], ["open", "进行中"], ["completed", "已完成"], ["deleted", "已删除"]],
+    segment: [["", "全部状态"], ["open", "开放"], ["completed", "已完成"], ["deleted", "已删除"]],
+    qa: [["", "全部状态"], ["open", "有效"], ["deleted", "已删除"]],
+  };
+  const statusLabel = { open: "进行中", completed: "已完成", deleted: "已删除" };
+  const fields = {
+    experience: ["顺序", "主题", "核心实体", "Experience ID", "状态", "Segment", "QA", "创建时间", "更新时间", "操作"],
+    segment: ["顺序", "主题", "核心实体", "意图", "Segment ID", "Experience ID", "状态", "QA", "创建时间", "更新时间", "操作"],
+    qa: ["顺序", "主题", "核心实体", "意图", "QA ID", "用户输入", "助手输出", "Segment ID", "状态", "置信度", "时间", "操作"],
+  };
+  const els = {
+    health: $("#health"),
+    stats: $("#stats"),
+    tabs: $("#level-tabs"),
+    search: $("#search"),
+    status: $("#status"),
+    head: $("#table-head"),
+    body: $("#table-body"),
+    empty: $("#empty"),
+    info: $("#page-info"),
+    prev: $("#prev"),
+    next: $("#next"),
+    context: $("#context-bar"),
+    toast: $("#toast"),
+  };
+  let searchTimer;
+
+  function toast(message) {
+    els.toast.textContent = message;
+    els.toast.classList.add("show");
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(() => els.toast.classList.remove("show"), 1800);
+  }
+
+  function setHealth(ok, label) {
+    els.health.className = `health ${ok ? "ready" : "error"}`;
+    els.health.querySelector("span").textContent = label;
+  }
+
+  async function api(url, options) {
+    const response = await fetch(url, options);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+    return payload;
+  }
+
+  async function loadStats() {
+    try {
+      const data = await api("/api/stats");
+      ["experience", "segment", "qa"].forEach((key, index) => {
+        els.stats.children[index].querySelector("strong").textContent = Number(data.counts[key] || 0).toLocaleString();
+      });
+      setHealth(true, "在线数据库");
+    } catch (error) {
+      setHealth(false, "服务不可用");
+      toast(error.message);
+    }
+  }
+
+  function configureStatus() {
+    els.status.innerHTML = statusOptions[state.level]
+      .map(([value, label]) => `<option value="${value}">${label}</option>`)
+      .join("");
+    state.status = "";
+  }
+
+  function renderHead() {
+    els.head.closest("table").dataset.level = state.level;
+    els.head.innerHTML = `<tr>${fields[state.level].map((value) => `<th>${value}</th>`).join("")}</tr>`;
+  }
+
+  function pill(status) {
+    return `<span class="status-pill ${esc(status)}">${esc(statusLabel[status] || status || "未知")}</span>`;
+  }
+
+  function idCell(value) {
+    return `<code class="memory-id" title="${esc(value)}">${esc(value || "—")}</code>`;
+  }
+
+  function textCell(value, fallback = "—") {
+    return `<span class="cell-text" title="${esc(value || fallback)}">${esc(value || fallback)}</span>`;
+  }
+
+  function detailButton(level, id) {
+    const url = `/detail.html?level=${encodeURIComponent(level)}&id=${encodeURIComponent(id)}`;
+    return `<a class="row-action" href="${url}">详情</a>`;
+  }
+
+  function experienceRow(item) {
+    const status = item.state?.status || "open";
+    return `<tr>
+      <td class="sequence">${item.sequence}</td>
+      <td><strong>${esc(item.topic || "未命名主题")}</strong></td>
+      <td>${textCell(item.core_entity)}</td>
+      <td>${idCell(item.experience_id)}</td>
+      <td>${pill(status)}</td>
+      <td><button class="count-link" data-drill="segment" data-parent="${esc(item.experience_id)}" data-label="${esc(item.topic)}">${item.segment_count}</button></td>
+      <td><button class="count-link" data-drill="qa" data-experience="${esc(item.experience_id)}" data-label="${esc(item.topic)}">${item.qa_count}</button></td>
+      <td>${textCell(item.created_at)}</td>
+      <td>${textCell(item.updated_at)}</td>
+      <td>${detailButton("experience", item.experience_id)}</td>
+    </tr>`;
+  }
+
+  function segmentRow(item) {
+    return `<tr>
+      <td class="sequence">${item.sequence}</td>
+      <td><strong>${esc(item.topic || "未命名主题")}</strong></td>
+      <td>${textCell(item.core_entity)}</td>
+      <td>${textCell(item.intent, "未命名阶段")}</td>
+      <td>${idCell(item.segment_id)}</td>
+      <td>${idCell(item.experience_id)}</td>
+      <td>${pill(item.status)}</td>
+      <td><button class="count-link" data-drill="qa" data-parent="${esc(item.segment_id)}" data-label="${esc(item.intent)}">${item.qa_count}</button></td>
+      <td>${textCell(item.created_at)}</td>
+      <td>${textCell(item.updated_at)}</td>
+      <td>${detailButton("segment", item.segment_id)}</td>
+    </tr>`;
+  }
+
+  function qaRow(item) {
+    return `<tr>
+      <td class="sequence">${item.sequence}</td>
+      <td><strong>${esc(item.topic || "未命名主题")}</strong></td>
+      <td>${textCell(item.core_entity)}</td>
+      <td>${textCell(item.intent)}</td>
+      <td>${idCell(item.qa_id)}</td>
+      <td>${textCell(item.user_input, "空输入")}</td>
+      <td>${textCell(item.assistant_output, "无助手输出")}</td>
+      <td>${idCell(item.segment_id)}</td>
+      <td>${pill(item.status)}</td>
+      <td>${Math.round(Number(item.confidence || 0) * 100)}%</td>
+      <td>${textCell(item.timestamp)}</td>
+      <td>${detailButton("qa", item.qa_id)}</td>
+    </tr>`;
+  }
+
+  function renderContext() {
+    const hasScope = Boolean(state.parentId || state.experienceId);
+    els.context.hidden = !hasScope;
+    if (!hasScope) return;
+    const scopeName = state.experienceId ? "Experience 下全部 QA" : `下层 ${state.level}`;
+    els.context.innerHTML = `正在查看 <b>${esc(state.parentLabel)}</b> 的 ${scopeName}<button data-clear-parent>清除范围</button>`;
+  }
+
+  async function loadList() {
+    renderHead();
+    const columnCount = fields[state.level].length;
+    els.body.innerHTML = `<tr><td colspan="${columnCount}"><p>正在加载…</p></td></tr>`;
+    const params = new URLSearchParams({ page: state.page, page_size: state.pageSize });
+    if (state.search) params.set("q", state.search);
+    if (state.status) params.set("status", state.status);
+    if (state.parentId) params.set("parent_id", state.parentId);
+    if (state.experienceId) params.set("experience_id", state.experienceId);
+    try {
+      const data = await api(`/api/${state.level}?${params}`);
+      Object.assign(state, { total: data.total, pages: data.pages });
+      const render = { experience: experienceRow, segment: segmentRow, qa: qaRow }[state.level];
+      els.body.innerHTML = data.items.map(render).join("");
+      els.empty.hidden = data.items.length > 0;
+      els.info.textContent = `${data.page} / ${data.pages} · ${data.total}`;
+      els.prev.disabled = state.page <= 1;
+      els.next.disabled = state.page >= data.pages;
+      renderContext();
+    } catch (error) {
+      els.body.innerHTML = "";
+      els.empty.hidden = false;
+      els.empty.querySelector("p").textContent = error.message;
+    }
+  }
+
+  function switchLevel(level, scope = {}) {
+    state.level = level;
+    state.page = 1;
+    state.parentId = scope.parentId || "";
+    state.experienceId = scope.experienceId || "";
+    state.parentLabel = scope.parentLabel || "";
+    state.status = "";
+    configureStatus();
+    els.tabs.querySelectorAll("button").forEach((button) => {
+      button.classList.toggle("active", button.dataset.level === level);
+    });
+    loadList();
+  }
+
+  els.tabs.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-level]");
+    if (button) switchLevel(button.dataset.level);
+  });
+  els.search.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      state.search = els.search.value.trim();
+      state.page = 1;
+      loadList();
+    }, 280);
+  });
+  els.status.addEventListener("change", () => {
+    state.status = els.status.value;
+    state.page = 1;
+    loadList();
+  });
+  els.body.addEventListener("click", (event) => {
+    const drill = event.target.closest("[data-drill]");
+    if (!drill) return;
+    switchLevel(drill.dataset.drill, {
+      parentId: drill.dataset.parent,
+      experienceId: drill.dataset.experience,
+      parentLabel: drill.dataset.label,
+    });
+  });
+  els.context.addEventListener("click", (event) => {
+    if (event.target.closest("[data-clear-parent]")) switchLevel(state.level);
+  });
+  $("#refresh").addEventListener("click", () => {
+    loadStats();
+    loadList();
+  });
+  els.prev.addEventListener("click", () => {
+    if (state.page > 1) {
+      state.page -= 1;
+      loadList();
+    }
+  });
+  els.next.addEventListener("click", () => {
+    if (state.page < state.pages) {
+      state.page += 1;
+      loadList();
+    }
+  });
+
+  configureStatus();
+  loadStats();
+  loadList();
 })();

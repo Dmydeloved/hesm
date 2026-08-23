@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +12,7 @@ from .prompts.topic_memory import (
 )
 
 from .config import get as config_get, get_config_path
+from .time_utils import format_timestamp
 
 
 RESULT_FIELDS = (
@@ -118,7 +118,7 @@ def validate_topic_result(value: Any) -> TopicResult:
 
 
 def add_result_metadata(topic_result: TopicResult, user_input: str) -> TopicResult:
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = format_timestamp()
     if isinstance(topic_result, list):
         return [
             {

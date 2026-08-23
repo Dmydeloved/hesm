@@ -10,6 +10,9 @@ DEFAULT_RETRIEVAL_PROMPT_PATH = PROMPTS_DIR / "retrieval_prompt.txt"
 DEFAULT_EXTRACTOR_PROMPT_PATH = PROMPTS_DIR / "extractor_prompt.txt"
 DEFAULT_SEGMENT_SUMMARY_PROMPT_PATH = PROMPTS_DIR / "segment_summary_prompt.txt"
 DEFAULT_EXPERIENCE_SUMMARY_PROMPT_PATH = PROMPTS_DIR / "experience_summary_prompt.txt"
+DEFAULT_HISTORICAL_EXPERIENCE_PROMPT_PATH = (
+    PROMPTS_DIR / "historical_experience_prompt.txt"
+)
 
 
 EXPERIENCE_RETRIEVAL_CRITERIA = """* Decide whether topic belongs to the same long-term discussion domain.
@@ -47,6 +50,13 @@ def load_segment_summary_prompt_template(path: str | Path | None = None) -> str:
 
 def load_experience_summary_prompt_template(path: str | Path | None = None) -> str:
     return load_prompt_template(path or DEFAULT_EXPERIENCE_SUMMARY_PROMPT_PATH)
+
+
+def load_historical_experience_prompt_template(
+    path: str | Path | None = None,
+) -> str:
+    """读取历史经验迁移 Prompt 模板。"""
+    return load_prompt_template(path or DEFAULT_HISTORICAL_EXPERIENCE_PROMPT_PATH)
 
 
 def build_retrieval_prompt(
@@ -120,6 +130,34 @@ def build_experience_summary_prompt(
     )
 
 
+def build_historical_experience_prompt(
+    *,
+    current_topic: str,
+    current_core_entity: str,
+    current_intent: str,
+    current_context: str,
+    historical_experiences: list[dict[str, Any]],
+    historical_segments: list[dict[str, Any]],
+    prompt_path: str | Path | None = None,
+) -> str:
+    """把当前任务和可追溯历史证据填入迁移蒸馏模板。"""
+    template = load_historical_experience_prompt_template(prompt_path)
+    return (
+        template.replace("{current_topic}", current_topic)
+        .replace("{current_core_entity}", current_core_entity)
+        .replace("{current_intent}", current_intent)
+        .replace("{current_context}", current_context)
+        .replace(
+            "{historical_experiences}",
+            json.dumps(historical_experiences, ensure_ascii=False, indent=2),
+        )
+        .replace(
+            "{historical_segments}",
+            json.dumps(historical_segments, ensure_ascii=False, indent=2),
+        )
+    )
+
+
 def experience_retrieval_prompt(
     query_text: str,
     candidates: list[dict[str, Any]],
@@ -164,6 +202,7 @@ def qa_retrieval_prompt(
 
 __all__ = [
     "DEFAULT_EXPERIENCE_SUMMARY_PROMPT_PATH",
+    "DEFAULT_HISTORICAL_EXPERIENCE_PROMPT_PATH",
     "DEFAULT_EXTRACTOR_PROMPT_PATH",
     "DEFAULT_RETRIEVAL_PROMPT_PATH",
     "DEFAULT_SEGMENT_SUMMARY_PROMPT_PATH",
@@ -172,11 +211,13 @@ __all__ = [
     "QA_RETRIEVAL_CRITERIA",
     "SEGMENT_RETRIEVAL_CRITERIA",
     "build_experience_summary_prompt",
+    "build_historical_experience_prompt",
     "build_extractor_prompt",
     "build_retrieval_prompt",
     "build_segment_summary_prompt",
     "experience_retrieval_prompt",
     "load_experience_summary_prompt_template",
+    "load_historical_experience_prompt_template",
     "load_extractor_prompt_template",
     "load_prompt_template",
     "load_retrieval_prompt_template",

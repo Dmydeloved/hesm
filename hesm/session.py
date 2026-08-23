@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any
+
+from .time_utils import format_timestamp
 
 
 SESSION_SCHEMA = """
@@ -44,7 +45,7 @@ class SessionManager:
 
     @staticmethod
     def _now() -> str:
-        return datetime.now(timezone.utc).isoformat()
+        return format_timestamp()
 
     @staticmethod
     def _loads(value: str, fallback: Any) -> Any:
@@ -52,6 +53,15 @@ class SessionManager:
             return json.loads(value)
         except (json.JSONDecodeError, TypeError):
             return fallback
+
+    @staticmethod
+    def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+        """检查兼容数据源表是否已经完成初始化。"""
+        row = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            (table_name,),
+        ).fetchone()
+        return row is not None
 
     def create(
         self,
@@ -139,12 +149,23 @@ class SessionManager:
                 ).fetchone()
             messages = self._loads(row["messages_json"], [])
             now = self._now()
+            turn_metadata = dict(metadata or {})
             messages.extend([
-                {"role": "user", "content": user_content, "created_at": now},
-                {"role": "assistant", "content": assistant_content, "created_at": now},
+                {
+                    "role": "user",
+                    "content": user_content,
+                    "created_at": now,
+                    "metadata": turn_metadata,
+                },
+                {
+                    "role": "assistant",
+                    "content": assistant_content,
+                    "created_at": now,
+                    "metadata": turn_metadata,
+                },
             ])
             session_metadata = self._loads(row["metadata_json"], {})
-            session_metadata.update(metadata or {})
+            session_metadata.update(turn_metadata)
             title = row["title"]
             if not messages[:-2] and title == "新会话":
                 title = user_content[:60] or title
@@ -182,9 +203,12 @@ class SessionManager:
         return self.get(session_id)
 
     def import_legacy_chat_turns(self) -> int:
-        """One-way compatibility import for chat turns stored before this table existed."""
+        """单向导入旧版存放在 QA 工具调用中的聊天记录。"""
         imported = 0
         with self._connect() as connection:
+            # 新数据库首次启动时 QA 表可能尚未由 MemoryStorage 创建，此时无需迁移。
+            if not self._table_exists(connection, "qa_memory"):
+                return 0
             rows = connection.execute(
                 "SELECT qa_id,user_input,assistant_output,tools_json FROM qa_memory "
                 "ORDER BY rowid"
@@ -222,9 +246,12 @@ class SessionManager:
         return imported
 
     def remove_chat_traces_from_qa_tools(self) -> int:
-        """Remove obsolete chat diagnostics while preserving real tool calls."""
+        """清除废弃的聊天诊断记录，同时保留真实的工具调用。"""
         changed = 0
         with self._lock, self._connect() as connection:
+            # 兼容全新数据库：QA 表不存在时没有需要清理的数据。
+            if not self._table_exists(connection, "qa_memory"):
+                return 0
             rows = connection.execute(
                 "SELECT qa_id,tools_json FROM qa_memory WHERE tools_json != '[]'"
             ).fetchall()

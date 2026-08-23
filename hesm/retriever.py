@@ -1,16 +1,25 @@
-"""Retrieve the current Experience and its recent descendants."""
+"""检索当前 Experience 及其最近的下层记忆。"""
 
 from __future__ import annotations
 
 import json
-from typing import Any, Callable
+from typing import Any
 
-from .storage import MemoryStorage
+from .manager import MemoryManager
 
 
 def _experience_status(experience: dict[str, Any]) -> str:
+    if experience.get("status"):
+        return str(experience["status"])
     state = experience.get("state")
     return str(state.get("status") or "") if isinstance(state, dict) else ""
+
+
+def _memory_text(value: Any) -> str:
+    """把结构化记忆转换为可读且稳定的 Prompt 文本。"""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value or "")
 
 
 def build_context_text(
@@ -18,7 +27,7 @@ def build_context_text(
     segments: list[dict[str, Any]],
     qas: list[dict[str, Any]],
 ) -> str:
-    """Build the prompt context from one Experience and recent descendants."""
+    """根据一个 Experience 及其最近下层记忆构造 Prompt 上下文。"""
     if not experiences:
         return "【长期记忆 Experience】\n未找到相关长期记忆。"
 
@@ -28,7 +37,7 @@ def build_context_text(
         f"主题：{experience.get('topic', '')}",
         f"核心实体：{experience.get('core_entity', '')}",
         f"状态：{_experience_status(experience)}",
-        f"摘要：{experience.get('summary', '')}",
+        f"摘要：{_memory_text(experience.get('summary'))}",
     ]
     history = experience.get("history_experience")
     if isinstance(history, dict) and history:
@@ -45,7 +54,7 @@ def build_context_text(
         lines.extend(
             [
                 f"{index}. 意图：{segment.get('intent', '')}",
-                f"   摘要：{segment.get('summary', '')}",
+                f"   摘要：{_memory_text(segment.get('summary'))}",
                 f"   更新时间：{segment.get('updated_at', '')}",
             ]
         )
@@ -65,45 +74,45 @@ def build_context_text(
 
 
 class HybridRetriever:
-    """Retrieve an active Experience or create one, then load recent context."""
+    """通过 MemoryManager 路由当前 Experience，并加载最近记忆。"""
 
     def __init__(
         self,
-        storage: MemoryStorage,
-        create_experience: Callable[..., dict[str, Any]],
+        manager: MemoryManager,
     ) -> None:
-        self.storage = storage
-        self.create_experience = create_experience
+        self.manager = manager
+        self.storage = manager.storage
 
     def retriever(
         self,
         topic: str,
         core_entity: str,
         query: str,
+        intent: str = "",
+        state_key: str = "default",
     ) -> dict[str, Any]:
-        """Return the current Experience and its recent memory context."""
-        from .config import get as config_get
-
+        """返回当前 Experience、最近两个 Segment 和最近五条 QA。"""
         topic = str(topic or "").strip()
         core_entity = str(core_entity or "").strip()
         query = str(query or "").strip()
+        intent = str(intent or "").strip() or "查询"
         if not topic or not core_entity or not query:
             raise ValueError("topic, core_entity and query must not be empty")
 
-        # 先从 SQLite 获取主题、实体完全一致的最新进行中 Experience。
-        experience = self.storage.find_active_experience(topic, core_entity)
-        if experience is None:
-            experience = self.create_experience(
-                topic=topic,
-                core_entity=core_entity,
-                query=query,
-            )
+        # 统一复用 MemoryManager 的路由规则和 runtime 维护逻辑。
+        experience, _current_segment = self.manager.route_experience(
+            state_key=state_key,
+            topic=topic,
+            core_entity=core_entity,
+            intent=intent,
+            query=query,
+        )
+        self.storage.commit()
 
-        # 只加载当前 Experience 下最近的有限数量 Segment。
-        segment_limit = max(1, int(config_get("api", "top_segment", 2)))
+        # 固定加载当前 Experience 下最近两个 Segment。
         latest_segments = self.storage.list_latest_segments(
             str(experience["experience_id"]),
-            segment_limit,
+            2,
         )
         segments = sorted(
             latest_segments,
@@ -114,9 +123,9 @@ class HybridRetriever:
             ),
         )
 
-        # 从上述 Segment 中取最近四轮 QA，再恢复为时间升序。
+        # 从上述 Segment 中取最近五条 QA，再恢复为时间升序。
         segment_ids = [segment["segment_id"] for segment in segments]
-        latest_qas = self.storage.list_latest_qas(segment_ids, 4)
+        latest_qas = self.storage.list_latest_qas(segment_ids, 5)
         qas = sorted(
             latest_qas,
             key=lambda item: (

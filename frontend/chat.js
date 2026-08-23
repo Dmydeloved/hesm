@@ -119,7 +119,7 @@
     elements.total.textContent = milliseconds(timing.chat_total_ms);
     elements.topic.innerHTML = `<div class="topic-grid"><div><small>主题</small><strong>${escapeHtml(extraction.topic || "—")}</strong></div><div><small>核心实体</small><strong>${escapeHtml(extraction.core_entity || "—")}</strong></div><div><small>意图</small><strong>${escapeHtml(extraction.intent || "—")}</strong></div><div><small>置信度</small><strong>${Math.round(Number(extraction.confidence || 0) * 100)}%</strong></div><div><small>相关实体</small><strong>${escapeHtml((extraction.entities || []).join("、") || "—")}</strong></div></div>`;
     elements.retrieval.innerHTML = `<div class="retrieval-counts"><span><b>${retrieval.experiences?.length || 0}</b>Experience</span><span><b>${retrieval.segments?.length || 0}</b>Segment</span><span><b>${retrieval.qas?.length || 0}</b>QA</span></div>`;
-    elements.promptPreview.textContent = `已拼接主题结果、${retrieval.qas?.length || 0} 条 QA 证据、${result.history?.length || 0} 条会话历史与当前问题。`;
+    elements.promptPreview.textContent = `已拼接 HESM 检索内容与当前问题，其中包含 ${retrieval.qas?.length || 0} 条 QA 证据。`;
     elements.promptText.textContent = result.prompt || "";
     elements.answerPreview.textContent = result.answer || "—";
     elements.model.textContent = result.model || "Answer model";

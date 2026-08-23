@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HESM 层级记忆树状详情">
+  <title>HESM · 记忆树状详情</title>
+  <link rel="stylesheet" href="/styles.css?v=7">
+  <link rel="stylesheet" href="/detail.css?v=1">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/index.html"><span class="brand-icon">H</span><span>HESM<small>Hierarchical Episodic &amp; Semantic Memory</small></span></a>
+    <nav><a class="active" href="/index.html">数据管理</a><a href="/retrieval.html">检索分析</a><a href="/chat.html?v=6">智能对话</a></nav>
+    <div id="health" class="health"><i></i><span>正在加载</span></div>
+  </header>
+
+  <main class="detail-shell">
+    <section class="detail-heading">
+      <div>
+        <a class="back-link" href="/index.html">← 返回数据管理</a>
+        <p id="detail-level" class="eyebrow">MEMORY TREE</p>
+        <h1 id="detail-title">正在加载…</h1>
+        <p id="detail-description">按层级展开查看记忆节点及其详细信息。</p>
+      </div>
+      <div class="tree-actions">
+        <button id="collapse-all" class="button secondary" type="button">全部收起</button>
+        <button id="expand-all" class="button secondary" type="button">全部展开</button>
+      </div>
+    </section>
+
+    <section id="tree-panel" class="tree-panel" aria-live="polite">
+      <div class="tree-loading"><span></span><p>正在构建记忆树…</p></div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="/detail.js?v=1"></script>
+</body>
+</html>

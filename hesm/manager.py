@@ -1,27 +1,27 @@
 from __future__ import annotations
 
+import json
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any
 
-from .embedder import (
-    TextEmbedder,
-    build_experience_embedding_text,
-    build_qa_embedding_text,
-    build_segment_embedding_text,
-)
+from .embedder import TextEmbedder
+from .recaller import ExperienceRecaller
 from .storage import MemoryStorage
 from .summarizer import SummarizerProtocol, TemplateSummarizer
-from .vector_store import ChromaVectorStore
+from .time_utils import format_timestamp
+from .vector_store import (
+    ChromaVectorStore,
+    build_vector_document,
+    build_vector_metadata,
+)
 
 
 logger = logging.getLogger(__name__)
-SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 
 class MemoryManager:
-    """Structured QA -> Segment -> Experience memory manager."""
+    """管理 QA → Segment → Experience 的分层结构化记忆。"""
 
     def __init__(
         self,
@@ -33,7 +33,7 @@ class MemoryManager:
         experience_summary_segment_threshold: int = 5,
         experience_similarity_threshold: float = 0.82,
         min_segment_qas: int = 2,
-        experience_recall: Callable[..., dict[str, Any]] | None = None,
+        experience_recaller: ExperienceRecaller | None = None,
     ) -> None:
         self.storage = storage
         self.summarizer = summarizer or TemplateSummarizer()
@@ -41,10 +41,10 @@ class MemoryManager:
         self.embedder = embedder
         self.segment_summary_qa_threshold = segment_summary_qa_threshold
         self.experience_summary_segment_threshold = experience_summary_segment_threshold
-        # Semantic routing thresholds
+        # 语义路由阈值。
         self.experience_similarity_threshold = experience_similarity_threshold
         self.min_segment_qas = min_segment_qas
-        self.experience_recall = experience_recall
+        self.experience_recaller = experience_recaller
 
     def add_qa(
         self,
@@ -55,7 +55,7 @@ class MemoryManager:
         timestamp: str | None = None,
         state_key: str = "default",
     ) -> dict[str, Any]:
-        """Add one structured topic result into QA/Segment/Experience memory."""
+        """把一条结构化主题结果写入三层记忆。"""
 
         topic = self._required_text(topic_result, "topic")
         core_entity = self._required_text(topic_result, "core_entity")
@@ -63,7 +63,7 @@ class MemoryManager:
         entities = topic_result.get("entities") or [core_entity]
         confidence = float(topic_result.get("confidence", 0.0))
         reasoning = str(topic_result.get("reasoning") or "")
-        timestamp = timestamp or self._now()
+        timestamp = format_timestamp(timestamp)
 
         logger.info(
             "写入主题记忆 state=%s topic=%s core_entity=%s intent=%s",
@@ -74,70 +74,18 @@ class MemoryManager:
         )
 
         try:
-            runtime = self.storage.get_runtime_state(state_key)
-            current_experience = self.storage.get_experience(
-                runtime["current_experience_id"] if runtime else None
+            current_experience, current_segment = self.route_experience(
+                state_key=state_key,
+                topic=topic,
+                core_entity=core_entity,
+                intent=intent,
+                query=user_input,
+                timestamp=timestamp,
             )
-            current_segment = self.storage.get_segment(
-                runtime["current_segment_id"] if runtime else None
+            action = self._resolve_add_action(
+                current_experience,
+                current_segment,
             )
-
-            action = "append_segment"
-
-            # ── Experience 路由 ────────────────────────────────────────────────
-            # 1. state_key 指向的当前 Experience 必须同时精确匹配 topic 和
-            #    core_entity，并且状态为 in_progress，才能直接复用。
-            # 2. 当前 Experience 不匹配时，先从 SQLite 查询最新的、主题实体
-            #    精确一致且状态为 in_progress 的 Experience。
-            # 3. SQLite 未命中时，查询专用于路由的 topic+core_entity 向量。
-            # 4. 两条路径都未命中时，召回历史经验并新建 Experience。
-            if not self._same_experience(
-                current_experience, topic, core_entity
-            ):
-                if current_segment:
-                    self._summarize_segment(current_segment, timestamp, reason="experience_switch")
-                if current_experience:
-                    self._summarize_experience(current_experience, timestamp, reason="experience_switch")
-
-                current_experience = self.storage.find_active_experience(
-                    topic, core_entity
-                )
-                if current_experience:
-                    logger.info(
-                        "SQLite 命中进行中 Experience id=%s topic=%s entity=%s",
-                        current_experience["experience_id"],
-                        current_experience["topic"],
-                        current_experience["core_entity"],
-                    )
-                else:
-                    current_experience = self._find_experience_by_vector(
-                        topic, core_entity
-                    )
-
-                if current_experience:
-                    current_segment = self.storage.find_latest_segment(
-                        current_experience["experience_id"]
-                    )
-                    action = "switch_experience"
-                else:
-                    current_experience = self.create_experience(
-                        topic=topic,
-                        core_entity=core_entity,
-                        query=user_input,
-                        timestamp=timestamp,
-                    )
-                    current_segment = None
-                    action = "new_experience"
-
-            # ── Segment 边界检测 ───────────────────────────────────────────────
-            # 语义漂移检测：intent 切换时，只有当当前 Segment 已积累了足够多的
-            # QA（>= min_segment_qas）才实际切断，避免生成大量 1-2 条的碎片
-            # Segment。少量 QA 时继续追加到当前 Segment，保证聚合度。
-            if not current_segment or self._should_cut_segment(current_segment, intent):
-                if current_segment:
-                    self._summarize_segment(current_segment, timestamp, reason="intent_switch")
-                current_segment = self._create_segment(current_experience, topic, core_entity, intent, timestamp)
-                action = "new_segment" if action == "append_segment" else action
 
             qa = {
                 "qa_id": self._new_id("qa"),
@@ -150,9 +98,9 @@ class MemoryManager:
                 "core_entity": core_entity,
                 "entities": [str(entity) for entity in entities if str(entity).strip()],
                 "segment_id": current_segment["segment_id"],
-                "status": "active",
+                "status": "open",
                 "confidence": confidence,
-                "reasoning": reasoning,
+                "reason": reasoning,
             }
             self.storage.insert_qa(qa)
             self.upsert_qa_vector(qa["qa_id"])
@@ -173,12 +121,6 @@ class MemoryManager:
             self._maybe_summarize_experience_by_threshold(current_experience, timestamp)
             self.storage.update_experience(current_experience)
             self.upsert_experience_vector(current_experience["experience_id"])
-            self.storage.upsert_runtime_state(
-                state_key=state_key,
-                current_experience_id=current_experience["experience_id"],
-                current_segment_id=current_segment["segment_id"],
-                updated_at=timestamp,
-            )
             self.storage.commit()
             return {
                 "qa_id": qa["qa_id"],
@@ -191,30 +133,145 @@ class MemoryManager:
             logger.exception("结构化记忆写入失败，已回滚")
             raise
 
+    def route_experience(
+        self,
+        *,
+        state_key: str,
+        topic: str,
+        core_entity: str,
+        intent: str,
+        query: str,
+        timestamp: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """完成 Experience 与 Segment 路由，并维护 runtime 当前指针。"""
+        timestamp = format_timestamp(timestamp)
+        runtime = self.storage.get_runtime_state(state_key)
+        current_experience = self.storage.get_experience(
+            runtime["current_experience_id"] if runtime else None
+        )
+        current_segment = self.storage.get_segment(
+            runtime["current_segment_id"] if runtime else None
+        )
+
+        # runtime 中的 Segment 必须属于当前 Experience，避免复用失效指针。
+        if (
+            current_experience
+            and current_segment
+            and current_segment.get("experience_id")
+            != current_experience.get("experience_id")
+        ):
+            current_segment = None
+
+        # 当前 Experience 不可复用时，依次尝试关系库、路由向量和新建流程。
+        if not self._same_experience(current_experience, topic, core_entity):
+            if current_segment:
+                current_segment["status"] = "completed"
+                self._summarize_segment(
+                    current_segment,
+                    timestamp,
+                    reason="experience_switch",
+                )
+            if current_experience:
+                self._summarize_experience(
+                    current_experience,
+                    timestamp,
+                    reason="experience_switch",
+                )
+
+            current_experience = self.storage.find_active_experience(
+                topic,
+                core_entity,
+            )
+            if current_experience:
+                logger.info(
+                    "SQLite 命中进行中 Experience id=%s topic=%s entity=%s",
+                    current_experience["experience_id"],
+                    current_experience["topic"],
+                    current_experience["core_entity"],
+                )
+            else:
+                current_experience = self._find_experience_by_vector(
+                    topic,
+                    core_entity,
+                )
+
+            if current_experience:
+                current_segment = self.storage.find_latest_segment(
+                    current_experience["experience_id"]
+                )
+            else:
+                current_experience = self.create_experience(
+                    topic=topic,
+                    core_entity=core_entity,
+                    query=query,
+                    intent=intent,
+                    timestamp=timestamp,
+                )
+                current_segment = None
+
+        # 在写入 runtime 前完成 Segment 边界判断，保证指针就是本轮写入目标。
+        if not current_segment or self._should_cut_segment(current_segment, intent):
+            if current_segment:
+                current_segment["status"] = "completed"
+                self._summarize_segment(
+                    current_segment,
+                    timestamp,
+                    reason="intent_switch",
+                )
+            current_segment = self._create_segment(
+                current_experience,
+                topic,
+                core_entity,
+                intent,
+                timestamp,
+            )
+
+        self.storage.upsert_runtime_state(
+            state_key=state_key,
+            current_experience_id=current_experience["experience_id"],
+            current_segment_id=current_segment["segment_id"],
+            updated_at=timestamp,
+        )
+        return current_experience, current_segment
+
+    @staticmethod
+    def _resolve_add_action(
+        current_experience: dict[str, Any],
+        current_segment: dict[str, Any],
+    ) -> str:
+        """根据路由结果生成兼容现有返回结构的写入动作。"""
+        if current_segment.get("qa_ids"):
+            return "append_segment"
+        if current_experience.get("segment_ids"):
+            return "new_segment"
+        return "new_experience"
+
     def create_experience(
         self,
         *,
         topic: str,
         core_entity: str,
         query: str,
+        intent: str = "",
         history_experience: dict[str, Any] | str | None = None,
         timestamp: str | None = None,
     ) -> dict[str, Any]:
-        """Create an in-progress Experience, seeded with recalled history."""
+        """创建进行中的 Experience，并注入召回的历史经验。"""
         topic = str(topic or "").strip()
         core_entity = str(core_entity or "").strip()
         query = str(query or "").strip()
         if not topic or not core_entity or not query:
             raise ValueError("topic, core_entity and query must not be empty")
 
-        now = timestamp or self._now()
+        now = format_timestamp(timestamp)
         if not history_experience:
-            if self.experience_recall is None:
-                raise RuntimeError("experience_recall is not configured")
-            recall_result = self.experience_recall(
+            if self.experience_recaller is None:
+                raise RuntimeError("experience_recaller is not configured")
+            recall_result = self.experience_recaller.recall(
                 topic=topic,
                 core_entity=core_entity,
                 query=query,
+                intent=intent,
             )
             history_experience = (
                 recall_result.get("history_experience")
@@ -228,8 +285,8 @@ class MemoryManager:
                 "core_entity": core_entity,
                 "intents_link": [],
                 "segment_ids": [],
-                "summary": "",
-                "state": {"status": "in_progress", "current_segment_id": ""},
+                "summary": {},
+                "status": "open",
                 "created_at": now,
                 "updated_at": now,
                 "version": 1,
@@ -253,9 +310,7 @@ class MemoryManager:
     def _mark_experience_completed(
         self, experience: dict[str, Any], now: str
     ) -> None:
-        state = dict(experience.get("state") or {})
-        state["status"] = "completed"
-        experience["state"] = state
+        experience["status"] = "completed"
         experience["updated_at"] = now
         experience["version"] = int(experience.get("version") or 0) + 1
         self.storage.update_experience(experience)
@@ -276,7 +331,7 @@ class MemoryManager:
             "core_entity": core_entity,
             "qa_ids": [],
             "status": "open",
-            "summary": "",
+            "summary": {},
             "experience_id": experience["experience_id"],
             "created_at": now,
             "updated_at": now,
@@ -304,10 +359,7 @@ class MemoryManager:
             experience["segment_ids"].append(segment["segment_id"])
         if intent not in experience["intents_link"]:
             experience["intents_link"].append(intent)
-        experience["state"] = {
-            "status": "in_progress",
-            "current_segment_id": segment["segment_id"],
-        }
+        experience["status"] = "open"
         experience["updated_at"] = now
 
     def _maybe_summarize_segment_by_threshold(self, segment: dict[str, Any], now: str) -> None:
@@ -328,7 +380,11 @@ class MemoryManager:
         qa_items = [qa for qa in qa_items if qa]
         if not qa_items:
             return
-        segment["summary"] = self.summarizer.summarize_segment(segment, qa_items)
+        summary = self.summarizer.summarize_segment(segment, qa_items)
+        segment["summary"] = self._summary_object(summary)
+        summary_state = segment["summary"].get("state") or {}
+        if summary_state.get("status") == "completed":
+            segment["status"] = "completed"
         segment["last_summarized_qa_count"] = len(segment["qa_ids"])
         segment["version"] += 1
         segment["updated_at"] = now
@@ -348,7 +404,11 @@ class MemoryManager:
             for segment_id in experience.get("segment_ids", [])
         ]
         segments = [segment for segment in segments if segment]
-        experience["summary"] = self.summarizer.summarize_experience(experience, segments)
+        summary = self.summarizer.summarize_experience(experience, segments)
+        experience["summary"] = self._summary_object(summary)
+        current_state = experience["summary"].get("current_state") or {}
+        if current_state.get("status") == "completed":
+            experience["status"] = "completed"
         experience["last_summarized_segment_count"] = len(experience["segment_ids"])
         experience["version"] += 1
         experience["updated_at"] = now
@@ -366,27 +426,17 @@ class MemoryManager:
         return self.storage.get_qa(qa_id)
 
     def upsert_experience_vector(self, experience_id: str) -> None:
-        """Synchronize the normal and topic/entity routing Experience vectors."""
+        """同步 Experience 内容向量与主题实体路由向量。"""
         experience = self.storage.get_experience(experience_id)
         if not experience:
             raise ValueError(f"Unknown experience_id: {experience_id}")
         recent_segments = self.storage.list_segments_by_experience_ids([experience_id])[:3]
         vector_memory = {**experience, "recent_segments": recent_segments}
-        text = build_experience_embedding_text(vector_memory)
-        route_text = (
-            f"主题：{experience['topic']}\n"
-            f"核心实体：{experience['core_entity']}"
-        )
+        text = build_vector_document("experience", vector_memory)
+        route_text = build_vector_document("experience_route", vector_memory)
         normal_embedding = self.embedder.embed(text)
         route_embedding = self.embedder.embed(route_text)
-        metadata = {
-            "experience_id": experience_id,
-            "topic": experience["topic"],
-            "core_entity": experience["core_entity"],
-            "intents": experience.get("intents_link") or [],
-            "version": experience["version"],
-            "status": (experience.get("state") or {}).get("status", ""),
-        }
+        metadata = build_vector_metadata("experience", experience)
         self.vector_store.upsert(
             memory_type="experience",
             memory_id=experience_id,
@@ -419,22 +469,14 @@ class MemoryManager:
                 qa["user_input"] for qa in recent_qas if qa
             ],
         }
-        text = build_segment_embedding_text(vector_memory)
+        text = build_vector_document("segment", vector_memory)
         self.vector_store.upsert(
             memory_type="segment",
             memory_id=segment_id,
             text=text,
             embedding=self.embedder.embed(text),
             updated_at=segment["updated_at"],
-            metadata={
-                "segment_id": segment_id,
-                "experience_id": segment["experience_id"],
-                "topic": segment["topic"],
-                "core_entity": segment["core_entity"],
-                "intent": segment["intent"],
-                "status": segment["status"],
-                "version": segment["version"],
-            },
+            metadata=build_vector_metadata("segment", segment),
         )
         logger.debug("Segment 向量已写入 id=%s", segment_id)
 
@@ -442,23 +484,14 @@ class MemoryManager:
         qa = self.storage.get_qa(qa_id)
         if not qa:
             raise ValueError(f"Unknown qa_id: {qa_id}")
-        text = build_qa_embedding_text(qa)
+        text = build_vector_document("qa", qa)
         self.vector_store.upsert(
             memory_type="qa",
             memory_id=qa_id,
             text=text,
             embedding=self.embedder.embed(text),
             updated_at=qa["timestamp"],
-            metadata={
-                "qa_id": qa_id,
-                "segment_id": qa["segment_id"],
-                "topic": qa["topic"],
-                "core_entity": qa["core_entity"],
-                "intent": qa["intent"],
-                "timestamp": qa["timestamp"],
-                "status": qa["status"],
-                "confidence": float(qa["confidence"]),
-            },
+            metadata=build_vector_metadata("qa", qa),
         )
         logger.debug("QA 向量已写入 id=%s", qa_id)
 
@@ -468,12 +501,12 @@ class MemoryManager:
         topic: str,
         core_entity: str,
     ) -> bool:
-        """Return true only for the exact active topic/entity identity."""
+        """仅在主题、核心实体和开放状态均匹配时返回真。"""
         return bool(
             experience
             and experience["topic"] == topic
             and experience["core_entity"] == core_entity
-            and (experience.get("state") or {}).get("status") == "in_progress"
+            and experience.get("status") == "open"
         )
 
     def _find_experience_by_vector(
@@ -486,7 +519,7 @@ class MemoryManager:
         except Exception:
             logger.warning("Experience 路由向量嵌入失败", exc_info=True)
             return None
-
+        ## TODO 添加筛选条件状态为open
         results = self.vector_store.query(
             query_embedding,
             memory_type="experience_route",
@@ -506,8 +539,7 @@ class MemoryManager:
             experience = self.storage.get_experience(exp_id)
             if (
                 experience
-                and (experience.get("state") or {}).get("status")
-                == "in_progress"
+                and experience.get("status") == "open"
             ):
                 logger.info(
                     "Experience 路由向量命中 id=%s sim=%.3f topic=%s entity=%s",
@@ -528,6 +560,9 @@ class MemoryManager:
            （措辞不同但语义相近时保留，避免碎片化）
         3. 当前 Segment 已积累了足够的 QA（>= min_segment_qas）
         """
+        if segment.get("status") != "open":
+            return True
+
         if segment["intent"] == intent:
             return False
 
@@ -571,8 +606,21 @@ class MemoryManager:
             raise ValueError(f"{key} is required")
         return text
 
+    @staticmethod
+    def _summary_object(value: Any) -> dict[str, Any]:
+        """把总结器响应规范化为结构化摘要对象。"""
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
     def _new_id(self, prefix: str) -> str:
         return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
     def _now(self) -> str:
-        return datetime.now(SHANGHAI_TZ).isoformat()
+        return format_timestamp()

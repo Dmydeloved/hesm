@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from hesm.config import PROJECT_ROOT, config_path
 from hesm.session import SessionManager
+from hesm.storage import MemoryStorage
 from service.hesm_service import HESMService
 
 
@@ -69,8 +70,8 @@ class MemoryRepository:
         item = dict(row)
         item["intents"] = _json(item.pop("intents_link_json", "[]"), [])
         item["segment_ids"] = _json(item.pop("segment_ids_json", "[]"), [])
-        item["summary"] = _json(item.pop("summary_json", '""'), "")
-        item["state"] = _json(item.pop("state_json", "{}"), {})
+        item["summary"] = _json(item.pop("summary_json", "{}"), {})
+        item["state"] = {"status": item.get("status", "open")}
         item["history_experience"] = _json(
             item.pop("history_experience_json", "{}"), {}
         )
@@ -82,6 +83,7 @@ class MemoryRepository:
     def _segment(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
         item["qa_ids"] = _json(item.pop("qa_ids_json", "[]"), [])
+        item["summary"] = _json(item.pop("summary_json", "{}"), {})
         item["qa_count"] = int(item.get("qa_count") or len(item["qa_ids"]))
         return item
 
@@ -90,6 +92,7 @@ class MemoryRepository:
         item = dict(row)
         item["tools"] = _json(item.pop("tools_json", "[]"), [])
         item["entities"] = _json(item.pop("entities_json", "[]"), [])
+        item["reasoning"] = item.get("reason", "")
         return item
 
     def stats(self) -> dict[str, Any]:
@@ -112,6 +115,7 @@ class MemoryRepository:
         search: str = "",
         status: str = "",
         parent_id: str = "",
+        experience_id: str = "",
         page: int = 1,
         page_size: int = 30,
     ) -> dict[str, Any]:
@@ -133,7 +137,7 @@ class MemoryRepository:
         elif level == "segment":
             select = "s.*, COUNT(q.qa_id) AS qa_count"
             joins = " LEFT JOIN qa_memory q ON q.segment_id=s.segment_id"
-            search_columns = ["s.segment_id", "s.topic", "s.intent", "s.core_entity", "s.summary"]
+            search_columns = ["s.segment_id", "s.topic", "s.intent", "s.core_entity", "s.summary_json"]
             group = " GROUP BY s.segment_id"
         else:
             select = "q.*, s.experience_id"
@@ -150,10 +154,7 @@ class MemoryRepository:
             conditions.append("(" + " OR ".join(f"{column} LIKE ?" for column in search_columns) + ")")
             parameters.extend([f"%{search.strip()}%"] * len(search_columns))
         if status.strip():
-            if level == "experience":
-                conditions.append("json_extract(e.state_json, '$.status') = ?")
-            else:
-                conditions.append(f"{alias}.status = ?")
+            conditions.append(f"{alias}.status = ?")
             parameters.append(status.strip())
         if parent_id.strip():
             parent_column = "s.experience_id" if level == "segment" else "q.segment_id"
@@ -161,14 +162,31 @@ class MemoryRepository:
                 raise HTTPException(status_code=400, detail="Experience 不支持 parent_id")
             conditions.append(f"{parent_column} = ?")
             parameters.append(parent_id.strip())
+        if experience_id.strip():
+            if level != "qa":
+                raise HTTPException(
+                    status_code=400,
+                    detail="experience_id 仅支持查询 QA",
+                )
+            conditions.append("s.experience_id = ?")
+            parameters.append(experience_id.strip())
 
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-        count_sql = f"SELECT COUNT(*) FROM {table} {alias}{where}"
-        order_column = "updated_at" if level != "qa" else "timestamp"
+        count_sql = (
+            f"SELECT COUNT(DISTINCT {alias}.{id_column}) "
+            f"FROM {table} {alias}{joins}{where}"
+        )
         offset = (page - 1) * page_size
+        if level == "segment" and parent_id.strip():
+            order_by = "s.created_at ASC, s.rowid ASC"
+        elif level == "qa" and (parent_id.strip() or experience_id.strip()):
+            order_by = "q.timestamp ASC, q.rowid ASC"
+        else:
+            order_column = "updated_at" if level != "qa" else "timestamp"
+            order_by = f"{alias}.{order_column} DESC, {alias}.rowid DESC"
         sql = (
             f"SELECT {select} FROM {table} {alias}{joins}{where}{group} "
-            f"ORDER BY {alias}.{order_column} DESC, {alias}.rowid DESC LIMIT ? OFFSET ?"
+            f"ORDER BY {order_by} LIMIT ? OFFSET ?"
         )
         with self._connect() as connection:
             total = int(connection.execute(count_sql, parameters).fetchone()[0])
@@ -178,8 +196,13 @@ class MemoryRepository:
             "segment": self._segment,
             "qa": self._qa,
         }[level]
+        items = []
+        for index, row in enumerate(rows, start=offset + 1):
+            item = serializer(row)
+            item["sequence"] = index
+            items.append(item)
         return {
-            "items": [serializer(row) for row in rows],
+            "items": items,
             "page": page,
             "page_size": page_size,
             "total": total,
@@ -197,32 +220,50 @@ class MemoryRepository:
                 raise HTTPException(status_code=404, detail=f"未找到 {level}: {memory_id}")
             if level == "experience":
                 item = self._experience(row)
-                item["segments"] = [
-                    self._segment(value)
-                    for value in connection.execute(
-                        "SELECT *, (SELECT COUNT(*) FROM qa_memory q WHERE q.segment_id=s.segment_id) qa_count "
-                        "FROM segment_memory s WHERE experience_id=? ORDER BY updated_at DESC",
-                        (memory_id,),
+                segments = []
+                segment_rows = connection.execute(
+                    "SELECT *, (SELECT COUNT(*) FROM qa_memory q "
+                    "WHERE q.segment_id=s.segment_id) qa_count "
+                    "FROM segment_memory s WHERE experience_id=? "
+                    "ORDER BY created_at ASC, rowid ASC",
+                    (memory_id,),
+                ).fetchall()
+                for segment_index, value in enumerate(segment_rows, start=1):
+                    segment = self._segment(value)
+                    segment["sequence"] = segment_index
+                    qa_rows = connection.execute(
+                        "SELECT * FROM qa_memory WHERE segment_id=? "
+                        "ORDER BY timestamp ASC, rowid ASC",
+                        (segment["segment_id"],),
                     ).fetchall()
-                ]
+                    segment["qas"] = []
+                    for qa_index, qa_row in enumerate(qa_rows, start=1):
+                        qa = self._qa(qa_row)
+                        qa["sequence"] = qa_index
+                        segment["qas"].append(qa)
+                    segments.append(segment)
+                item["segments"] = segments
             elif level == "segment":
                 item = self._segment(row)
-                item["qas"] = [
-                    self._qa(value)
-                    for value in connection.execute(
-                        "SELECT * FROM qa_memory WHERE segment_id=? ORDER BY timestamp DESC",
-                        (memory_id,),
-                    ).fetchall()
-                ]
+                item["qas"] = []
+                qa_rows = connection.execute(
+                    "SELECT * FROM qa_memory WHERE segment_id=? "
+                    "ORDER BY timestamp ASC, rowid ASC",
+                    (memory_id,),
+                ).fetchall()
+                for qa_index, value in enumerate(qa_rows, start=1):
+                    qa = self._qa(value)
+                    qa["sequence"] = qa_index
+                    item["qas"].append(qa)
             else:
                 item = self._qa(row)
         return item
 
     def set_status(self, level: Literal["experience", "segment", "qa"], memory_id: str, status: str) -> dict[str, Any]:
         allowed = {
-            "experience": {"in_progress", "paused", "completed", "archived"},
-            "segment": {"open", "closed", "archived", "deleted"},
-            "qa": {"active", "archived", "deleted"},
+            "experience": {"open", "completed", "deleted"},
+            "segment": {"open", "completed", "deleted"},
+            "qa": {"open", "deleted"},
         }[level]
         if status not in allowed:
             raise HTTPException(status_code=422, detail=f"不支持的状态: {status}")
@@ -233,18 +274,10 @@ class MemoryRepository:
             ).fetchone()
             if row is None:
                 raise HTTPException(status_code=404, detail=f"未找到 {level}: {memory_id}")
-            if level == "experience":
-                state = _json(row["state_json"], {})
-                state["status"] = status
-                connection.execute(
-                    "UPDATE experience_memory SET state_json=? WHERE experience_id=?",
-                    (json.dumps(state, ensure_ascii=False), memory_id),
-                )
-            else:
-                connection.execute(
-                    f"UPDATE {table} SET status=? WHERE {id_column}=?",
-                    (status, memory_id),
-                )
+            connection.execute(
+                f"UPDATE {table} SET status=? WHERE {id_column}=?",
+                (status, memory_id),
+            )
             connection.commit()
         return self.detail(level, memory_id)
 
@@ -354,6 +387,10 @@ class ChatRequest(BaseModel):
 
 
 app = FastAPI(title="HESM Memory Console API", version="3.0.0")
+
+# 管理接口会在 HESMService 惰性创建之前访问数据库，因此启动时先补齐完整记忆表结构。
+database_initializer = MemoryStorage(DATABASE_PATH)
+database_initializer.close()
 repository = MemoryRepository(DATABASE_PATH)
 session_manager = SessionManager(DATABASE_PATH)
 session_manager.import_legacy_chat_turns()
@@ -476,11 +513,13 @@ def list_memories(
     q: str = Query(default="", max_length=500),
     status: str = Query(default="", max_length=32),
     parent_id: str = Query(default="", max_length=200),
+    experience_id: str = Query(default="", max_length=200),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=30, ge=1, le=100),
 ) -> dict[str, Any]:
     return repository.list_memories(
         level, search=q, status=status, parent_id=parent_id,
+        experience_id=experience_id,
         page=page, page_size=page_size,
     )
 
