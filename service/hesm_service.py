@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from threading import RLock
 import time
-from typing import Any
+from typing import Any, Iterator
 
 from hesm.chat import LLMAnswerer, build_chat_prompt
 from hesm.config import PROJECT_ROOT, load_config
@@ -201,6 +201,28 @@ class HESMService:
         session_id: str | None = None,
     ) -> dict[str, Any]:
         """Retrieve memory, answer the user, then persist the complete turn."""
+        final_result: dict[str, Any] | None = None
+        for event in self.chat_events(
+            message=message,
+            history=history,
+            state_key=state_key,
+            session_id=session_id,
+        ):
+            if event.get("event") == "final":
+                final_result = event["result"]
+        if final_result is None:
+            raise RuntimeError("Chat completed without final result")
+        return final_result
+
+    def chat_events(
+        self,
+        *,
+        message: str,
+        history: list[dict[str, Any]] | None = None,
+        state_key: str = "default",
+        session_id: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield real chat processing milestones as each backend stage completes."""
         text = str(message).strip()
         if not text:
             raise ValueError("message must not be empty")
@@ -208,42 +230,116 @@ class HESMService:
         session = self.sessions.ensure(session_identifier)
         persisted_history = session.get("messages") or []
         requested_history = history or []
-        history_source = persisted_history if persisted_history else requested_history
-        extraction_context = self._build_topic_extraction_context(
+        # The browser only needs to submit session_id. history is retained as a
+        # compatibility fallback for older callers whose session has not been saved.
+        history_source = persisted_history or requested_history
+        recent_turns = self._recent_session_turns(
             history_source,
             session.get("metadata") or {},
+            limit=5,
         )
-        print(f"extraction_context:{extraction_context}")
-        normalized_history = [
-            {
-                "role": str(item.get("role") or ""),
-                "content": str(item.get("content") or "")[:20_000],
-            }
-            for item in history_source[-20:]
-            if item.get("role") in {"user", "assistant"}
-            and str(item.get("content") or "").strip()
-        ]
+        extraction_context = (
+            json.dumps(recent_turns, ensure_ascii=False, indent=2)
+            if recent_turns else ""
+        )
 
         total_started_at = time.perf_counter()
+        timings: dict[str, float] = {}
+        yield {
+            "event": "start",
+            "session_id": session_identifier,
+            "history_turn_count": len(recent_turns),
+        }
         with self._lock:
-            retrieval_result = self.retrieve(
-                question=text,
-                state_key=state_key,
-                extraction_context=extraction_context,
+            yield {
+                "event": "stage_started",
+                "stage": "extract",
+                "session_id": session_identifier,
+                "history_turn_count": len(recent_turns),
+            }
+            extraction_started_at = time.perf_counter()
+            extracted = self.extractor.extract(
+                user_input=text,
+                context=extraction_context,
             )
+            timings["topic_extraction_ms"] = round(
+                (time.perf_counter() - extraction_started_at) * 1000, 3
+            )
+            candidates = extracted if isinstance(extracted, list) else [extracted]
+            if not candidates or not isinstance(candidates[0], dict):
+                raise ValueError("Topic extraction returned no valid query")
+            primary = candidates[0]
+            yield {
+                "event": "stage_completed",
+                "stage": "extract",
+                "timing_ms": timings["topic_extraction_ms"],
+                "extraction": primary,
+                "query_candidates": candidates,
+                "history_turn_count": len(recent_turns),
+            }
+
+            yield {"event": "stage_started", "stage": "retrieve"}
+            retrieval_started_at = time.perf_counter()
+            retrieval_payload = self.retriever.retriever(
+                topic=str(primary.get("topic") or ""),
+                core_entity=str(primary.get("core_entity") or ""),
+                query=text,
+                intent=str(primary.get("intent") or ""),
+                state_key=session_identifier,
+            )
+            timings["retrieval_ms"] = round(
+                (time.perf_counter() - retrieval_started_at) * 1000, 3
+            )
+            retrieval_result = {
+                "question": text,
+                "query_extraction": primary,
+                "query_candidates": candidates,
+                "timing": {
+                    "topic_extraction_ms": timings["topic_extraction_ms"],
+                    "retrieval_ms": timings["retrieval_ms"],
+                },
+                **retrieval_payload,
+            }
+            yield {
+                "event": "stage_completed",
+                "stage": "retrieve",
+                "timing_ms": timings["retrieval_ms"],
+                "retrieval": retrieval_result,
+            }
+
+            yield {"event": "stage_started", "stage": "prompt"}
             prompt_started_at = time.perf_counter()
             prompt = build_chat_prompt(
                 question=text,
                 memory_context=retrieval_result.get("context") or "",
             )
-            prompt_ms = round((time.perf_counter() - prompt_started_at) * 1000, 3)
+            timings["prompt_assembly_ms"] = round(
+                (time.perf_counter() - prompt_started_at) * 1000, 3
+            )
+            yield {
+                "event": "stage_completed",
+                "stage": "prompt",
+                "timing_ms": timings["prompt_assembly_ms"],
+                "prompt": prompt,
+                "history_turn_count": len(recent_turns),
+                "retrieval_qa_count": len(retrieval_result.get("qas") or []),
+            }
 
+            yield {"event": "stage_started", "stage": "generate"}
             generation_started_at = time.perf_counter()
             answer = self.answerer.answer(prompt)
-            generation_ms = round(
+            timings["generation_ms"] = round(
                 (time.perf_counter() - generation_started_at) * 1000, 3
             )
+            yield {
+                "event": "stage_completed",
+                "stage": "generate",
+                "timing_ms": timings["generation_ms"],
+                "answer": answer,
+                "model": self.chat_model,
+            }
 
+            yield {"event": "stage_started", "stage": "store"}
             storage_started_at = time.perf_counter()
             stored = self.add_memory(
                 user_input=text,
@@ -253,9 +349,9 @@ class HESMService:
                 # tools is reserved exclusively for actual tool invocations.
                 # Topic extraction, retrieval and prompt diagnostics are not tools.
                 tools=[],
-                state_key=state_key,
+                state_key=session_identifier,
             )
-            storage_ms = round((time.perf_counter() - storage_started_at) * 1000, 3)
+            timings["storage_ms"] = round((time.perf_counter() - storage_started_at) * 1000, 3)
             self.sessions.append_turn(
                 session_identifier,
                 user_content=text,
@@ -271,26 +367,50 @@ class HESMService:
                     ),
                 },
             )
+            yield {
+                "event": "stage_completed",
+                "stage": "store",
+                "timing_ms": timings["storage_ms"],
+                "stored": stored,
+            }
 
         total_ms = round((time.perf_counter() - total_started_at) * 1000, 3)
-        return {
+        retrieval_result["timing"] = {
+            **retrieval_result.get("timing", {}),
+            "response_assembly_ms": round(
+                max(
+                    0.0,
+                    total_ms
+                    - timings.get("topic_extraction_ms", 0.0)
+                    - timings.get("retrieval_ms", 0.0),
+                ),
+                3,
+            ),
+            "total_ms": round(
+                timings.get("topic_extraction_ms", 0.0)
+                + timings.get("retrieval_ms", 0.0),
+                3,
+            ),
+        }
+        result = {
             "message": text,
             "answer": answer,
             "prompt": prompt,
-            "history": normalized_history,
             "extraction": retrieval_result["query_extraction"],
             "retrieval": retrieval_result,
             "stored": stored,
             "timing": {
                 **retrieval_result.get("timing", {}),
-                "prompt_assembly_ms": prompt_ms,
-                "generation_ms": generation_ms,
-                "storage_ms": storage_ms,
+                "prompt_assembly_ms": timings["prompt_assembly_ms"],
+                "generation_ms": timings["generation_ms"],
+                "storage_ms": timings["storage_ms"],
                 "chat_total_ms": total_ms,
             },
             "model": self.chat_model,
             "session_id": session_identifier,
+            "history_turn_count": len(recent_turns),
         }
+        yield {"event": "final", "result": result}
 
     def close(self) -> None:
         with self._lock:
@@ -302,6 +422,17 @@ class HESMService:
         session_metadata: dict[str, Any],
     ) -> str:
         """构造最近五轮对话及其既有主题、核心实体上下文。"""
+        turns = HESMService._recent_session_turns(messages, session_metadata, limit=5)
+        return json.dumps(turns, ensure_ascii=False, indent=2) if turns else ""
+
+    @staticmethod
+    def _recent_session_turns(
+        messages: list[dict[str, Any]],
+        session_metadata: dict[str, Any],
+        *,
+        limit: int = 5,
+    ) -> list[dict[str, str]]:
+        """Return the most recent user/assistant turns from a saved session."""
         turns: list[dict[str, str]] = []
         pending: dict[str, str] | None = None
         for message in messages:
@@ -343,7 +474,7 @@ class HESMService:
 
         if pending:
             turns.append(pending)
-        turns = turns[-5:]
+        turns = turns[-max(1, int(limit)):]
 
         # 兼容尚未在消息中保存主题信息的旧会话，回填最近一轮元数据。
         if turns:
@@ -353,7 +484,7 @@ class HESMService:
             turns[-1]["core_entity"] = turns[-1]["core_entity"] or str(
                 session_metadata.get("core_entity") or ""
             )
-        return json.dumps(turns, ensure_ascii=False, indent=2) if turns else ""
+        return turns
 
     @staticmethod
     def _project_path(value: str | Path) -> Path:

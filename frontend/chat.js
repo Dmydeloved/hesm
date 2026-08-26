@@ -84,10 +84,16 @@
     const order = ["extract", "retrieve", "prompt", "generate", "store"];
     const index = order.indexOf(step);
     document.querySelectorAll(".trace-step").forEach((node, position) => {
-      node.classList.toggle("active", status !== "failed" && position === index);
-      node.classList.toggle("done", status === "done" || position < index);
+      const completed = status === "done" || status === "completed";
+      node.classList.toggle("active", status !== "failed" && !completed && position === index);
+      node.classList.toggle("done", status === "done" || position < index || (completed && position === index));
       node.classList.toggle("failed", status === "failed" && position === index);
     });
+  }
+
+  function setStepTime(step, value) {
+    const node = document.querySelector(`[data-step="${step}"] time`);
+    if (node) node.textContent = milliseconds(value);
   }
 
   function startTrace() {
@@ -101,13 +107,45 @@
     elements.store.innerHTML = "<p>等待模型回答完成…</p>";
     document.querySelectorAll(".trace-step time").forEach((item) => { item.textContent = "—"; });
     setStep("extract");
-    let index = 0;
-    const stages = ["extract", "retrieve", "prompt", "generate"];
     clearInterval(state.timer);
-    state.timer = setInterval(() => {
-      index = Math.min(index + 1, stages.length - 1);
-      setStep(stages[index]);
-    }, 850);
+  }
+
+  function renderExtraction(extraction) {
+    elements.topic.innerHTML = `<div class="topic-grid"><div><small>主题</small><strong>${escapeHtml(extraction.topic || "—")}</strong></div><div><small>核心实体</small><strong>${escapeHtml(extraction.core_entity || "—")}</strong></div><div><small>意图</small><strong>${escapeHtml(extraction.intent || "—")}</strong></div><div><small>置信度</small><strong>${Math.round(Number(extraction.confidence || 0) * 100)}%</strong></div><div><small>相关实体</small><strong>${escapeHtml((extraction.entities || []).join("、") || "—")}</strong></div></div>`;
+  }
+
+  function renderRetrieval(retrieval) {
+    elements.retrieval.innerHTML = `<div class="retrieval-counts"><span><b>${retrieval.experiences?.length || 0}</b>Experience</span><span><b>${retrieval.segments?.length || 0}</b>Segment</span><span><b>${retrieval.qas?.length || 0}</b>QA</span></div>`;
+  }
+
+  function renderStored(stored) {
+    elements.store.innerHTML = `<div class="store-path"><code title="${escapeHtml(stored.experience_id)}">${escapeHtml(stored.experience_id || "—")}</code><i>→</i><code title="${escapeHtml(stored.segment_id)}">${escapeHtml(stored.segment_id || "—")}</code><i>→</i><code title="${escapeHtml(stored.qa_id)}">${escapeHtml(stored.qa_id || "—")}</code></div>`;
+  }
+
+  function updateTraceEvent(event) {
+    if (event.event === "stage_started") {
+      setStep(event.stage);
+      if (event.stage === "extract") elements.topic.innerHTML = `<p>正在读取最近 ${event.history_turn_count || 0} 轮会话历史并分析主题…</p>`;
+      if (event.stage === "retrieve") elements.retrieval.innerHTML = "<p>正在按主题、核心实体和意图检索 HESM 记忆…</p>";
+      if (event.stage === "prompt") elements.promptPreview.textContent = "正在拼接 HESM 检索内容和当前问题…";
+      if (event.stage === "generate") elements.answerPreview.textContent = "正在调用回答模型…";
+      if (event.stage === "store") elements.store.innerHTML = "<p>正在写入 QA、Segment 与 Experience…</p>";
+      return;
+    }
+    if (event.event !== "stage_completed") return;
+    setStep(event.stage, "completed");
+    setStepTime(event.stage, event.timing_ms);
+    if (event.stage === "extract") renderExtraction(event.extraction || {});
+    if (event.stage === "retrieve") renderRetrieval(event.retrieval || {});
+    if (event.stage === "prompt") {
+      elements.promptPreview.textContent = `已拼接 HESM 检索内容与当前问题，其中包含 ${event.retrieval_qa_count || 0} 条 QA 证据。`;
+      elements.promptText.textContent = event.prompt || "";
+    }
+    if (event.stage === "generate") {
+      elements.answerPreview.textContent = event.answer || "—";
+      elements.model.textContent = event.model || "Answer model";
+    }
+    if (event.stage === "store") renderStored(event.stored?.memories?.[0] || {});
   }
 
   function renderTrace(result) {
@@ -117,13 +155,13 @@
     const retrieval = result.retrieval || {};
     const stored = result.stored?.memories?.[0] || {};
     elements.total.textContent = milliseconds(timing.chat_total_ms);
-    elements.topic.innerHTML = `<div class="topic-grid"><div><small>主题</small><strong>${escapeHtml(extraction.topic || "—")}</strong></div><div><small>核心实体</small><strong>${escapeHtml(extraction.core_entity || "—")}</strong></div><div><small>意图</small><strong>${escapeHtml(extraction.intent || "—")}</strong></div><div><small>置信度</small><strong>${Math.round(Number(extraction.confidence || 0) * 100)}%</strong></div><div><small>相关实体</small><strong>${escapeHtml((extraction.entities || []).join("、") || "—")}</strong></div></div>`;
-    elements.retrieval.innerHTML = `<div class="retrieval-counts"><span><b>${retrieval.experiences?.length || 0}</b>Experience</span><span><b>${retrieval.segments?.length || 0}</b>Segment</span><span><b>${retrieval.qas?.length || 0}</b>QA</span></div>`;
+    renderExtraction(extraction);
+    renderRetrieval(retrieval);
     elements.promptPreview.textContent = `已拼接 HESM 检索内容与当前问题，其中包含 ${retrieval.qas?.length || 0} 条 QA 证据。`;
     elements.promptText.textContent = result.prompt || "";
     elements.answerPreview.textContent = result.answer || "—";
     elements.model.textContent = result.model || "Answer model";
-    elements.store.innerHTML = `<div class="store-path"><code title="${escapeHtml(stored.experience_id)}">${escapeHtml(stored.experience_id || "—")}</code><i>→</i><code title="${escapeHtml(stored.segment_id)}">${escapeHtml(stored.segment_id || "—")}</code><i>→</i><code title="${escapeHtml(stored.qa_id)}">${escapeHtml(stored.qa_id || "—")}</code></div>`;
+    renderStored(stored);
     const values = {
       extract: timing.topic_extraction_ms, retrieve: timing.retrieval_ms,
       prompt: timing.prompt_assembly_ms, generate: timing.generation_ms,
@@ -133,6 +171,46 @@
       document.querySelector(`[data-step="${key}"] time`).textContent = milliseconds(value);
     });
     setStep("store", "done");
+  }
+
+  async function streamRequest(url, body, onEvent) {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail || `HTTP ${response.status}`);
+    }
+    if (!response.body) throw new Error("当前浏览器不支持流式响应");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let finalResult = null;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const event = JSON.parse(line);
+        if (event.event === "error") throw new Error(event.message || "对话执行失败");
+        onEvent(event);
+        if (event.event === "final") finalResult = event.result;
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      const event = JSON.parse(buffer);
+      if (event.event === "error") throw new Error(event.message || "对话执行失败");
+      onEvent(event);
+      if (event.event === "final") finalResult = event.result;
+    }
+    if (!finalResult) throw new Error("服务端未返回最终回答");
+    return finalResult;
   }
 
   function cacheCurrentHistory() {
@@ -182,13 +260,11 @@
     const typing = addTyping();
     startTrace();
     try {
-      const payload = await request("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message, history: state.history.slice(-20), state_key: state.stateKey,
-          session_id: state.stateKey,
-        }),
+      const payload = await streamRequest("/api/chat/stream", {
+        message,
+        session_id: state.stateKey,
+      }, (event) => {
+        updateTraceEvent(event);
       });
       typing.remove();
       addMessage("assistant", payload.answer, `<span class="stored-chip">已存入 HESM</span><span>${milliseconds(payload.timing?.chat_total_ms)}</span>`);

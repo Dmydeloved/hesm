@@ -10,7 +10,7 @@ from threading import Lock, RLock
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -431,8 +431,8 @@ def root() -> RedirectResponse:
 
 
 @app.get("/favicon.ico", include_in_schema=False)
-def favicon() -> Response:
-    return Response(status_code=204)
+def favicon() -> RedirectResponse:
+    return RedirectResponse("/favicon.svg?v=1")
 
 
 @app.get("/api/health")
@@ -567,6 +567,24 @@ def chat(request: ChatRequest) -> dict[str, Any]:
     except Exception as error:
         LOGGER.exception("HESM chat failed")
         raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@app.post("/api/chat/stream")
+def chat_stream(request: ChatRequest) -> StreamingResponse:
+    def stream() -> Any:
+        try:
+            payload = request.model_dump()
+            payload["history"] = [item for item in payload["history"]]
+            for event in get_service().chat_events(**payload):
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+        except Exception as error:
+            LOGGER.exception("HESM streaming chat failed")
+            yield json.dumps(
+                {"event": "error", "message": str(error)},
+                ensure_ascii=False,
+            ) + "\n"
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
 @app.on_event("shutdown")

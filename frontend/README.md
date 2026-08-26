@@ -29,7 +29,7 @@ python -m service.server
 
 耗时面板展示主题提取、Experience/上下文查询和响应组装的真实耗时。
 
-智能对话页面执行“主题提取 → HESM 检索 → Prompt 拼接 → LLM 回答 → 记忆存储”。每轮成功回答会作为 QA 写入 HESM；`tools_json` 只保存真实工具调用，不混入检索诊断。
+智能对话页面执行“主题提取 → HESM 检索 → Prompt 拼接 → LLM 回答 → 记忆存储”。前端只提交 `session_id` 和当前消息，服务端会从 `chat_session` 中读取最近 5 轮历史用于主题提取；最终回答 Prompt 仍只使用 HESM 检索内容和当前问题。每轮成功回答会作为 QA 写入 HESM；`tools_json` 只保存真实工具调用，不混入检索诊断。
 
 聊天历史由独立的 `chat_session` 表管理，并保留浏览器本地缓存作为离线回退。刷新页面后会通过 `session_id` 自动恢复；“新建会话”会生成独立的会话标识，页面左侧可以切换或归档已保存会话。该表只负责会话历史，不改变 Experience、Segment、QA 的业务逻辑。
 
@@ -43,6 +43,7 @@ python -m service.server
 - `POST /api/memories`
 - `POST /api/retrieve`
 - `POST /api/chat`
+- `POST /api/chat/stream`
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `GET/PATCH/DELETE /api/sessions/{session_id}`

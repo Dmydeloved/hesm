@@ -16,7 +16,7 @@ _llm_profiles:
   nano: &nano_llm
     <<: *llm_connection
     model: gpt-5.4-nano-high
-topic_extraction: *nano_llm
+topic_extraction: *strong_llm
 
 embedding: &embedding_defaults
   api_key: "sk-29434e233c3e437281144cd9e2a1f04f"
