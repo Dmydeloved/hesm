@@ -45,11 +45,24 @@ class ExperienceRecaller:
         intent = str(intent or "").strip()
         if not topic or not core_entity or not query:
             raise ValueError("topic, core_entity and query must not be empty")
+        logger.info(
+            "Experience recall started topic=%s core_entity=%s intent=%s query=%s",
+            topic,
+            core_entity,
+            intent,
+            query,
+        )
 
         sql_rows = self.storage.search_completed_experiences(
             topic=topic,
             core_entity=core_entity,
             limit=3,
+        )
+        logger.info(
+            "Experience recall SQLite completed topic=%s core_entity=%s count=%s",
+            topic,
+            core_entity,
+            len(sql_rows),
         )
 
         query_text = f"主题：{topic}\n核心实体：{core_entity}\n查询：{query}"
@@ -60,6 +73,12 @@ class ExperienceRecaller:
                 memory_type="experience",
                 top_k=3,
                 metadata_filter={"status": "completed"},
+            )
+            logger.info(
+                "Experience recall vector completed topic=%s core_entity=%s count=%s",
+                topic,
+                core_entity,
+                len(vector_items),
             )
         except Exception:
             logger.warning("Experience vector recall failed", exc_info=True)
@@ -126,6 +145,11 @@ class ExperienceRecaller:
                 )
             except Exception:
                 prompt_tokens = max(1, (len(prompt) + 3) // 4)
+                logger.info(
+                    "tiktoken.get_encoding failed; switched to length fallback token estimate prompt_tokens=%s",
+                    prompt_tokens,
+                    exc_info=True,
+                )
 
             fallback_payload = {
                 "relevance_score": 0.0,
@@ -145,7 +169,9 @@ class ExperienceRecaller:
 
                 llm_called = True
                 response_text = LLMSummarizer()._generate_summary(
-                    prompt, fallback=fallback
+                    prompt,
+                    fallback=fallback,
+                    task="historical_experience_recall",
                 ).strip()
                 parsed = json.loads(response_text)
                 history_experience = (
@@ -159,11 +185,20 @@ class ExperienceRecaller:
                     "Experience summary compression failed; using fallback",
                     exc_info=True,
                 )
-        print(
-            "检索结果：experiences:"
-            f"{json.dumps(experience_map, ensure_ascii=False, indent=2)}\n"
-            "history_experience:"
-            f"{json.dumps(history_experience, ensure_ascii=False, indent=2)}"
+        total_ms = round((time.perf_counter() - started_at) * 1000, 3)
+        logger.info(
+            "Experience recall completed topic=%s core_entity=%s sqlite_candidates=%s chroma_candidates=%s merged_experiences=%s llm_called=%s llm_fallback=%s prompt_tokens=%s total_ms=%s experiences=%s history_experience=%s",
+            topic,
+            core_entity,
+            len(sql_rows),
+            chroma_candidates,
+            len(experience_map),
+            llm_called,
+            llm_fallback,
+            prompt_tokens,
+            total_ms,
+            json.dumps(experience_map, ensure_ascii=False, indent=2),
+            json.dumps(history_experience, ensure_ascii=False, indent=2),
         )
         return {
             "experiences": experience_map,
@@ -176,9 +211,7 @@ class ExperienceRecaller:
                 "llm_fallback": llm_fallback,
                 "prompt": prompt,
                 "prompt_tokens": prompt_tokens,
-                "total_recall_ms": round(
-                    (time.perf_counter() - started_at) * 1000, 3
-                ),
+                "total_recall_ms": total_ms,
             },
         }
 

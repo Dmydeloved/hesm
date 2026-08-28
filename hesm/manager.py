@@ -72,6 +72,13 @@ class MemoryManager:
             core_entity,
             intent,
         )
+        logger.info(
+            "Memory add payload state=%s user_input=%s assistant_output=%s topic_result=%s",
+            state_key,
+            user_input,
+            assistant_output,
+            json.dumps(topic_result, ensure_ascii=False),
+        )
 
         try:
             current_experience, current_segment = self.route_experience(
@@ -146,6 +153,14 @@ class MemoryManager:
             self.storage.update_experience(current_experience)
             self.upsert_experience_vector(current_experience["experience_id"])
             self.storage.commit()
+            logger.info(
+                "Memory add committed state=%s qa_id=%s segment_id=%s experience_id=%s action=%s",
+                state_key,
+                qa["qa_id"],
+                current_segment["segment_id"],
+                current_experience["experience_id"],
+                action,
+            )
             return {
                 "qa_id": qa["qa_id"],
                 "segment_id": current_segment["segment_id"],
@@ -169,12 +184,27 @@ class MemoryManager:
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """路由 Experience，并返回其最新 Segment（若不存在则为 ``None``）。"""
         timestamp = format_timestamp(timestamp)
+        logger.info(
+            "Route experience started state_key=%s topic=%s core_entity=%s intent=%s query=%s",
+            state_key,
+            topic,
+            core_entity,
+            intent,
+            query,
+        )
         runtime = self.storage.get_runtime_state(state_key)
         current_experience = self.storage.get_experience(
             runtime["current_experience_id"] if runtime else None
         )
         current_segment = self.storage.get_segment(
             runtime["current_segment_id"] if runtime else None
+        )
+        logger.info(
+            "Route runtime loaded state_key=%s runtime=%s current_experience_id=%s current_segment_id=%s",
+            state_key,
+            json.dumps(runtime or {}, ensure_ascii=False),
+            (current_experience or {}).get("experience_id", ""),
+            (current_segment or {}).get("segment_id", ""),
         )
 
         # runtime 中的 Segment 必须属于当前 Experience，避免复用失效指针。
@@ -184,10 +214,22 @@ class MemoryManager:
             and current_segment.get("experience_id")
             != current_experience.get("experience_id")
         ):
+            logger.info(
+                "Route discarded stale segment state_key=%s segment_id=%s experience_id=%s expected_experience_id=%s",
+                state_key,
+                current_segment.get("segment_id", ""),
+                current_segment.get("experience_id", ""),
+                current_experience.get("experience_id", ""),
+            )
             current_segment = None
 
         # 当前 Experience 不可复用时，依次尝试关系库、路由向量和新建流程。
         if not self._same_experience(current_experience, topic, core_entity):
+            logger.info(
+                "Route current experience not reusable state_key=%s current_experience_id=%s",
+                state_key,
+                (current_experience or {}).get("experience_id", ""),
+            )
             if current_segment:
                 current_segment["status"] = "completed"
                 self._summarize_segment(
@@ -232,6 +274,13 @@ class MemoryManager:
                     timestamp=timestamp,
                 )
                 current_segment = None
+        else:
+            logger.info(
+                "Route reused current experience state_key=%s experience_id=%s segment_id=%s",
+                state_key,
+                current_experience.get("experience_id", ""),
+                (current_segment or {}).get("segment_id", ""),
+            )
 
 
         self.storage.upsert_runtime_state(
@@ -239,6 +288,12 @@ class MemoryManager:
             current_experience_id=current_experience["experience_id"],
             current_segment_id=current_segment["segment_id"] if current_segment else "",
             updated_at=timestamp,
+        )
+        logger.info(
+            "Route experience completed state_key=%s experience_id=%s segment_id=%s",
+            state_key,
+            current_experience["experience_id"],
+            current_segment["segment_id"] if current_segment else "",
         )
         return current_experience, current_segment
 
@@ -373,11 +428,25 @@ class MemoryManager:
     def _maybe_summarize_segment_by_threshold(self, segment: dict[str, Any], now: str) -> None:
         qa_count = len(segment["qa_ids"])
         if qa_count - segment["last_summarized_qa_count"] >= self.segment_summary_qa_threshold:
+            logger.info(
+                "Segment summary threshold reached segment_id=%s qa_count=%s last_summarized=%s threshold=%s",
+                segment.get("segment_id", ""),
+                qa_count,
+                segment.get("last_summarized_qa_count", 0),
+                self.segment_summary_qa_threshold,
+            )
             self._summarize_segment(segment, now, reason="qa_threshold")
 
     def _maybe_summarize_experience_by_threshold(self, experience: dict[str, Any], now: str) -> None:
         segment_count = len(experience["segment_ids"])
         if segment_count - experience["last_summarized_segment_count"] >= self.experience_summary_segment_threshold:
+            logger.info(
+                "Experience summary threshold reached experience_id=%s segment_count=%s last_summarized=%s threshold=%s",
+                experience.get("experience_id", ""),
+                segment_count,
+                experience.get("last_summarized_segment_count", 0),
+                self.experience_summary_segment_threshold,
+            )
             self._summarize_experience(experience, now, reason="segment_threshold")
 
     def _summarize_segment(self, segment: dict[str, Any], now: str, reason: str) -> None:
@@ -387,7 +456,18 @@ class MemoryManager:
         ]
         qa_items = [qa for qa in qa_items if qa]
         if not qa_items:
+            logger.info(
+                "Segment summary skipped because no QA items segment_id=%s reason=%s",
+                segment.get("segment_id", ""),
+                reason,
+            )
             return
+        logger.info(
+            "Segment summary invoking summarizer segment_id=%s reason=%s qa_count=%s",
+            segment.get("segment_id", ""),
+            reason,
+            len(qa_items),
+        )
         summary = self.summarizer.summarize_segment(segment, qa_items)
         segment["summary"] = self._summary_object(summary)
         summary_state = segment["summary"].get("state") or {}
@@ -412,6 +492,12 @@ class MemoryManager:
             for segment_id in experience.get("segment_ids", [])
         ]
         segments = [segment for segment in segments if segment]
+        logger.info(
+            "Experience summary invoking summarizer experience_id=%s reason=%s segment_count=%s",
+            experience.get("experience_id", ""),
+            reason,
+            len(segments),
+        )
         summary = self.summarizer.summarize_experience(experience, segments)
         experience["summary"] = self._summary_object(summary)
         current_state = experience["summary"].get("current_state") or {}
@@ -569,17 +655,50 @@ class MemoryManager:
         3. 当前 Segment 已积累了足够的 QA（>= min_segment_qas）
         """
         if segment.get("status") != "open":
+            logger.info(
+                "Segment cut because status is not open segment_id=%s status=%s",
+                segment.get("segment_id", ""),
+                segment.get("status", ""),
+            )
             return True
 
         if segment["intent"] == intent:
+            logger.info(
+                "Segment retained because intent is unchanged segment_id=%s intent=%s",
+                segment.get("segment_id", ""),
+                intent,
+            )
             return False
 
-        if self._intent_similarity(segment["intent"], intent) >= 0.8:
+        similarity = self._intent_similarity(segment["intent"], intent)
+        if similarity >= 0.8:
+            logger.info(
+                "Segment retained because intent similarity is high segment_id=%s old_intent=%s new_intent=%s similarity=%.3f",
+                segment.get("segment_id", ""),
+                segment["intent"],
+                intent,
+                similarity,
+            )
             return False
 
         if len(segment.get("qa_ids") or []) < self.min_segment_qas:
+            logger.info(
+                "Segment retained because QA count is below threshold segment_id=%s qa_count=%s min_segment_qas=%s similarity=%.3f",
+                segment.get("segment_id", ""),
+                len(segment.get("qa_ids") or []),
+                self.min_segment_qas,
+                similarity,
+            )
             return False
 
+        logger.info(
+            "Segment cut because intent changed segment_id=%s old_intent=%s new_intent=%s qa_count=%s similarity=%.3f",
+            segment.get("segment_id", ""),
+            segment["intent"],
+            intent,
+            len(segment.get("qa_ids") or []),
+            similarity,
+        )
         return True
 
     @staticmethod

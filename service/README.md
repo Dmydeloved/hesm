@@ -13,3 +13,7 @@
 ```powershell
 python -m service.server
 ```
+
+运行日志统一写入项目根目录的 `logs/`，文件名格式为
+`hesm-YYYY-MM-DD.log`。服务跨过午夜后会自动切换到新日期文件，并保留最近
+30 天日志。每条日志包含时间、等级、源文件名、行号、logger 名称和消息。

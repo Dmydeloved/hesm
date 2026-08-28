@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_INSTRUCTION = """你是一个使用 HESM 长期记忆的智能助手。
@@ -58,9 +62,15 @@ class LLMAnswerer:
         self.retry_delay = max(0.0, float(retry_delay))
 
     def answer(self, prompt: str) -> str:
+        logger.info("Chat answer LLM prompt model=%s prompt=%s", self.model, prompt)
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
+                logger.info(
+                    "Chat answer LLM request model=%s attempt=%s",
+                    self.model,
+                    attempt,
+                )
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
@@ -69,11 +79,30 @@ class LLMAnswerer:
                 content = (response.choices[0].message.content or "").strip()
                 if not content:
                     raise ValueError("Answer model returned empty content")
+                logger.info(
+                    "Chat answer LLM response model=%s attempt=%s content=%s",
+                    self.model,
+                    attempt,
+                    content,
+                )
                 return content
             except Exception as error:
                 last_error = error
+                logger.warning(
+                    "Chat answer LLM attempt failed model=%s attempt=%s/%s",
+                    self.model,
+                    attempt,
+                    self.max_retries,
+                    exc_info=True,
+                )
                 if attempt < self.max_retries:
                     time.sleep(self.retry_delay * attempt)
+        logger.error(
+            "Chat answer generation failed after retries model=%s attempts=%s error=%s",
+            self.model,
+            self.max_retries,
+            last_error,
+        )
         raise RuntimeError(
             f"Chat answer generation failed after {self.max_retries} attempts: {last_error}"
         ) from last_error

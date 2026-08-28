@@ -15,11 +15,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from hesm.config import PROJECT_ROOT, config_path
+from hesm.logging_config import configure_logging
 from hesm.session import SessionManager
 from hesm.storage import MemoryStorage
 from service.hesm_service import HESMService
 
 
+configure_logging()
 LOGGER = logging.getLogger("hesm.service")
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 DATABASE_PATH = config_path("paths", "memory_db")

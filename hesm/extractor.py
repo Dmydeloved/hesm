@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ DEFAULT_PROMPT_PATH = DEFAULT_EXTRACTOR_PROMPT_PATH
 
 TopicRecord = dict[str, Any]
 TopicResult = TopicRecord | list[TopicRecord]
+logger = logging.getLogger(__name__)
 
 
 def load_prompt_template(path: str | Path | None = None) -> str:
@@ -185,20 +187,55 @@ class TopicExtractor:
             domain_knowledge,
             prompt_path=self.prompt_path,
         )
+        logger.info(
+            "Topic extraction LLM prompt model=%s prompt=%s",
+            self.model,
+            prompt,
+        )
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
+                logger.info(
+                    "Topic extraction LLM request model=%s attempt=%s",
+                    self.model,
+                    attempt,
+                )
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
                 )
                 content = (response.choices[0].message.content or "").strip()
-                return validate_topic_result(parse_topic_response(content))
+                logger.info(
+                    "Topic extraction LLM response model=%s attempt=%s content=%s",
+                    self.model,
+                    attempt,
+                    content,
+                )
+                result = validate_topic_result(parse_topic_response(content))
+                logger.info(
+                    "Topic extraction parsed result model=%s result=%s",
+                    self.model,
+                    json.dumps(result, ensure_ascii=False),
+                )
+                return result
             except Exception as error:
                 last_error = error
+                logger.warning(
+                    "Topic extraction LLM attempt failed model=%s attempt=%s/%s",
+                    self.model,
+                    attempt,
+                    self.max_retries,
+                    exc_info=True,
+                )
                 if attempt < self.max_retries:
                     time.sleep(self.retry_delay * attempt)
+        logger.error(
+            "Topic extraction failed after retries model=%s attempts=%s error=%s",
+            self.model,
+            self.max_retries,
+            last_error,
+        )
         raise RuntimeError(
             f"Topic extraction failed after {self.max_retries} attempts: {last_error}"
         ) from last_error

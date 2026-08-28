@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any, Protocol
@@ -15,6 +16,9 @@ from .prompts.topic_memory import (
 from .config import get as config_get
 
 from collections import Counter
+
+
+logger = logging.getLogger(__name__)
 
 
 class SummarizerProtocol(Protocol):
@@ -189,7 +193,16 @@ class LLMSummarizer:
             self._normalized_qas(qa_items),
             prompt_path=self.segment_prompt_path,
         )
-        return self._generate_summary(prompt, fallback=TemplateSummarizer().summarize_segment(segment, qa_items))
+        logger.info(
+            "Segment summary started segment_id=%s qa_count=%s",
+            segment.get("segment_id", ""),
+            len(qa_items),
+        )
+        return self._generate_summary(
+            prompt,
+            fallback=TemplateSummarizer().summarize_segment(segment, qa_items),
+            task="segment_summary",
+        )
 
     def summarize_experience(
         self, experience: dict[str, Any], segments: list[dict[str, Any]]
@@ -199,32 +212,94 @@ class LLMSummarizer:
             self._normalized_segments(segments),
             prompt_path=self.experience_prompt_path,
         )
+        logger.info(
+            "Experience summary started experience_id=%s segment_count=%s",
+            experience.get("experience_id", ""),
+            len(segments),
+        )
         return self._generate_summary(
             prompt,
             fallback=TemplateSummarizer().summarize_experience(experience, segments),
+            task="experience_summary",
         )
 
-    def _generate_summary(self, prompt: str, fallback: str) -> str:
+    def _generate_summary(
+        self,
+        prompt: str,
+        fallback: str,
+        task: str = "summary",
+    ) -> str:
+        logger.info(
+            "Summary LLM prompt task=%s model=%s prompt=%s",
+            task,
+            self.model,
+            prompt,
+        )
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
+                logger.info(
+                    "Summary LLM request task=%s model=%s attempt=%s",
+                    task,
+                    self.model,
+                    attempt,
+                )
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
                 )
                 content = (response.choices[0].message.content or "").strip()
+                logger.info(
+                    "Summary LLM response task=%s model=%s attempt=%s content=%s",
+                    task,
+                    self.model,
+                    attempt,
+                    content,
+                )
                 summary = parse_summary_response(content)
                 if summary:
+                    logger.info(
+                        "Summary parsed task=%s model=%s summary=%s",
+                        task,
+                        self.model,
+                        summary,
+                    )
                     return summary
+                logger.warning(
+                    "Summary LLM returned empty parsed summary task=%s model=%s attempt=%s",
+                    task,
+                    self.model,
+                    attempt,
+                )
             except Exception as error:
                 last_error = error
+                logger.warning(
+                    "Summary LLM attempt failed task=%s model=%s attempt=%s/%s",
+                    task,
+                    self.model,
+                    attempt,
+                    self.max_retries,
+                    exc_info=True,
+                )
                 if attempt < self.max_retries:
                     time.sleep(self.retry_delay * attempt)
 
         if last_error is not None:
-            print(f"segment summary error:{str(last_error)}")
+            logger.warning(
+                "Summary generation failed; using fallback task=%s model=%s error=%s fallback=%s",
+                task,
+                self.model,
+                last_error,
+                fallback,
+            )
             return fallback
+        logger.info(
+            "Summary generation empty after retries; using fallback task=%s model=%s fallback=%s",
+            task,
+            self.model,
+            fallback,
+        )
         return fallback
 
     def _normalized_qas(self, qa_items: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from pathlib import Path
 import pickle
@@ -11,6 +12,9 @@ import uuid
 
 from .config import config_path
 from .time_utils import format_timestamp
+
+
+logger = logging.getLogger(__name__)
 
 try:
     import chromadb
@@ -98,6 +102,12 @@ def _normalize_chroma_sqlite_timestamps(sqlite_path: Path) -> int:
                     )
                     changed += 1
         connection.commit()
+        if changed:
+            logger.info(
+                "Normalized Chroma SQLite timestamp metadata path=%s changed=%s",
+                sqlite_path,
+                changed,
+            )
         return changed
     finally:
         connection.close()
@@ -483,10 +493,21 @@ class ChromaVectorStore:
         read_only: bool = False,
     ) -> None:
         self.persist_path = Path(persist_path) if persist_path is not None else config_path("paths", "chroma")
+        logger.info(
+            "Initializing vector store persist_path=%s collection=%s ephemeral=%s read_only=%s",
+            self.persist_path,
+            collection_name,
+            ephemeral,
+            read_only,
+        )
         if read_only:
             self.client = None
             self.collection = _PersistentReadOnlyCollection(
                 self.persist_path / "chroma.sqlite3"
+            )
+            logger.info(
+                "Vector store initialized in read-only mode count=%s",
+                self.collection.count(),
             )
             return
         if not ephemeral:
@@ -501,6 +522,11 @@ class ChromaVectorStore:
                 if ephemeral
                 else _PersistentQueueBackedCollection(self.persist_path / "chroma.sqlite3")
             )
+            logger.info(
+                "Chroma unavailable; vector store switched to fallback collection ephemeral=%s count=%s",
+                ephemeral,
+                self.collection.count(),
+            )
             return
         self.client = (
             chromadb.EphemeralClient()
@@ -511,6 +537,11 @@ class ChromaVectorStore:
             collection_name = f"{collection_name}_{uuid.uuid4().hex}"
         self.collection = self.client.get_or_create_collection(
             name=collection_name, metadata={"hnsw:space": "cosine"}
+        )
+        logger.info(
+            "Vector store initialized collection=%s count=%s",
+            collection_name,
+            self.collection.count(),
         )
 
     def upsert(
@@ -544,11 +575,23 @@ class ChromaVectorStore:
                     if isinstance(value, (list, dict))
                     else value
                 )
+        logger.info(
+            "Vector upsert started memory_type=%s memory_id=%s text_length=%s metadata=%s",
+            memory_type,
+            memory_id,
+            len(text),
+            json.dumps(vector_metadata, ensure_ascii=False),
+        )
         self.collection.upsert(
             ids=[f"{memory_type}:{memory_id}"],
             documents=[text],
             embeddings=[embedding],
             metadatas=[vector_metadata],
+        )
+        logger.info(
+            "Vector upsert completed memory_type=%s memory_id=%s",
+            memory_type,
+            memory_id,
         )
 
     def normalize_timestamps(self) -> int:
@@ -584,6 +627,7 @@ class ChromaVectorStore:
                 ids=changed_ids,
                 metadatas=changed_metadatas,
             )
+        logger.info("Vector timestamp normalization completed changed=%s", len(changed_ids))
         return len(changed_ids)
 
     def query(
@@ -596,6 +640,7 @@ class ChromaVectorStore:
         if memory_type not in MEMORY_TYPES:
             raise ValueError(f"Unsupported memory type: {memory_type}")
         if self.collection.count() == 0:
+            logger.info("Vector query skipped because collection is empty memory_type=%s", memory_type)
             return []
         filters: list[dict[str, Any]] = [{"memory_type": memory_type}]
         for key, value in (metadata_filter or {}).items():
@@ -619,6 +664,13 @@ class ChromaVectorStore:
                 "distance": distance,
                 "similarity": max(0.0, min(1.0, 1.0 - distance)),
             })
+        logger.info(
+            "Vector query completed memory_type=%s top_k=%s metadata_filter=%s result_count=%s",
+            memory_type,
+            top_k,
+            json.dumps(metadata_filter or {}, ensure_ascii=False),
+            len(items),
+        )
         return items
 
     def count(self) -> int:

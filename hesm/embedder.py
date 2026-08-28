@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import re
 from typing import Any, Protocol
 
 from .config import get as config_get
+
+
+logger = logging.getLogger(__name__)
 
 
 TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9_]+")
@@ -40,8 +44,20 @@ class BailianEmbedder:
     def embed(self, text: str) -> list[float]:
         if not text.strip():
             raise ValueError("Embedding text cannot be empty.")
+        logger.info(
+            "Embedding request model=%s text_length=%s text=%s",
+            self.model,
+            len(text),
+            text,
+        )
         response = self.client.embeddings.create(model=self.model, input=text)
-        return list(response.data[0].embedding)
+        embedding = list(response.data[0].embedding)
+        logger.info(
+            "Embedding response model=%s dimension=%s",
+            self.model,
+            len(embedding),
+        )
+        return embedding
 
 
 class HashingEmbedder:

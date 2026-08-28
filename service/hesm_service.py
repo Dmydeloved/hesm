@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from threading import RLock
 import time
@@ -12,6 +13,7 @@ from hesm.chat import LLMAnswerer, build_chat_prompt
 from hesm.config import PROJECT_ROOT, load_config
 from hesm.embedder import BailianEmbedder
 from hesm.extractor import TopicExtractor
+from hesm.logging_config import configure_logging
 from hesm.manager import MemoryManager
 from hesm.recaller import ExperienceRecaller
 from hesm.retriever import HybridRetriever
@@ -21,12 +23,17 @@ from hesm.summarizer import LLMSummarizer
 from hesm.vector_store import ChromaVectorStore
 
 
+logger = logging.getLogger(__name__)
+
+
 class HESMService:
     """Own all production HESM components behind two public operations."""
 
     def __init__(self, config_path: str | Path | None = None) -> None:
+        configure_logging()
         self.config = load_config(config_path)
         self._lock = RLock()
+        logger.info("Initializing HESMService config_path=%s", config_path or "default")
 
         paths = self.config.get("paths", {})
         database_path = self._project_path(paths.get("memory_db", "memory/hesm.sqlite3"))
@@ -99,6 +106,12 @@ class HESMService:
             retry_delay=float(chat_config.get("retry_delay", 2.0)),
         )
         self.chat_model = str(chat_config.get("model") or "")
+        logger.info(
+            "HESMService initialized db=%s chroma=%s chat_model=%s",
+            database_path,
+            chroma_path,
+            self.chat_model,
+        )
 
     def add_memory(
         self,
@@ -115,6 +128,11 @@ class HESMService:
         text = str(user_input).strip()
         if not text:
             raise ValueError("user_input must not be empty")
+        logger.info(
+            "Add memory started state_key=%s user_input=%s",
+            state_key,
+            text,
+        )
         with self._lock:
             extracted = topic_result or self.extractor.extract(
                 user_input=text,
@@ -123,6 +141,11 @@ class HESMService:
             topic_results = extracted if isinstance(extracted, list) else [extracted]
             if not topic_results or not all(isinstance(item, dict) for item in topic_results):
                 raise ValueError("Topic extraction returned no valid records")
+            logger.info(
+                "Add memory topic extraction result state_key=%s topic_results=%s",
+                state_key,
+                json.dumps(topic_results, ensure_ascii=False),
+            )
             memories = [
                 self.manager.add_qa(
                     topic_result=item,
@@ -134,6 +157,12 @@ class HESMService:
                 )
                 for item in topic_results
             ]
+        logger.info(
+            "Add memory completed state_key=%s memory_count=%s memories=%s",
+            state_key,
+            len(memories),
+            json.dumps(memories, ensure_ascii=False),
+        )
         return {
             "memories": memories,
             "topic_results": topic_results,
@@ -151,6 +180,7 @@ class HESMService:
         text = str(question).strip()
         if not text:
             raise ValueError("question must not be empty")
+        logger.info("Retrieve started state_key=%s question=%s", state_key, text)
         started_at = time.perf_counter()
         with self._lock:
             extraction_started_at = time.perf_counter()
@@ -165,6 +195,12 @@ class HESMService:
             if not candidates or not isinstance(candidates[0], dict):
                 raise ValueError("Topic extraction returned no valid query")
             primary = candidates[0]
+            logger.info(
+                "Retrieve extraction completed state_key=%s timing_ms=%s extraction=%s",
+                state_key,
+                extraction_ms,
+                json.dumps(primary, ensure_ascii=False),
+            )
             retrieval_started_at = time.perf_counter()
             result = self.retriever.retriever(
                 topic=str(primary.get("topic") or ""),
@@ -176,7 +212,16 @@ class HESMService:
             retrieval_ms = round(
                 (time.perf_counter() - retrieval_started_at) * 1000, 3
             )
+            logger.info(
+                "Retrieve memory completed state_key=%s timing_ms=%s experience_count=%s segment_count=%s qa_count=%s",
+                state_key,
+                retrieval_ms,
+                len(result.get("experiences") or []),
+                len(result.get("segments") or []),
+                len(result.get("qas") or []),
+            )
         total_ms = round((time.perf_counter() - started_at) * 1000, 3)
+        logger.info("Retrieve completed state_key=%s total_ms=%s", state_key, total_ms)
         return {
             "question": text,
             "query_extraction": primary,
@@ -227,6 +272,12 @@ class HESMService:
         if not text:
             raise ValueError("message must not be empty")
         session_identifier = str(session_id or state_key or "web_chat")
+        logger.info(
+            "Chat events started session_id=%s state_key=%s message=%s",
+            session_identifier,
+            state_key,
+            text,
+        )
         session = self.sessions.ensure(session_identifier)
         persisted_history = session.get("messages") or []
         requested_history = history or []
@@ -269,6 +320,13 @@ class HESMService:
             if not candidates or not isinstance(candidates[0], dict):
                 raise ValueError("Topic extraction returned no valid query")
             primary = candidates[0]
+            logger.info(
+                "Chat extract completed session_id=%s timing_ms=%s extraction=%s candidates=%s",
+                session_identifier,
+                timings["topic_extraction_ms"],
+                json.dumps(primary, ensure_ascii=False),
+                json.dumps(candidates, ensure_ascii=False),
+            )
             yield {
                 "event": "stage_completed",
                 "stage": "extract",
@@ -300,6 +358,14 @@ class HESMService:
                 },
                 **retrieval_payload,
             }
+            logger.info(
+                "Chat retrieve completed session_id=%s timing_ms=%s experience_count=%s segment_count=%s qa_count=%s",
+                session_identifier,
+                timings["retrieval_ms"],
+                len(retrieval_payload.get("experiences") or []),
+                len(retrieval_payload.get("segments") or []),
+                len(retrieval_payload.get("qas") or []),
+            )
             yield {
                 "event": "stage_completed",
                 "stage": "retrieve",
@@ -316,6 +382,12 @@ class HESMService:
             timings["prompt_assembly_ms"] = round(
                 (time.perf_counter() - prompt_started_at) * 1000, 3
             )
+            logger.info(
+                "Chat prompt built session_id=%s timing_ms=%s prompt=%s",
+                session_identifier,
+                timings["prompt_assembly_ms"],
+                prompt,
+            )
             yield {
                 "event": "stage_completed",
                 "stage": "prompt",
@@ -330,6 +402,13 @@ class HESMService:
             answer = self.answerer.answer(prompt)
             timings["generation_ms"] = round(
                 (time.perf_counter() - generation_started_at) * 1000, 3
+            )
+            logger.info(
+                "Chat generation completed session_id=%s timing_ms=%s model=%s answer=%s",
+                session_identifier,
+                timings["generation_ms"],
+                self.chat_model,
+                answer,
             )
             yield {
                 "event": "stage_completed",
@@ -352,6 +431,12 @@ class HESMService:
                 state_key=session_identifier,
             )
             timings["storage_ms"] = round((time.perf_counter() - storage_started_at) * 1000, 3)
+            logger.info(
+                "Chat store completed session_id=%s timing_ms=%s stored=%s",
+                session_identifier,
+                timings["storage_ms"],
+                json.dumps(stored, ensure_ascii=False),
+            )
             self.sessions.append_turn(
                 session_identifier,
                 user_content=text,
@@ -410,6 +495,12 @@ class HESMService:
             "session_id": session_identifier,
             "history_turn_count": len(recent_turns),
         }
+        logger.info(
+            "Chat events completed session_id=%s total_ms=%s result=%s",
+            session_identifier,
+            total_ms,
+            json.dumps(result, ensure_ascii=False),
+        )
         yield {"event": "final", "result": result}
 
     def close(self) -> None:

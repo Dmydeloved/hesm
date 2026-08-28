@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from .manager import MemoryManager
+
+
+logger = logging.getLogger(__name__)
 
 
 def _experience_status(experience: dict[str, Any]) -> str:
@@ -98,6 +102,14 @@ class HybridRetriever:
         intent = str(intent or "").strip() or "查询"
         if not topic or not core_entity or not query:
             raise ValueError("topic, core_entity and query must not be empty")
+        logger.info(
+            "Hybrid retrieval started state_key=%s topic=%s core_entity=%s intent=%s query=%s",
+            state_key,
+            topic,
+            core_entity,
+            intent,
+            query,
+        )
 
         # 统一复用 MemoryManager 的路由规则和 runtime 维护逻辑。
         experience, _current_segment = self.manager.route_experience(
@@ -108,6 +120,12 @@ class HybridRetriever:
             query=query,
         )
         self.storage.commit()
+        logger.info(
+            "Hybrid retrieval routed state_key=%s experience_id=%s current_segment_id=%s",
+            state_key,
+            experience.get("experience_id", ""),
+            (_current_segment or {}).get("segment_id", ""),
+        )
 
         # 固定加载当前 Experience 下最近两个 Segment。
         latest_segments = self.storage.list_latest_segments(
@@ -136,6 +154,14 @@ class HybridRetriever:
 
         experiences = [experience]
         context = build_context_text(experiences, segments, qas)
+        logger.info(
+            "Hybrid retrieval completed state_key=%s experience_count=%s segment_count=%s qa_count=%s context=%s",
+            state_key,
+            len(experiences),
+            len(segments),
+            len(qas),
+            context,
+        )
         return {
             "experiences": experiences,
             "segments": segments,

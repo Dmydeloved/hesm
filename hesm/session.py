@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import uuid
 from pathlib import Path
@@ -10,6 +11,9 @@ from threading import RLock
 from typing import Any
 
 from .time_utils import format_timestamp
+
+
+logger = logging.getLogger(__name__)
 
 
 SESSION_SCHEMA = """
@@ -37,6 +41,7 @@ class SessionManager:
         with self._connect() as connection:
             connection.executescript(SESSION_SCHEMA)
             connection.commit()
+        logger.info("Session manager initialized database=%s", self.database_path.resolve())
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=15)
@@ -83,6 +88,7 @@ class SessionManager:
                 ),
             )
             connection.commit()
+        logger.info("Chat session created session_id=%s title=%s", identifier, title)
         return self.get(identifier)
 
     def ensure(self, session_id: str, title: str = "新会话") -> dict[str, Any]:
@@ -178,6 +184,12 @@ class SessionManager:
                 ),
             )
             connection.commit()
+        logger.info(
+            "Chat turn persisted session_id=%s user_content=%s assistant_content=%s",
+            session_id,
+            user_content,
+            assistant_content,
+        )
         return self.get(session_id)
 
     def rename(self, session_id: str, title: str) -> dict[str, Any]:
@@ -189,6 +201,7 @@ class SessionManager:
             if not cursor.rowcount:
                 raise KeyError(f"Session not found: {session_id}")
             connection.commit()
+        logger.info("Chat session renamed session_id=%s title=%s", session_id, title)
         return self.get(session_id)
 
     def archive(self, session_id: str) -> dict[str, Any]:
@@ -200,6 +213,7 @@ class SessionManager:
             if not cursor.rowcount:
                 raise KeyError(f"Session not found: {session_id}")
             connection.commit()
+        logger.info("Chat session archived session_id=%s", session_id)
         return self.get(session_id)
 
     def import_legacy_chat_turns(self) -> int:
@@ -243,6 +257,7 @@ class SessionManager:
                 metadata={"legacy_qa_ids": sorted(imported_ids)},
             )
             imported += 1
+        logger.info("Legacy chat session import completed imported=%s", imported)
         return imported
 
     def remove_chat_traces_from_qa_tools(self) -> int:
@@ -274,6 +289,7 @@ class SessionManager:
                 )
                 changed += 1
             connection.commit()
+        logger.info("Legacy QA chat traces cleanup completed changed=%s", changed)
         return changed
 
 
