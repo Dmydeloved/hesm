@@ -82,6 +82,30 @@ class MemoryManager:
                 query=user_input,
                 timestamp=timestamp,
             )
+
+            # Segment intent 边界只在真正写入 QA 时判断。route_experience
+            # 仅负责定位 Experience 及其最新 Segment，供检索和写入共用。
+            if not current_segment or self._should_cut_segment(current_segment, intent):
+                if current_segment:
+                    current_segment["status"] = "completed"
+                    self._summarize_segment(
+                        current_segment,
+                        timestamp,
+                        reason="intent_switch",
+                    )
+                current_segment = self._create_segment(
+                    current_experience,
+                    topic,
+                    core_entity,
+                    intent,
+                    timestamp,
+                )
+            self.storage.upsert_runtime_state(
+                state_key=state_key,
+                current_experience_id=current_experience["experience_id"],
+                current_segment_id=current_segment["segment_id"],
+                updated_at=timestamp,
+            )
             action = self._resolve_add_action(
                 current_experience,
                 current_segment,
@@ -142,8 +166,8 @@ class MemoryManager:
         intent: str,
         query: str,
         timestamp: str | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """完成 Experience 与 Segment 路由，并维护 runtime 当前指针。"""
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """路由 Experience，并返回其最新 Segment（若不存在则为 ``None``）。"""
         timestamp = format_timestamp(timestamp)
         runtime = self.storage.get_runtime_state(state_key)
         current_experience = self.storage.get_experience(
@@ -209,27 +233,11 @@ class MemoryManager:
                 )
                 current_segment = None
 
-        # 在写入 runtime 前完成 Segment 边界判断，保证指针就是本轮写入目标。
-        if not current_segment or self._should_cut_segment(current_segment, intent):
-            if current_segment:
-                current_segment["status"] = "completed"
-                self._summarize_segment(
-                    current_segment,
-                    timestamp,
-                    reason="intent_switch",
-                )
-            current_segment = self._create_segment(
-                current_experience,
-                topic,
-                core_entity,
-                intent,
-                timestamp,
-            )
 
         self.storage.upsert_runtime_state(
             state_key=state_key,
             current_experience_id=current_experience["experience_id"],
-            current_segment_id=current_segment["segment_id"],
+            current_segment_id=current_segment["segment_id"] if current_segment else "",
             updated_at=timestamp,
         )
         return current_experience, current_segment

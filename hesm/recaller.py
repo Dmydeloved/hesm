@@ -50,7 +50,7 @@ class ExperienceRecaller:
             topic=topic,
             core_entity=core_entity,
             limit=3,
-        )[:3]
+        )
 
         query_text = f"主题：{topic}\n核心实体：{core_entity}\n查询：{query}"
         vector_items: list[dict[str, Any]] = []

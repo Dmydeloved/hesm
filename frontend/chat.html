@@ -7,12 +7,12 @@
   <title>HESM · 智能对话</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1">
   <link rel="stylesheet" href="/styles.css?v=7">
-  <link rel="stylesheet" href="/chat.css?v=7">
+  <link rel="stylesheet" href="/chat.css?v=8">
 </head>
 <body class="chat-page">
   <header class="topbar">
     <a class="brand" href="/index.html"><span class="brand-icon">H</span><span>HESM<small>Hierarchical Experience State Memory</small></span></a>
-    <nav><a href="/index.html">数据管理</a><a href="/retrieval.html">检索分析</a><a class="active" href="/chat.html?v=7">智能对话</a></nav>
+    <nav><a href="/index.html">数据管理</a><a href="/retrieval.html">检索分析</a><a class="active" href="/chat.html?v=8">智能对话</a></nav>
     <div id="health" class="health"><i></i><span>正在连接</span></div>
   </header>
 
@@ -40,15 +40,14 @@
       <div id="trace" class="trace" hidden>
         <article class="trace-step" data-step="extract"><header><span>01</span><div><strong>主题提取</strong><small>TopicExtractor</small></div><time>—</time></header><div id="topic-result" class="trace-body"></div></article>
         <article class="trace-step" data-step="retrieve"><header><span>02</span><div><strong>记忆检索</strong><small>Experience → Segment → QA</small></div><time>—</time></header><div id="retrieval-result" class="trace-body"></div></article>
-        <article class="trace-step" data-step="prompt"><header><span>03</span><div><strong>Prompt 拼接</strong><small>Memory + history + question</small></div><time>—</time></header><div class="trace-body"><button class="inspect-button" data-dialog="prompt-dialog">查看完整 Prompt</button><p id="prompt-preview">—</p></div></article>
-        <article class="trace-step" data-step="generate"><header><span>04</span><div><strong>LLM 回答</strong><small id="model-name">Answer model</small></div><time>—</time></header><div class="trace-body"><p id="answer-preview">—</p></div></article>
+        <article class="trace-step" data-step="prompt"><header><span>03</span><div><strong>Prompt 拼接</strong><small>Memory + history + question</small></div><time>—</time></header><div class="trace-body"><details class="prompt-content" open><summary>完整 Prompt</summary><pre id="prompt-text">—</pre></details></div></article>
+        <article class="trace-step trace-step-compact" data-step="generate"><header><span>04</span><div><strong>LLM 回答</strong><small id="model-name">Answer model</small></div><time>—</time></header></article>
         <article class="trace-step" data-step="store"><header><span>05</span><div><strong>记忆存储</strong><small>QA → Segment → Experience</small></div><time>—</time></header><div id="store-result" class="trace-body"></div></article>
       </div>
     </aside>
   </main>
 
-  <dialog id="prompt-dialog" class="prompt-dialog"><header><div><p class="eyebrow">FINAL LLM INPUT</p><h2>完整 Prompt</h2></div><button data-close-dialog>×</button></header><pre id="prompt-text"></pre></dialog>
   <div id="toast" class="toast"></div>
-  <script src="/chat.js?v=7"></script>
+  <script src="/chat.js?v=8"></script>
 </body>
 </html>

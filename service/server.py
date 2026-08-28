@@ -601,4 +601,4 @@ app.mount("/", NoCacheStaticFiles(directory=FRONTEND_DIR, html=True), name="fron
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("service.server:app", host="127.0.0.1", port=8080, reload=False)
+    uvicorn.run("service.server:app", host="0.0.0.0", port=8080, reload=False)

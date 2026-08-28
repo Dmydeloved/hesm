@@ -15,10 +15,9 @@
     health: $("#health"), form: $("#chat-form"), input: $("#message"),
     send: $("#send"), messages: $("#messages"), empty: $("#trace-empty"),
     trace: $("#trace"), total: $("#total-time"), topic: $("#topic-result"),
-    retrieval: $("#retrieval-result"), promptPreview: $("#prompt-preview"),
-    promptText: $("#prompt-text"), answerPreview: $("#answer-preview"),
+    retrieval: $("#retrieval-result"), promptText: $("#prompt-text"),
     store: $("#store-result"), model: $("#model-name"),
-    dialog: $("#prompt-dialog"), toast: $("#toast"),
+    toast: $("#toast"),
     sessionList: $("#session-list"), sessionTitle: $("#current-session-title"),
   };
 
@@ -102,9 +101,9 @@
     elements.total.textContent = "处理中";
     elements.topic.innerHTML = "<p>正在分析主题与意图…</p>";
     elements.retrieval.innerHTML = "<p>等待主题提取完成…</p>";
-    elements.promptPreview.textContent = "等待记忆检索完成…";
-    elements.answerPreview.textContent = "等待 Prompt 组装完成…";
+    elements.promptText.textContent = "等待记忆检索完成…";
     elements.store.innerHTML = "<p>等待模型回答完成…</p>";
+    document.querySelector(".prompt-content").open = true;
     document.querySelectorAll(".trace-step time").forEach((item) => { item.textContent = "—"; });
     setStep("extract");
     clearInterval(state.timer);
@@ -114,8 +113,33 @@
     elements.topic.innerHTML = `<div class="topic-grid"><div><small>主题</small><strong>${escapeHtml(extraction.topic || "—")}</strong></div><div><small>核心实体</small><strong>${escapeHtml(extraction.core_entity || "—")}</strong></div><div><small>意图</small><strong>${escapeHtml(extraction.intent || "—")}</strong></div><div><small>置信度</small><strong>${Math.round(Number(extraction.confidence || 0) * 100)}%</strong></div><div><small>相关实体</small><strong>${escapeHtml((extraction.entities || []).join("、") || "—")}</strong></div></div>`;
   }
 
+  function memoryValue(value) {
+    if (value === null || value === undefined || value === "") return "—";
+    return typeof value === "object" ? JSON.stringify(value, null, 2) : String(value);
+  }
+
+  function memoryField(label, value) {
+    return `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(memoryValue(value))}</dd>`;
+  }
+
+  function retrievalItem(type, item) {
+    const id = item[`${type}_id`] || item.id || "—";
+    const fields = type === "experience"
+      ? [["ID", id], ["主题", item.topic], ["核心实体", item.core_entity], ["状态", item.status || item.state?.status], ["摘要", item.summary], ["历史经验", item.history_experience]]
+      : type === "segment"
+        ? [["ID", id], ["主题", item.topic], ["意图", item.intent], ["核心实体", item.core_entity], ["状态", item.status], ["摘要", item.summary]]
+        : [["ID", id], ["时间", item.timestamp], ["主题", item.topic], ["意图", item.intent], ["用户输入", item.user_input], ["助手输出", item.assistant_output]];
+    const title = type === "experience" ? item.topic || id : type === "segment" ? item.intent || item.topic || id : item.user_input || item.intent || id;
+    return `<article class="retrieval-item"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(id)}</small><dl>${fields.map(([label, value]) => memoryField(label, value)).join("")}</dl></article>`;
+  }
+
+  function retrievalGroup(type, label, items) {
+    const records = Array.isArray(items) ? items : [];
+    return `<details class="retrieval-group"><summary><b>${records.length}</b>${label}<span>点击查看</span></summary><div class="retrieval-items">${records.length ? records.map((item) => retrievalItem(type, item)).join("") : '<p>未检索到相关记录。</p>'}</div></details>`;
+  }
+
   function renderRetrieval(retrieval) {
-    elements.retrieval.innerHTML = `<div class="retrieval-counts"><span><b>${retrieval.experiences?.length || 0}</b>Experience</span><span><b>${retrieval.segments?.length || 0}</b>Segment</span><span><b>${retrieval.qas?.length || 0}</b>QA</span></div>`;
+    elements.retrieval.innerHTML = `<div class="retrieval-counts">${retrievalGroup("experience", "Experience", retrieval.experiences)}${retrievalGroup("segment", "Segment", retrieval.segments)}${retrievalGroup("qa", "QA", retrieval.qas)}</div>`;
   }
 
   function renderStored(stored) {
@@ -127,8 +151,7 @@
       setStep(event.stage);
       if (event.stage === "extract") elements.topic.innerHTML = `<p>正在读取最近 ${event.history_turn_count || 0} 轮会话历史并分析主题…</p>`;
       if (event.stage === "retrieve") elements.retrieval.innerHTML = "<p>正在按主题、核心实体和意图检索 HESM 记忆…</p>";
-      if (event.stage === "prompt") elements.promptPreview.textContent = "正在拼接 HESM 检索内容和当前问题…";
-      if (event.stage === "generate") elements.answerPreview.textContent = "正在调用回答模型…";
+      if (event.stage === "prompt") elements.promptText.textContent = "正在拼接 HESM 检索内容和当前问题…";
       if (event.stage === "store") elements.store.innerHTML = "<p>正在写入 QA、Segment 与 Experience…</p>";
       return;
     }
@@ -138,11 +161,9 @@
     if (event.stage === "extract") renderExtraction(event.extraction || {});
     if (event.stage === "retrieve") renderRetrieval(event.retrieval || {});
     if (event.stage === "prompt") {
-      elements.promptPreview.textContent = `已拼接 HESM 检索内容与当前问题，其中包含 ${event.retrieval_qa_count || 0} 条 QA 证据。`;
       elements.promptText.textContent = event.prompt || "";
     }
     if (event.stage === "generate") {
-      elements.answerPreview.textContent = event.answer || "—";
       elements.model.textContent = event.model || "Answer model";
     }
     if (event.stage === "store") renderStored(event.stored?.memories?.[0] || {});
@@ -157,9 +178,7 @@
     elements.total.textContent = milliseconds(timing.chat_total_ms);
     renderExtraction(extraction);
     renderRetrieval(retrieval);
-    elements.promptPreview.textContent = `已拼接 HESM 检索内容与当前问题，其中包含 ${retrieval.qas?.length || 0} 条 QA 证据。`;
     elements.promptText.textContent = result.prompt || "";
-    elements.answerPreview.textContent = result.answer || "—";
     elements.model.textContent = result.model || "Answer model";
     renderStored(stored);
     const values = {
@@ -332,12 +351,6 @@
     showToast("已创建并保存新会话");
   }
   $("#new-chat").addEventListener("click", createNewSession);
-  document.querySelectorAll("[data-dialog]").forEach((button) => button.addEventListener("click", () => {
-    if (state.result) elements.dialog.showModal(); else showToast("暂无 Prompt");
-  }));
-  document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => elements.dialog.close()));
-  elements.dialog.addEventListener("click", (event) => { if (event.target === elements.dialog) elements.dialog.close(); });
-
   checkHealth();
   request("/api/sessions")
     .then((data) => {
