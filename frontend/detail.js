@@ -74,6 +74,7 @@
           ["核心实体", item.core_entity],
           ["意图", item.intent],
           ["QA ID", item.qa_id, true],
+          ["Source ID", item.source_id, true],
           ["Segment ID", item.segment_id, true],
           ["时间", item.timestamp],
           ["置信度", `${Math.round(Number(item.confidence || 0) * 100)}%`],

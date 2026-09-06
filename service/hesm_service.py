@@ -123,6 +123,7 @@ class HESMService:
         tools: list[dict[str, Any]] | None = None,
         timestamp: str | None = None,
         state_key: str = "default",
+        source_id: str | None = None,
     ) -> dict[str, Any]:
         """Extract and persist one interaction into hierarchical memory."""
         text = str(user_input).strip()
@@ -154,6 +155,7 @@ class HESMService:
                     tools=tools,
                     timestamp=timestamp,
                     state_key=state_key,
+                    source_id=source_id,
                 )
                 for item in topic_results
             ]

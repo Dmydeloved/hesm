@@ -31,6 +31,7 @@ def export_snapshot(database: Path, output: Path) -> None:
     for row in connection.execute("SELECT * FROM qa_memory ORDER BY rowid"):
         qa = {
             "id": row["qa_id"],
+            "sourceId": row["source_id"] if "source_id" in row.keys() else None,
             "timestamp": row["timestamp"],
             "userInput": row["user_input"],
             "assistantOutput": row["assistant_output"],

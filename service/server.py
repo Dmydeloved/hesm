@@ -147,6 +147,7 @@ class MemoryRepository:
             search_columns = [
                 "q.qa_id", "q.topic", "q.intent", "q.core_entity",
                 "q.user_input", "q.assistant_output", "q.entities_json",
+                "q.source_id",
             ]
             group = ""
 
@@ -360,6 +361,7 @@ class MemoryRepository:
 
 class MemoryAddRequest(BaseModel):
     user_input: str = Field(min_length=1, max_length=20_000)
+    source_id: str | None = Field(default=None, max_length=500)
     assistant_output: str = Field(default="", max_length=20_000)
     context: str = Field(default="", max_length=50_000)
     topic_result: dict[str, Any] | list[dict[str, Any]] | None = None

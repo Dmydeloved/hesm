@@ -17,6 +17,7 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS qa_memory (
     qa_id TEXT PRIMARY KEY,
+    source_id TEXT,
     timestamp TEXT NOT NULL,
     user_input TEXT NOT NULL,
     assistant_output TEXT NOT NULL,
@@ -183,6 +184,10 @@ class MemoryStorage:
     def _ensure_memory_columns(self) -> None:
         """为旧版数据库补齐文档定义的字段，并迁移可复用的数据。"""
         qa_columns = self._table_columns("qa_memory")
+        if "source_id" not in qa_columns:
+            self.connection.execute(
+                "ALTER TABLE qa_memory ADD COLUMN source_id TEXT"
+            )
         if "reason" not in qa_columns:
             self.connection.execute(
                 "ALTER TABLE qa_memory ADD COLUMN reason TEXT NOT NULL DEFAULT ''"
@@ -480,13 +485,17 @@ class MemoryStorage:
 
     def insert_qa(self, qa: dict[str, Any]) -> None:
         columns = [
-            "qa_id", "timestamp", "user_input", "assistant_output", "tools_json",
+            "qa_id", "source_id", "timestamp", "user_input", "assistant_output", "tools_json",
             "topic", "intent", "core_entity", "entities_json", "segment_id",
             "status", "confidence", "reason",
         ]
+        source_id = qa.get("source_id")
+        if source_id is not None:
+            source_id = str(source_id).strip() or None
         reason = qa.get("reason", qa.get("reasoning", ""))
         values: list[Any] = [
             qa["qa_id"],
+            source_id,
             format_timestamp(qa["timestamp"]),
             qa["user_input"],
             qa["assistant_output"],

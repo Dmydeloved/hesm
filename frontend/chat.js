@@ -128,7 +128,7 @@
       ? [["ID", id], ["主题", item.topic], ["核心实体", item.core_entity], ["状态", item.status || item.state?.status], ["摘要", item.summary], ["历史经验", item.history_experience]]
       : type === "segment"
         ? [["ID", id], ["主题", item.topic], ["意图", item.intent], ["核心实体", item.core_entity], ["状态", item.status], ["摘要", item.summary]]
-        : [["ID", id], ["时间", item.timestamp], ["主题", item.topic], ["意图", item.intent], ["用户输入", item.user_input], ["助手输出", item.assistant_output]];
+        : [["ID", id], ["Source ID", item.source_id], ["时间", item.timestamp], ["主题", item.topic], ["意图", item.intent], ["用户输入", item.user_input], ["助手输出", item.assistant_output]];
     const title = type === "experience" ? item.topic || id : type === "segment" ? item.intent || item.topic || id : item.user_input || item.intent || id;
     return `<article class="retrieval-item"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(id)}</small><dl>${fields.map(([label, value]) => memoryField(label, value)).join("")}</dl></article>`;
   }

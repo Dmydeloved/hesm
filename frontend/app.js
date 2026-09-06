@@ -31,7 +31,7 @@
   const fields = {
     experience: ["顺序", "主题", "核心实体", "Experience ID", "状态", "Segment", "QA", "创建时间", "更新时间", "操作"],
     segment: ["顺序", "主题", "核心实体", "意图", "Segment ID", "Experience ID", "状态", "QA", "创建时间", "更新时间", "操作"],
-    qa: ["顺序", "主题", "核心实体", "意图", "QA ID", "用户输入", "助手输出", "Segment ID", "状态", "置信度", "时间", "操作"],
+    qa: ["顺序", "主题", "核心实体", "意图", "QA ID", "Source ID", "用户输入", "助手输出", "Segment ID", "状态", "置信度", "时间", "操作"],
   };
   const els = {
     health: $("#health"),
@@ -150,6 +150,7 @@
       <td>${textCell(item.core_entity)}</td>
       <td>${textCell(item.intent)}</td>
       <td>${idCell(item.qa_id)}</td>
+      <td>${idCell(item.source_id)}</td>
       <td>${textCell(item.user_input, "空输入")}</td>
       <td>${textCell(item.assistant_output, "无助手输出")}</td>
       <td>${idCell(item.segment_id)}</td>

@@ -54,6 +54,7 @@ class MemoryManager:
         tools: list[dict[str, Any]] | None = None,
         timestamp: str | None = None,
         state_key: str = "default",
+        source_id: str | None = None,
     ) -> dict[str, Any]:
         """把一条结构化主题结果写入三层记忆。"""
 
@@ -64,6 +65,8 @@ class MemoryManager:
         confidence = float(topic_result.get("confidence", 0.0))
         reasoning = str(topic_result.get("reasoning") or "")
         timestamp = format_timestamp(timestamp)
+        if source_id is not None:
+            source_id = str(source_id).strip() or None
 
         logger.info(
             "写入主题记忆 state=%s topic=%s core_entity=%s intent=%s",
@@ -73,8 +76,10 @@ class MemoryManager:
             intent,
         )
         logger.info(
-            "Memory add payload state=%s user_input=%s assistant_output=%s topic_result=%s",
+            "Memory add payload state=%s source_id=%s user_input=%s "
+            "assistant_output=%s topic_result=%s",
             state_key,
+            source_id,
             user_input,
             assistant_output,
             json.dumps(topic_result, ensure_ascii=False),
@@ -120,6 +125,7 @@ class MemoryManager:
 
             qa = {
                 "qa_id": self._new_id("qa"),
+                "source_id": source_id,
                 "timestamp": timestamp,
                 "user_input": user_input,
                 "assistant_output": assistant_output,

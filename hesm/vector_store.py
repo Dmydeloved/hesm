@@ -236,6 +236,7 @@ def build_vector_metadata(
         return {
             **common,
             "qa_id": str(memory.get("qa_id") or ""),
+            "source_id": str(memory.get("source_id") or ""),
             "segment_id": str(memory.get("segment_id") or ""),
             "intent": str(memory.get("intent") or ""),
             "timestamp": _metadata_timestamp(memory.get("timestamp")),

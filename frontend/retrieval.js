@@ -131,7 +131,7 @@
       + `<strong>${escapeHtml(qa.intent || qa.topic || "QA")}</strong><small>${escapeHtml(qa.qa_id)}</small>`
       + `</div></header><details><summary>查看 QA 完整信息</summary>`
       + informationGrid([
-        ["时间", qa.timestamp], ["主题", qa.topic], ["核心实体", qa.core_entity],
+        ["Source ID", qa.source_id], ["时间", qa.timestamp], ["主题", qa.topic], ["核心实体", qa.core_entity],
         ["意图", qa.intent], ["状态", qa.status], ["相关实体", qa.entities],
       ])
       + `<section class="qa-content"><b>用户输入</b><p>${escapeHtml(qa.user_input || "—")}</p>`
