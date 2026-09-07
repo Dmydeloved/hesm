@@ -14,10 +14,10 @@ from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from hesm.config import PROJECT_ROOT, config_path
-from hesm.logging_config import configure_logging
-from hesm.session import SessionManager
-from hesm.storage import MemoryStorage
+from core.config import PROJECT_ROOT, config_path
+from core.logging_config import configure_logging
+from core.session import SessionManager
+from core.storage import MemoryStorage
 from service.hesm_service import HESMService
 
 

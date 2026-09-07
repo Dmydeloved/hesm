@@ -9,18 +9,18 @@ from threading import RLock
 import time
 from typing import Any, Iterator
 
-from hesm.chat import LLMAnswerer, build_chat_prompt
-from hesm.config import PROJECT_ROOT, load_config
-from hesm.embedder import BailianEmbedder
-from hesm.extractor import TopicExtractor
-from hesm.logging_config import configure_logging
-from hesm.manager import MemoryManager
-from hesm.recaller import ExperienceRecaller
-from hesm.retriever import HybridRetriever
-from hesm.session import SessionManager
-from hesm.storage import MemoryStorage
-from hesm.summarizer import LLMSummarizer
-from hesm.vector_store import ChromaVectorStore
+from core.chat import LLMAnswerer, build_chat_prompt
+from core.config import PROJECT_ROOT, load_config
+from core.embedder import BailianEmbedder
+from core.extractor import TopicExtractor
+from core.logging_config import configure_logging
+from core.manager import MemoryManager
+from core.recaller import ExperienceRecaller
+from core.retriever import HybridRetriever
+from core.session import SessionManager
+from core.storage import MemoryStorage
+from core.summarizer import LLMSummarizer
+from core.vector_store import ChromaVectorStore
 
 
 logger = logging.getLogger(__name__)

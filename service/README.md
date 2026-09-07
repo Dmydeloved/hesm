@@ -6,7 +6,7 @@
 - `server.py`：FastAPI 接口、管理仓储和静态前端托管入口。
 - `export_memory_snapshot.py`：从 SQLite 导出只读前端快照的工具。
 
-核心记忆逻辑位于 `hesm/`，页面与静态资源位于 `frontend/`。
+核心记忆逻辑位于 `core/`，页面与静态资源位于 `frontend/`。
 
 从项目根目录启动：
 
