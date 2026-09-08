@@ -1,0 +1,514 @@
+{
+  "schema_version": 1,
+  "status": "user_memory_implementation_ready_not_run",
+  "study_id": "hesm_memory_agent_v1",
+  "created_on": "2026-09-07",
+  "updated_on": "2026-09-08",
+  "current_scope": "user_memory_only",
+  "description": "实验规划数据；尚无运行器直接加载此文件。null 表示正式运行前必须填写。",
+  "repositories": {
+    "hesm": {
+      "path": "../",
+      "audited_commit": "43658719bb8cf15b4c73b92ac39f0afba25d55ff"
+    },
+    "omnimemeval": {
+      "path": "../../OmniMemEval",
+      "audited_commit": "0b1ea8d28aa2d3e03ac4a6aee17b3006a131da7d"
+    }
+  },
+  "protocol": {
+    "user_memory": "omnimemeval_pinned",
+    "agent_memory": "omnimemeval_five_domain_pinned",
+    "agent_latest_four_domain": "separate_optional_study",
+    "query_mutates_persistent_memory": false,
+    "include_gold_in_memory": false,
+    "persistent_test_writes": false,
+    "namespace_scope": [
+      "study",
+      "run",
+      "method",
+      "variant",
+      "benchmark",
+      "scale",
+      "user"
+    ],
+    "session_order": "event_time_then_original_order",
+    "unknown_event_time": "preserve_unknown"
+  },
+  "models": {
+    "answer": null,
+    "judge": null,
+    "memory_extraction": null,
+    "embedding": null,
+    "agent": null,
+    "openclaw_version": null,
+    "plugin_version": null,
+    "tokenizer": null,
+    "prompt_hashes": null
+  },
+  "data_manifest": {
+    "revisions": null,
+    "file_sha256": null,
+    "task_id_files": null,
+    "development_ids": null,
+    "confirmation_ids": null
+  },
+  "budgets": {
+    "status": "proposed_freeze_before_confirmation",
+    "retrieved_context_tokens": [
+      2048,
+      4096,
+      8192,
+      16384
+    ],
+    "primary_context_tokens": 4096,
+    "currency": null,
+    "max_total_cost": null,
+    "max_task_seconds": null,
+    "workers_initial": 1,
+    "llm_workers_initial": 2,
+    "top_k_is_not_token_budget": true
+  },
+  "statistics": {
+    "paired_cluster_bootstrap_samples": 10000,
+    "ci_level": 0.95,
+    "noninferiority_one_sided": true,
+    "primary_comparator": null,
+    "multiple_comparisons": "Holm for preregistered family; mark other comparisons exploratory",
+    "clusters": {
+      "locomo": "conversation",
+      "longmemeval": "independent_haystack",
+      "beam": "conversation",
+      "agentbench": "task_with_all_repeats"
+    },
+    "cross_scale_official_beam_paired": false
+  },
+  "proposed_criteria": {
+    "locomo": {
+      "accuracy_difference_lower_bound_gt": -0.02,
+      "context_token_ratio_upper_bound_lt": 0.8
+    },
+    "state": {
+      "knowledge_update_accuracy_difference_lower_bound_gt": 0,
+      "separate_secondary_slices": [
+        "multi-session",
+        "temporal-reasoning"
+      ]
+    },
+    "controlled_beam": {
+      "nugget_difference_lower_bound_gt": -0.03,
+      "context_token_ratio_upper_bound_lt": 1.1,
+      "require_full_history_ingestion": true
+    },
+    "experience": {
+      "macro_accuracy_difference_lower_bound_gt": 0,
+      "turn_ratio_upper_bound_lt": 1,
+      "report_all_domains": true
+    }
+  },
+  "user_conditions": [
+    {
+      "id": "locomo",
+      "benchmark": "locomo",
+      "dataset": "locomo10",
+      "expected_questions_local_protocol": 1540,
+      "excluded_categories": [
+        5
+      ],
+      "script": "scripts/run_locomo_eval.sh",
+      "result_prefix": "results/locomo",
+      "primary_metrics": [
+        "overall_accuracy",
+        "answer_input_tokens"
+      ]
+    },
+    {
+      "id": "lme_s",
+      "benchmark": "longmemeval",
+      "dataset": "longmemeval_s_cleaned",
+      "expected_questions_local_protocol": 500,
+      "script": "scripts/run_lme_eval.sh",
+      "result_prefix": "results/lme",
+      "primary_metrics": [
+        "knowledge-update_accuracy",
+        "multi-session_accuracy",
+        "temporal-reasoning_accuracy"
+      ],
+      "secondary_metrics": [
+        "overall_accuracy",
+        "answer_input_tokens"
+      ]
+    },
+    {
+      "id": "beam_100k",
+      "benchmark": "beam",
+      "cli_scale": "100k",
+      "nominal_context_tokens": 128000,
+      "scale_is_exact_measured_count": false,
+      "script": "scripts/run_beam_eval.sh",
+      "result_prefix": "results/beam",
+      "primary_metrics": [
+        "nugget_score",
+        "answer_input_tokens"
+      ],
+      "secondary_metrics": [
+        "query_p95_ms",
+        "ingestion_tokens",
+        "ingestion_seconds",
+        "peak_ram_bytes",
+        "index_bytes",
+        "history_ingestion_coverage",
+        "context_truncation_rate"
+      ]
+    },
+    {
+      "id": "beam_500k",
+      "benchmark": "beam",
+      "cli_scale": "500k",
+      "nominal_context_tokens": 500000,
+      "scale_is_exact_measured_count": false,
+      "script": "scripts/run_beam_eval.sh",
+      "result_prefix": "results/beam",
+      "primary_metrics": [
+        "nugget_score",
+        "answer_input_tokens"
+      ],
+      "secondary_metrics": [
+        "query_p95_ms",
+        "ingestion_tokens",
+        "ingestion_seconds",
+        "peak_ram_bytes",
+        "index_bytes",
+        "history_ingestion_coverage",
+        "context_truncation_rate"
+      ]
+    },
+    {
+      "id": "beam_1m",
+      "benchmark": "beam",
+      "cli_scale": "1m",
+      "nominal_context_tokens": 1000000,
+      "scale_is_exact_measured_count": false,
+      "script": "scripts/run_beam_eval.sh",
+      "result_prefix": "results/beam",
+      "primary_metrics": [
+        "nugget_score",
+        "answer_input_tokens"
+      ],
+      "secondary_metrics": [
+        "query_p95_ms",
+        "ingestion_tokens",
+        "ingestion_seconds",
+        "peak_ram_bytes",
+        "index_bytes",
+        "history_ingestion_coverage",
+        "context_truncation_rate"
+      ]
+    },
+    {
+      "id": "beam_10m",
+      "benchmark": "beam",
+      "cli_scale": "10m",
+      "nominal_context_tokens": 10000000,
+      "scale_is_exact_measured_count": false,
+      "script": "scripts/run_beam_eval.sh",
+      "result_prefix": "results/beam",
+      "primary_metrics": [
+        "nugget_score",
+        "answer_input_tokens"
+      ],
+      "secondary_metrics": [
+        "query_p95_ms",
+        "ingestion_tokens",
+        "ingestion_seconds",
+        "peak_ram_bytes",
+        "index_bytes",
+        "history_ingestion_coverage",
+        "context_truncation_rate"
+      ]
+    }
+  ],
+  "user_methods": [
+    {
+      "id": "hesm_full",
+      "lib": "hesm",
+      "variant": "full",
+      "status": "implemented_not_formally_run",
+      "conditions": [
+        "locomo",
+        "lme_s",
+        "beam_100k",
+        "beam_500k",
+        "beam_1m",
+        "beam_10m"
+      ]
+    },
+    {
+      "id": "mem0",
+      "lib": "mem0",
+      "variant": "product",
+      "status": "adapter_present_credentials_and_configuration_unverified",
+      "conditions": [
+        "locomo",
+        "lme_s",
+        "beam_100k",
+        "beam_500k",
+        "beam_1m",
+        "beam_10m"
+      ]
+    },
+    {
+      "id": "supermemory",
+      "lib": "supermemory",
+      "variant": "product",
+      "status": "adapter_present_credentials_and_configuration_unverified",
+      "conditions": [
+        "locomo",
+        "lme_s",
+        "beam_100k",
+        "beam_500k",
+        "beam_1m",
+        "beam_10m"
+      ]
+    },
+    {
+      "id": "hindsight",
+      "lib": "hindsight",
+      "variant": "product",
+      "status": "adapter_present_credentials_and_configuration_unverified",
+      "conditions": [
+        "locomo",
+        "lme_s",
+        "beam_100k",
+        "beam_500k",
+        "beam_1m",
+        "beam_10m"
+      ]
+    },
+    {
+      "id": "hesm_without_state",
+      "lib": "hesm",
+      "variant": "without_state",
+      "status": "ablation_pending",
+      "conditions": [
+        "lme_s"
+      ],
+      "preserve": [
+        "raw_timestamps",
+        "raw_history",
+        "context_budget"
+      ]
+    },
+    {
+      "id": "hesm_without_hierarchical",
+      "lib": "hesm",
+      "variant": "without_hierarchical",
+      "status": "ablation_pending",
+      "conditions": [
+        "locomo",
+        "beam_100k",
+        "beam_500k",
+        "beam_1m",
+        "beam_10m"
+      ],
+      "preserve": [
+        "state_if_separable",
+        "experience_if_separable",
+        "raw_history",
+        "embedding",
+        "context_budget"
+      ]
+    },
+    {
+      "id": "flat_rag",
+      "lib": null,
+      "variant": "flat_rag",
+      "status": "implementation_pending",
+      "conditions": [
+        "locomo",
+        "lme_s",
+        "beam_100k",
+        "beam_500k",
+        "beam_1m",
+        "beam_10m"
+      ]
+    }
+  ],
+  "agent_domains": [
+    {
+      "id": "reasoning",
+      "source": "OmniMath",
+      "expected_train_local_protocol": 478,
+      "expected_test_local_protocol": 100,
+      "additional_metric": "avg_chars"
+    },
+    {
+      "id": "information_retrieval",
+      "source": "BrowseComp-Plus",
+      "expected_train_local_protocol": 154,
+      "expected_test_local_protocol": 65
+    },
+    {
+      "id": "knowledge_work",
+      "source": "GDPVal",
+      "expected_train_local_protocol": 87,
+      "expected_test_local_protocol": 58,
+      "additional_metric": "reward"
+    },
+    {
+      "id": "code_implementation",
+      "source": "LiveCodeBench",
+      "expected_train_local_protocol": 97,
+      "expected_test_local_protocol": 39
+    },
+    {
+      "id": "software_engineering",
+      "source": "SWE-Bench",
+      "expected_train_local_protocol": 101,
+      "expected_test_local_protocol": 26
+    }
+  ],
+  "agent_methods": [
+    {
+      "id": "no_memory",
+      "protocol": "test_only",
+      "memory_plugin": null,
+      "task_trials": 3,
+      "test_runs": 1,
+      "status": "isolated_runtime_validation_pending"
+    },
+    {
+      "id": "hesm_full",
+      "protocol": "memory_train_backup_test",
+      "memory_plugin": "hesm",
+      "variant": "full",
+      "task_trials": 1,
+      "test_runs": 3,
+      "status": "plugin_pending"
+    },
+    {
+      "id": "hesm_without_experience",
+      "protocol": "memory_train_backup_test",
+      "memory_plugin": "hesm",
+      "variant": "without_experience",
+      "task_trials": 1,
+      "test_runs": 3,
+      "status": "plugin_and_ablation_pending"
+    },
+    {
+      "id": "raw_trajectory_memory",
+      "protocol": "memory_train_backup_test",
+      "memory_plugin": null,
+      "optional": true,
+      "status": "implementation_pending"
+    },
+    {
+      "id": "mem0",
+      "optional": true,
+      "status": "plugin_lifecycle_not_present_in_local_config"
+    },
+    {
+      "id": "supermemory",
+      "optional": true,
+      "status": "lifecycle_config_present_runtime_unverified"
+    },
+    {
+      "id": "hindsight",
+      "optional": true,
+      "status": "lifecycle_config_present_runtime_unverified"
+    }
+  ],
+  "agent_primary_metrics": [
+    "mean_single_trial_accuracy",
+    "avg_model_response_turns"
+  ],
+  "stages": [
+    {
+      "id": "P0",
+      "deliverable": "protocol_and_data_manifest",
+      "status": "implemented_for_user_memory",
+      "requires": []
+    },
+    {
+      "id": "P1",
+      "deliverable": "isolated_readonly_eval_service",
+      "status": "implemented",
+      "requires": [
+        "P0"
+      ]
+    },
+    {
+      "id": "P2",
+      "deliverable": "omnimemeval_hesm_adapter",
+      "status": "implemented",
+      "requires": [
+        "P1"
+      ]
+    },
+    {
+      "id": "P3",
+      "deliverable": "mechanism_ablation_controls",
+      "status": "deferred",
+      "requires": [
+        "P1"
+      ]
+    },
+    {
+      "id": "P4",
+      "deliverable": "openclaw_hesm_plugin_and_lifecycle",
+      "status": "deferred",
+      "requires": [
+        "P1"
+      ]
+    },
+    {
+      "id": "P5",
+      "deliverable": "pilot_and_budget_estimate",
+      "status": "not_run",
+      "requires": [
+        "P2",
+        "P3",
+        "P4"
+      ]
+    },
+    {
+      "id": "P6",
+      "deliverable": "confirmed_runs_and_reports",
+      "status": "not_run",
+      "requires": [
+        "P5"
+      ]
+    }
+  ],
+  "formal_run_gates": [
+    "data_revision_and_hashes_pinned",
+    "model_and_prompt_versions_pinned",
+    "independent_namespace_verified",
+    "readonly_queries_verified",
+    "chronological_ingestion_verified",
+    "idempotency_verified",
+    "finalize_and_snapshot_consistency_verified",
+    "real_vector_backend_verified",
+    "effective_token_budget_verified",
+    "no_gold_leakage_verified",
+    "ablations_verified",
+    "agent_test_freeze_verified",
+    "primary_comparator_and_criteria_frozen",
+    "cost_limit_configured"
+  ],
+  "outputs": [
+    "manifest.json",
+    "records.jsonl",
+    "comparison.csv",
+    "ablation.csv",
+    "scaling.csv",
+    "report.md"
+  ],
+  "result_policy": {
+    "missing_value": null,
+    "not_executed_status": "not_run",
+    "unsupported_status": "unsupported",
+    "preserve_raw_reports": true,
+    "mix_public_reference_with_reproduced_results": false
+  }
+}

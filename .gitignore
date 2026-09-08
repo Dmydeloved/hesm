@@ -17,6 +17,10 @@ data/topic_extracted/*checkpoint*.json
 data/topic_extracted/*failures*.jsonl
 data/topic_extracted/permission_probe.tmp
 results/
+experiments/.cache/
+experiments/.runtime/
+experiments/*.local.yaml
+experiments/config/*.local.yaml
 
 # Local test cache files
 tests/__pycache__/

@@ -1,0 +1,40 @@
+# Explicit experiment configuration. No values are inherited from config/hesm.yaml.
+schema_version: 1
+profile: user_memory_published
+data_root: ../.runtime/user_memory
+host: 127.0.0.1
+port: 8766
+api_token_env: HESM_EVAL_TOKEN
+models:
+  memory:
+    model: gpt-4.1-mini-2025-04-14
+    api_key_env: HESM_EVAL_MEMORY_API_KEY
+    base_url_env: HESM_EVAL_MEMORY_BASE_URL
+    timeout: 120
+    max_retries: 2
+  embedding:
+    model: text-embedding-v4
+    api_key_env: HESM_EVAL_EMBEDDING_API_KEY
+    base_url_env: HESM_EVAL_EMBEDDING_BASE_URL
+    timeout: 120
+    max_retries: 2
+memory:
+  segment_qa_limit: 5
+  experience_summary_segment_threshold: 5
+  experience_similarity_threshold: 0.82
+  input_chunk_tokens: 2048
+retrieval:
+  experience_candidates: 6
+  segments_per_experience: 3
+  qas_per_segment: 3
+  context_tokens: 4096
+  tokenizer: cl100k_base
+  include_state: true
+  include_experience: true
+  max_top_k: 100
+  # Per-user budget. LoCoMo's two speaker contexts are counted together by OmniMemEval.
+formal:
+  require_chroma: true
+  require_real_models: true
+  on_ingestion_failure: quarantine_namespace
+  baseline_source: OmniMemEval/docs/user_memory/results.md
