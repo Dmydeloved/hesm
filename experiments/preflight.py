@@ -24,6 +24,7 @@ def main():
     from openai import OpenAI
     import httpx
     for stage in ['memory', 'embedding', 'ANSWER', 'EVAL']:
+        cfg = {}
         try:
             if stage in ['memory', 'embedding']:
                 cfg = connection(settings, stage)
@@ -47,7 +48,11 @@ def main():
             cause = exc
             while cause.__cause__ is not None:
                 cause = cause.__cause__
-            reason = str(cause).replace(cfg.get('api_key', '<unset>'), '<redacted>')[:300]
+            reason = str(cause)
+            api_key = cfg.get('api_key')
+            if api_key:
+                reason = reason.replace(api_key, '<redacted>')
+            reason = reason[:300]
             result['checks'].append({'stage': stage, 'status': 'failed', 'error_type': type(exc).__name__,
                                     'http_status': getattr(exc, 'status_code', None), 'network_reason': reason})
     if args.output:
