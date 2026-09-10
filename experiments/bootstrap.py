@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from experiments.settings import ROOT, read_settings
+from experiments.settings import ROOT
 
 
 def bootstrap(source, destination):
@@ -16,9 +16,9 @@ def bootstrap(source, destination):
     if destination.exists():
         raise FileExistsError('Refusing to overwrite existing independent experiment credentials')
     config = yaml.safe_load(Path(source).read_text(encoding='utf-8'))
-    memory, embedding = config['topic_extraction'], config['embedding']
+    memory = config['topic_extraction']
+    embedding = config['embedding']
     values = {
-        'HESM_EVAL_URL': 'http://127.0.0.1:8766',
         'HESM_EVAL_TOKEN': secrets.token_urlsafe(32),
         'HESM_EVAL_MEMORY_API_KEY': memory['api_key'],
         'HESM_EVAL_MEMORY_BASE_URL': memory['base_url'],
@@ -30,11 +30,10 @@ def bootstrap(source, destination):
         'EVAL_API_KEY': memory['api_key'], 'EVAL_BASE_URL': memory['base_url'],
         'HESM_EVAL_TIMEOUT': '3600', 'LLM_WORKERS': '2', 'TOPK': '20',
         'ANONYMIZED_TELEMETRY': 'False', 'PYTHONUTF8': '1',
-        'HESM_EVAL_CONFIG_FINGERPRINT': read_settings(ROOT / 'experiments/config/user_memory.yaml')['config_fingerprint'],
     }
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open('x', encoding='utf-8') as f:
-        f.write('# Independent credential copy. Runtime does not read production configuration.\n')
+        f.write('# Credentials for user_memory.yaml plus OmniMemEval answer/judge models.\n')
         for key, value in values.items():
             f.write(f'{key}={json.dumps(str(value))}\n')
     print(f'Created independent experiment env: {destination}; credential values omitted')

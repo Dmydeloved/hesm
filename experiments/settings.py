@@ -1,8 +1,7 @@
-"""Strict, independent configuration for experimental services."""
+"""Load the standalone HESM configuration used only by OmniMemEval."""
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from pathlib import Path
 from typing import Any
@@ -10,49 +9,108 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+MEMORY_MODEL = "gpt-4.1-mini-2025-04-14"
+ANSWER_MODEL = "gpt-4.1-mini-2025-04-14"
+JUDGE_MODEL = "gpt-4o-mini-2024-07-18"
+EMBEDDING_MODEL = "text-embedding-v4"
+EMBEDDING_MAX_INPUT_TOKENS = 8192
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _resolve_env(value: Any, location: str = "config") -> Any:
+    """Resolve exact ``${NAME}`` YAML scalars without writing secrets to disk."""
+    if isinstance(value, dict):
+        return {
+            key: _resolve_env(item, f"{location}.{key}")
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _resolve_env(item, f"{location}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+        name = value[2:-1].strip()
+        resolved = os.environ.get(name, "")
+        if not resolved:
+            raise ValueError(f"Missing environment variable {name} for {location}")
+        return resolved
+    return value
 
 
 def read_settings(path: str | Path) -> dict[str, Any]:
     target = Path(path).expanduser().resolve(strict=True)
-    if target == (ROOT / 'config/hesm.yaml').resolve():
-        raise ValueError('The production HESM config cannot be used for experiments')
-    data = yaml.safe_load(target.read_text(encoding='utf-8'))
-    if not isinstance(data, dict) or data.get('schema_version') != 1:
-        raise ValueError('Expected an explicit schema_version: 1 experiment config')
-    required = {'profile', 'data_root', 'models', 'memory', 'retrieval', 'formal', 'api_token_env'}
-    if required - data.keys():
-        raise ValueError(f'Missing experiment settings: {sorted(required - data.keys())}')
-    root = (target.parent / data['data_root']).resolve()
-    production = (ROOT / 'memory').resolve()
+    raw_data = yaml.safe_load(target.read_text(encoding="utf-8"))
+    if not isinstance(raw_data, dict) or raw_data.get("schema_version") != 2:
+        raise ValueError("Expected schema_version: 2 standalone experiment config")
+    data = _resolve_env(raw_data)
+    experiment = data.get("experiment")
+    if not isinstance(experiment, dict):
+        raise ValueError("Missing experiment configuration section")
+    required = {"profile", "data_root", "host", "port", "api_token"}
+    if required - experiment.keys():
+        raise ValueError(
+            f"Missing experiment settings: {sorted(required - experiment.keys())}"
+        )
+    native_required = {
+        "topic_extraction", "embedding", "summarization",
+        "memory_management", "api",
+    }
+    if native_required - data.keys():
+        raise ValueError(
+            f"Missing native HESM sections: {sorted(native_required - data.keys())}"
+        )
+    for section in ("topic_extraction", "summarization", "chat"):
+        model = str((data.get(section) or {}).get("model") or "")
+        if model != MEMORY_MODEL:
+            raise ValueError(
+                f"{section}.model must be {MEMORY_MODEL}, got {model or '<unset>'}"
+            )
+    embedding_model = str((data.get("embedding") or {}).get("model") or "")
+    if embedding_model != EMBEDDING_MODEL:
+        raise ValueError(
+            f"embedding.model must be {EMBEDDING_MODEL}, got {embedding_model or '<unset>'}"
+        )
+    embedding = data.get("embedding") or {}
+    max_input_tokens = int(embedding.get("max_input_tokens", 0))
+    chunk_tokens = int(embedding.get("chunk_tokens", 0))
+    if max_input_tokens != EMBEDDING_MAX_INPUT_TOKENS:
+        raise ValueError(
+            f"embedding.max_input_tokens must be {EMBEDDING_MAX_INPUT_TOKENS}"
+        )
+    if not 1 <= chunk_tokens < max_input_tokens:
+        raise ValueError(
+            "embedding.chunk_tokens must be positive and below max_input_tokens"
+        )
+    root = (target.parent / str(experiment["data_root"])).resolve()
+    production = (ROOT / "memory").resolve()
     if root == production or production in root.parents or root in production.parents:
-        raise ValueError('Experiment storage must be separate from production memory')
-    if root == ROOT or root in ROOT.parents:
-        raise ValueError('Experiment storage must be a dedicated directory')
-    for section, keys in [('memory', ['segment_qa_limit', 'experience_summary_segment_threshold', 'input_chunk_tokens']),
-                          ('retrieval', ['experience_candidates', 'segments_per_experience', 'qas_per_segment', 'context_tokens', 'max_top_k'])]:
-        for key in keys:
-            value = data[section].get(key)
-            if type(value) is not int or value < 1:
-                raise ValueError(f'{section}.{key} must be a positive integer')
-    for key in ['include_state', 'include_experience']:
-        if type(data['retrieval'].get(key)) is not bool:
-            raise ValueError(f'retrieval.{key} must be a boolean')
-    if not data['retrieval']['include_state']:
-        raise ValueError('The main experiment uses full HESM State; disabling State requires a separate ablation implementation')
-    # The fingerprint records configuration, never credential values.
-    data['config_fingerprint'] = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
-    data['config_path'] = str(target)
-    data['data_root'] = str(root)
-    return data
-
-
-def connection(settings: dict, section: str) -> dict:
-    model = settings['models'][section]
-    values = {key: os.environ.get(model[f'{key}_env'], '').strip() for key in ['api_key', 'base_url']}
-    if not all(values.values()) or not model.get('model'):
-        raise ValueError(f'Missing independent {section} credentials/model; configure the experiment env file')
-    return {**values, 'model': model['model'], 'timeout': float(model['timeout']),
-            'max_retries': int(model['max_retries'])}
+        raise ValueError("Experiment storage must be separate from production memory")
+    file_sha256 = _sha256(target)
+    # The reproducibility fingerprint covers the YAML-controlled models,
+    # thresholds and paths, but never derives a stored hash from credentials.
+    config_sha256 = file_sha256
+    result = dict(experiment)
+    result.update({
+        "config_path": str(target),
+        "data_root": str(root),
+        # HESMService reads native settings from this same experiment file.
+        "hesm_config_path": str(target),
+        "hesm_config_sha256": file_sha256,
+        "config_fingerprint": config_sha256,
+        "native_config": data,
+        "max_top_k": int(experiment.get("max_top_k", 100)),
+        "native_models": {
+            "topic_extraction": (data.get("topic_extraction") or {}).get("model"),
+            "summarization": (data.get("summarization") or {}).get("model"),
+            "chat": (data.get("chat") or {}).get("model"),
+            "embedding": (data.get("embedding") or {}).get("model"),
+        },
+    })
+    return result
 
 
 def load_env(path: str | Path) -> None:
@@ -60,3 +118,11 @@ def load_env(path: str | Path) -> None:
     for key, value in dotenv_values(path).items():
         if value is not None:
             os.environ[key] = value
+
+
+def validate_omnimemeval_models() -> None:
+    expected = {"ANSWER_MODEL": ANSWER_MODEL, "EVAL_MODEL": JUDGE_MODEL}
+    for name, required in expected.items():
+        actual = os.environ.get(name, "").strip()
+        if actual != required:
+            raise ValueError(f"{name} must be {required}, got {actual or '<unset>'}")

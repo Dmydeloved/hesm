@@ -24,15 +24,11 @@
     "include_gold_in_memory": false,
     "persistent_test_writes": false,
     "namespace_scope": [
-      "study",
-      "run",
-      "method",
-      "variant",
       "benchmark",
-      "scale",
-      "user"
+      "version",
+      "data_sha256"
     ],
-    "session_order": "event_time_then_original_order",
+    "session_order": "input_order_timestamp_forwarded_to_native_hesm",
     "unknown_event_time": "preserve_unknown"
   },
   "models": {
@@ -483,11 +479,9 @@
   "formal_run_gates": [
     "data_revision_and_hashes_pinned",
     "model_and_prompt_versions_pinned",
-    "independent_namespace_verified",
-    "readonly_queries_verified",
-    "chronological_ingestion_verified",
-    "idempotency_verified",
-    "finalize_and_snapshot_consistency_verified",
+    "dataset_run_isolation_verified",
+    "native_hesm_add_path_verified",
+    "readonly_retrieval_does_not_create_experience",
     "real_vector_backend_verified",
     "effective_token_budget_verified",
     "no_gold_leakage_verified",

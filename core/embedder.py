@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 
 TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9_]+")
+DEFAULT_MAX_INPUT_TOKENS = 8192
+DEFAULT_CHUNK_TOKENS = 7800
 
 
 class TextEmbedder(Protocol):
@@ -28,6 +30,8 @@ class BailianEmbedder:
         api_key: str | None = None,
         model: str | None = None,
         base_url: str | None = None,
+        max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
+        chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
     ) -> None:
         from openai import OpenAI
 
@@ -40,24 +44,144 @@ class BailianEmbedder:
         )
         self.client = OpenAI(api_key=str(api_key), base_url=str(base_url))
         self.model = str(model)
+        self.max_input_tokens = int(max_input_tokens)
+        self.chunk_tokens = int(chunk_tokens)
+        if self.max_input_tokens < 1:
+            raise ValueError("embedding.max_input_tokens must be positive")
+        if not 1 <= self.chunk_tokens <= self.max_input_tokens:
+            raise ValueError(
+                "embedding.chunk_tokens must be between 1 and max_input_tokens"
+            )
 
     def embed(self, text: str) -> list[float]:
         if not text.strip():
             raise ValueError("Embedding text cannot be empty.")
+        chunks, token_count = split_embedding_text(
+            text,
+            max_input_tokens=self.max_input_tokens,
+            chunk_tokens=self.chunk_tokens,
+        )
         logger.info(
-            "Embedding request model=%s text_length=%s text=%s",
+            "Embedding request model=%s text_length=%s token_count=%s chunks=%s",
             self.model,
             len(text),
-            text,
+            token_count,
+            len(chunks),
         )
-        response = self.client.embeddings.create(model=self.model, input=text)
-        embedding = list(response.data[0].embedding)
+        if len(chunks) > 1:
+            logger.warning(
+                "Embedding content exceeds one-call limit; model=%s "
+                "token_count=%s max_input_tokens=%s chunk_tokens=%s chunks=%s",
+                self.model,
+                token_count,
+                self.max_input_tokens,
+                self.chunk_tokens,
+                len(chunks),
+            )
+        vectors = []
+        for chunk in chunks:
+            response = self.client.embeddings.create(
+                model=self.model,
+                input=chunk,
+            )
+            vectors.append(list(response.data[0].embedding))
+        embedding = _mean_normalized(vectors)
         logger.info(
-            "Embedding response model=%s dimension=%s",
+            "Embedding response model=%s dimension=%s chunks=%s",
             self.model,
             len(embedding),
+            len(chunks),
         )
         return embedding
+
+
+def embedding_token_count(text: str) -> int:
+    """Count tokens with the experiment tokenizer, with a safe byte fallback."""
+    try:
+        import tiktoken
+
+        return len(tiktoken.get_encoding("cl100k_base").encode(text))
+    except Exception:
+        # A byte is the smallest possible tokenizer unit, so byte length is a
+        # conservative upper bound when tiktoken is unavailable.
+        return len(text.encode("utf-8"))
+
+
+def split_embedding_text(
+    text: str,
+    *,
+    max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
+    chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
+) -> tuple[list[str], int]:
+    """Return nonempty chunks that are safe for one embedding API call each."""
+    if not text or not text.strip():
+        raise ValueError("Embedding text cannot be empty.")
+    max_input_tokens = int(max_input_tokens)
+    chunk_tokens = int(chunk_tokens)
+    if max_input_tokens < 1 or not 1 <= chunk_tokens <= max_input_tokens:
+        raise ValueError("Invalid embedding token limits")
+    try:
+        import tiktoken
+
+        encoding = tiktoken.get_encoding("cl100k_base")
+        token_ids = encoding.encode(text)
+        token_count = len(token_ids)
+        if token_count <= max_input_tokens:
+            return [text], token_count
+        # Split on Python character boundaries. Decoding arbitrary token slices
+        # can split the UTF-8 bytes of one CJK character across two chunks.
+        chunks = []
+        start = 0
+        while start < len(text):
+            low, high = start + 1, len(text)
+            best = start
+            while low <= high:
+                middle = (low + high) // 2
+                if len(encoding.encode(text[start:middle])) <= chunk_tokens:
+                    best = middle
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if best == start:
+                best = start + 1
+            chunks.append(text[start:best])
+            start = best
+        return [chunk for chunk in chunks if chunk.strip()], token_count
+    except ImportError:
+        raw = text.encode("utf-8")
+        token_count = len(raw)
+        if token_count <= max_input_tokens:
+            return [text], token_count
+        chunks: list[str] = []
+        current: list[str] = []
+        current_bytes = 0
+        for character in text:
+            encoded_size = len(character.encode("utf-8"))
+            if current and current_bytes + encoded_size > chunk_tokens:
+                chunks.append("".join(current))
+                current = []
+                current_bytes = 0
+            current.append(character)
+            current_bytes += encoded_size
+        if current:
+            chunks.append("".join(current))
+        return [chunk for chunk in chunks if chunk.strip()], token_count
+
+
+def _mean_normalized(vectors: list[list[float]]) -> list[float]:
+    if not vectors or not vectors[0]:
+        raise ValueError("Embedding provider returned an empty vector")
+    if len(vectors) == 1:
+        return vectors[0]
+    dimensions = len(vectors[0])
+    if any(len(vector) != dimensions for vector in vectors):
+        raise ValueError("Embedding provider returned inconsistent dimensions")
+    averaged = [
+        sum(vector[index] for vector in vectors) / len(vectors)
+        for index in range(dimensions)
+    ]
+    norm = math.sqrt(sum(value * value for value in averaged))
+    return [value / norm for value in averaged] if norm else averaged
 
 
 class HashingEmbedder:

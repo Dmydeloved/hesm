@@ -1,141 +1,157 @@
-import copy
-import json
-import sys
+import hashlib
+import sqlite3
 from pathlib import Path
 
-import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from core.embedder import HashingEmbedder
-from core.summarizer import TemplateSummarizer
-from core.vector_store import ChromaVectorStore, _InMemoryCollection
-from experiments.backend import EvaluationBackend
-from experiments.components import EvaluationManager
-from experiments.settings import ROOT, read_settings
+import experiments.backend as backend_module
 
 
-class Collection(_InMemoryCollection):
-    def get(self, *, limit, offset, include):
-        items = sorted(self._items.values(), key=lambda x: x['id'])[offset:offset + limit]
-        return {key: [i[field] for i in items] for key, field in [('ids', 'id'), ('documents', 'document'), ('embeddings', 'embedding'), ('metadatas', 'metadata')]}
+class FakeHESMService:
+    instances = []
+
+    def __init__(
+        self, config_path=None, *, config_data=None, storage_root, retriever_class
+    ):
+        self.config_data = config_data
+        self.storage_root = Path(storage_root)
+        self.retriever_class = retriever_class
+        self.added = []
+        self.closed = False
+        self.instances.append(self)
+
+    def add_memory(self, **kwargs):
+        self.added.append(kwargs)
+        return {"memories": [{"qa_id": f"qa_{len(self.added)}"}]}
+
+    def retrieve(self, **kwargs):
+        return {
+            "context": f"native context from {self.storage_root.name}",
+            "route_status": "runtime",
+            "query_extraction": {
+                "topic": "topic", "core_entity": "entity", "intent": "query"
+            },
+            "experiences": [{"experience_id": "exp_1"}],
+            "segments": [{"segment_id": "seg_1"}],
+            "qas": [{"qa_id": "qa_1"}],
+        }
+
+    def close(self):
+        self.closed = True
 
 
-class Vectors(ChromaVectorStore):
-    def __init__(self, **kwargs):
-        self.client = None
-        self.collection = Collection()
+def make_backend(monkeypatch, tmp_path):
+    FakeHESMService.instances = []
+    monkeypatch.setattr(backend_module, "HESMService", FakeHESMService)
+    settings = {
+        "data_root": str(tmp_path),
+        "native_config": {"embedding": {"model": "text-embedding-v4"}},
+        "max_top_k": 100,
+        "profile": "test",
+        "config_fingerprint": "fingerprint",
+    }
+    return backend_module.EvaluationBackend(settings, "locomo_fixture")
 
 
-class Extractor:
-    def extract(self, text, **kwargs):
-        if 'FAIL_MODEL' in text:
-            raise RuntimeError('simulated model failure')
-        return {'topic': 'personal facts', 'core_entity': 'person', 'intent': 'remember', 'entities': ['person'], 'confidence': 1., 'reasoning': 'fixture'}
+def user_hash(user_id):
+    return hashlib.sha256(user_id.encode("utf-8")).hexdigest()
 
 
-class NoHistory:
-    def recall(self, **kwargs):
-        return {'history_experience': {}}
+def request_rows(backend):
+    with sqlite3.connect(backend.request_db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        return connection.execute(
+            "SELECT * FROM request_log ORDER BY rowid"
+        ).fetchall()
 
 
-def components(settings, storage, vectors, directory):
-    embedder = HashingEmbedder(128)
-    manager = EvaluationManager(storage, vectors, embedder, TemplateSummarizer(),
-        experience_recaller=NoHistory(), segment_summary_qa_threshold=2)
-    return Extractor(), embedder, manager
+def test_add_isolates_native_hesm_by_user_and_is_idempotent(monkeypatch, tmp_path):
+    backend = make_backend(monkeypatch, tmp_path)
+    messages = [
+        {"role": "user", "content": "remember this", "chat_time": "2024-01-01"}
+    ]
+
+    first = backend.add("user-a", messages, "session-a")
+    duplicate = backend.add("user-a", messages, "session-b")
+    other = backend.add("user-b", messages, "session-a")
+
+    assert first["idempotent"] is False
+    assert duplicate["idempotent"] is True
+    assert other["idempotent"] is False
+    assert len(FakeHESMService.instances) == 2
+    assert {instance.storage_root for instance in FakeHESMService.instances} == {
+        backend.users_root / user_hash("user-a"),
+        backend.users_root / user_hash("user-b"),
+    }
+    assert sum(len(instance.added) for instance in FakeHESMService.instances) == 2
+    assert all(
+        item["state_key"] == "evaluation"
+        for instance in FakeHESMService.instances
+        for item in instance.added
+    )
+
+    rows = request_rows(backend)
+    assert [row["status"] for row in rows] == ["success", "success", "success"]
+    assert [row["idempotent_hit"] for row in rows] == [0, 1, 0]
+    assert rows[0]["request_hash"] == rows[1]["request_hash"]
+    assert rows[0]["user_hash"] != rows[2]["user_hash"]
 
 
-@pytest.fixture
-def backend(tmp_path):
-    config = read_settings(ROOT / 'experiments/config/user_memory.yaml')
-    config['data_root'] = str(tmp_path / 'memory')
-    config['formal']['require_chroma'] = False
-    config['formal']['require_real_models'] = False
-    config['retrieval']['context_tokens'] = 4096
-    return EvaluationBackend(config, component_factory=components, vector_factory=Vectors)
+def test_search_uses_only_requested_user_store_and_records_status(monkeypatch, tmp_path):
+    backend = make_backend(monkeypatch, tmp_path)
+    result_a = backend.search("user-a", "question", 20, "2024-01-02")
+    result_b = backend.search("user-b", "question", 20, "2024-01-02")
+
+    assert user_hash("user-a") in result_a["context"]
+    assert user_hash("user-b") in result_b["context"]
+    assert result_a["candidate_counts"] == {
+        "experiences": 1, "segments": 1, "qas": 1
+    }
+    rows = request_rows(backend)
+    assert [row["operation"] for row in rows] == ["search", "search"]
+    assert all(row["status"] == "success" for row in rows)
 
 
-def message(content, date='2024-01-01T00:00:00Z', role='user'):
-    return {'role': role, 'content': content, 'chat_time': date, 'has_answer': True, 'gold': 'DO_NOT_INGEST'}
+def test_write_locks_are_stable_per_user_and_distinct_between_users(
+    monkeypatch, tmp_path
+):
+    backend = make_backend(monkeypatch, tmp_path)
+    lock_a = backend._write_lock(user_hash("user-a"))
+    assert lock_a is backend._write_lock(user_hash("user-a"))
+    assert lock_a is not backend._write_lock(user_hash("user-b"))
 
 
-def state(backend, user):
-    storage, vectors, *_ = backend._open(backend._row(user))
-    return '\n'.join(storage.connection.iterdump()), copy.deepcopy(vectors.collection._items)
+def test_failed_add_records_hash_without_request_content(monkeypatch, tmp_path):
+    backend = make_backend(monkeypatch, tmp_path)
+
+    def fail(**kwargs):
+        raise RuntimeError("provider failed")
+
+    with backend._write_lock(user_hash("user-a")):
+        service = backend._service(user_hash("user-a"))
+    service.add_memory = fail
+
+    try:
+        backend.add("user-a", [{"content": "private request text"}])
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected add failure")
+
+    row = request_rows(backend)[0]
+    assert row["status"] == "failed"
+    assert row["error_type"] == "RuntimeError"
+    assert "private request text" not in str(dict(row))
 
 
-def test_isolation_and_readonly_query_order(backend):
-    backend.add('alice', [message('My secret is orchidseven')], 's1')
-    backend.add('bob', [message('My secret is cobalteight')], 's1')
-    before = state(backend, 'alice')
-    first = backend.search('alice', 'What is my secret?')['context']
-    backend.search('alice', 'An entirely new topic with no previous history')
-    assert first == backend.search('alice', 'What is my secret?')['context']
-    assert 'orchidseven' in first and 'cobalteight' not in first
-    assert 'DO_NOT_INGEST' not in first
-    assert state(backend, 'alice') == before
+def test_validation_failure_is_also_recorded(monkeypatch, tmp_path):
+    backend = make_backend(monkeypatch, tmp_path)
+    try:
+        backend.search("user-a", "", 20)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected validation failure")
 
-
-def test_idempotency_and_session_conflict(backend):
-    messages = [message('I moved to Paris')]
-    backend.add('u', messages, 's1')
-    before = state(backend, 'u')
-    assert backend.add('u', messages, 's1')['status'] == 'already_ingested'
-    assert state(backend, 'u') == before
-    with pytest.raises(ValueError, match='different content'):
-        backend.add('u', [message('Different')], 's1')
-
-
-def test_quarantine_partial_failure_and_reset(backend):
-    with pytest.raises(RuntimeError, match='simulated'):
-        backend.add('u', [message('first succeeds'), message('FAIL_MODEL')], 's1')
-    with pytest.raises(RuntimeError, match='quarantined'):
-        backend.search('u', 'first')
-    backend.delete('u')
-    backend.add('u', [message('replacement')], 's1')
-    assert 'replacement' in backend.search('u', 'replacement')['context']
-
-
-def test_snapshot_restore_and_frozen_test(backend):
-    backend.add('u', [message('before snapshot')], 's1')
-    snapshot = backend.snapshot('u')
-    before = backend.search('u', 'snapshot')['context']
-    backend.add('u', [message('after snapshot', '2024-02-01T00:00:00Z')], 's2')
-    backend.set_mode('u', 'test')
-    backend.restore('u', snapshot['snapshot_id'])
-    assert backend.search('u', 'snapshot')['context'] == before
-    with pytest.raises(PermissionError):
-        backend.add('u', [message('test contamination')], 's3')
-    with pytest.raises(PermissionError):
-        backend.delete('u')
-    with pytest.raises(ValueError, match='namespace'):
-        backend.restore('other_user', snapshot['snapshot_id'])
-
-
-def test_assistant_evidence_unknown_dates_and_budget(backend):
-    backend.add('u', [message('Assistant says the access code is ambernine.', None, 'assistant')], 's1')
-    result = backend.search('u', 'access code', question_date='2024-03-01')
-    assert 'ambernine' in result['context']
-    assert result['query_date'] == '2024-03-01'
-    backend.settings['retrieval']['context_tokens'] = 80
-    assert backend.search('u', 'access code')['context_tokens'] <= 80
-
-
-def test_out_of_order_sessions_rejected(backend):
-    backend.add('u', [message('newer', '2024-02-01T00:00:00Z')], 's2')
-    with pytest.raises(ValueError, match='chronological'):
-        backend.add('u', [message('older')], 's1')
-
-
-def test_production_config_rejected():
-    with pytest.raises(ValueError, match='production'):
-        read_settings(ROOT / 'config/hesm.yaml')
-
-
-def test_chunking_preserves_all_unicode(backend):
-    backend.settings['memory']['input_chunk_tokens'] = 9
-    text = '中文🙂é test' * 30
-    chunks = list(backend._chunks(text))
-    assert ''.join(chunks) == text
-    assert all(len(backend.tokenizer.encode(c, disallowed_special=())) <= 9 for c in chunks)
+    row = request_rows(backend)[0]
+    assert row["operation"] == "search"
+    assert row["status"] == "failed"
+    assert row["error_type"] == "ValueError"

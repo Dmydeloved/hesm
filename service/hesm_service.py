@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from pathlib import Path
@@ -29,15 +30,32 @@ logger = logging.getLogger(__name__)
 class HESMService:
     """Own all production HESM components behind two public operations."""
 
-    def __init__(self, config_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        config_path: str | Path | None = None,
+        *,
+        config_data: dict[str, Any] | None = None,
+        storage_root: str | Path | None = None,
+        retriever_class: type[Any] | None = None,
+    ) -> None:
         configure_logging()
-        self.config = load_config(config_path)
+        self.config = (
+            copy.deepcopy(config_data)
+            if config_data is not None
+            else load_config(config_path)
+        )
         self._lock = RLock()
         logger.info("Initializing HESMService config_path=%s", config_path or "default")
 
         paths = self.config.get("paths", {})
-        database_path = self._project_path(paths.get("memory_db", "memory/hesm.sqlite3"))
-        chroma_path = self._project_path(paths.get("chroma", "memory/chroma"))
+        if storage_root is not None:
+            isolated_root = Path(storage_root).expanduser().resolve()
+            isolated_root.mkdir(parents=True, exist_ok=True)
+            database_path = isolated_root / "hesm.sqlite3"
+            chroma_path = isolated_root / "chroma"
+        else:
+            database_path = self._project_path(paths.get("memory_db", "memory/hesm.sqlite3"))
+            chroma_path = self._project_path(paths.get("chroma", "memory/chroma"))
 
         embedding_config = self.config.get("embedding", {})
         topic_config = self.config.get("topic_extraction", {})
@@ -58,6 +76,10 @@ class HESMService:
             api_key=embedding_config.get("api_key"),
             model=embedding_config.get("model"),
             base_url=embedding_config.get("base_url"),
+            max_input_tokens=int(
+                embedding_config.get("max_input_tokens", 8192)
+            ),
+            chunk_tokens=int(embedding_config.get("chunk_tokens", 7800)),
         )
         self.extractor = TopicExtractor(
             api_key=topic_config.get("api_key"),
@@ -95,7 +117,7 @@ class HESMService:
             min_segment_qas=int(management_config.get("min_segment_qas", 2)),
             experience_recaller=self.recaller,
         )
-        self.retriever = HybridRetriever(
+        self.retriever = (retriever_class or HybridRetriever)(
             manager=self.manager,
         )
         self.answerer = LLMAnswerer(

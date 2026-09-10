@@ -1,40 +1,62 @@
-# Explicit experiment configuration. No values are inherited from config/hesm.yaml.
-schema_version: 1
-profile: user_memory_published
-data_root: ../.runtime/user_memory
-host: 127.0.0.1
-port: 8766
-api_token_env: HESM_EVAL_TOKEN
-models:
-  memory:
-    model: gpt-4.1-mini-2025-04-14
-    api_key_env: HESM_EVAL_MEMORY_API_KEY
-    base_url_env: HESM_EVAL_MEMORY_BASE_URL
-    timeout: 120
-    max_retries: 2
-  embedding:
-    model: text-embedding-v4
-    api_key_env: HESM_EVAL_EMBEDDING_API_KEY
-    base_url_env: HESM_EVAL_EMBEDDING_BASE_URL
-    timeout: 120
-    max_retries: 2
-memory:
-  segment_qa_limit: 5
-  experience_summary_segment_threshold: 5
-  experience_similarity_threshold: 0.82
-  input_chunk_tokens: 2048
-retrieval:
-  experience_candidates: 1
-  segments_per_experience: 2
-  qas_per_segment: 4
-  context_tokens: 4096
-  tokenizer: cl100k_base
-  include_state: true
-  include_experience: true
+# Standalone configuration for the HESM OmniMemEval adapter.
+# It does not inherit from or reference config/hesm.yaml.
+schema_version: 2
+experiment:
+  profile: native_hesm_user_memory
+  data_root: ../.runtime/user_memory
+  host: 127.0.0.1
+  port: 8766
+  # Resolved from .env.user_memory; the value is never stored in this YAML.
+  api_token: "${HESM_EVAL_TOKEN}"
   max_top_k: 100
-  # Per-user budget. LoCoMo's two speaker contexts are counted together by OmniMemEval.
-formal:
-  require_chroma: true
-  require_real_models: true
-  on_ingestion_failure: quarantine_namespace
-  baseline_source: OmniMemEval/docs/user_memory/results.md
+
+paths:
+  # Safety fallback; dataset runs override these with a hashed dataset directory.
+  memory_db: experiments/.runtime/user_memory/default/hesm.sqlite3
+  chroma: experiments/.runtime/user_memory/default/chroma
+
+# Experiment-only HESM provider settings. They are independent copies.
+_llm_connection: &llm_connection
+  # Provider credentials are resolved from .env.user_memory.
+  api_key: "${HESM_EVAL_MEMORY_API_KEY}"
+  base_url: "${HESM_EVAL_MEMORY_BASE_URL}"
+  max_retries: 3
+  retry_delay: 2.0
+
+_llm_profiles:
+  strong: &strong_llm
+    <<: *llm_connection
+    model: gpt-4.1-mini-2025-04-14
+  nano: &nano_llm
+    <<: *llm_connection
+    model: gpt-4.1-mini-2025-04-14
+topic_extraction: *strong_llm
+
+embedding: &embedding_defaults
+  api_key: "${HESM_EVAL_EMBEDDING_API_KEY}"
+  model: text-embedding-v4
+  base_url: "${HESM_EVAL_EMBEDDING_BASE_URL}"
+  max_input_tokens: 8192
+  chunk_tokens: 7800
+
+retrieval:
+  # Completed-Experience recall only: SQLite relation path + Chroma path.
+  experience_vector_recall_limit: 12
+  experience_relational_recall_limit: 12
+  experience_similarity_threshold: 0.82
+
+summarization: *strong_llm
+
+# Final answer generation for the Web Console chat page.
+chat: *nano_llm
+
+memory_management:
+  segment_qa_threshold: 5
+  experience_segment_threshold: 5
+  experience_similarity_threshold: 0.82
+  min_segment_qas: 2
+
+api:
+  top_experience: 1
+  top_segment: 2
+  top_qa: 4

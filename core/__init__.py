@@ -2,6 +2,11 @@
 
 from .manager import MemoryManager
 from .recaller import ExperienceRecaller
-from .retriever import HybridRetriever
+from .retriever import HybridRetriever, ReadOnlyHybridRetriever
 
-__all__ = ["ExperienceRecaller", "HybridRetriever", "MemoryManager"]
+__all__ = [
+    "ExperienceRecaller",
+    "HybridRetriever",
+    "ReadOnlyHybridRetriever",
+    "MemoryManager",
+]

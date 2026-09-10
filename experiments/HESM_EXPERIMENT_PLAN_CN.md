@@ -1,5 +1,7 @@
 # HESM 长期记忆与 Agent 实验实施方案
 
+> User Memory 已改为原生 HESM 薄适配方案。本文中旧的用户/session namespace、generation、snapshot、frozen mode 和评测专用检索实现不再适用；当前实现与运行方式以 `USER_MEMORY_GUIDE_CN.md` 为准。
+
 版本：v1.1，2026-09-08。目标是检验 Hierarchical、State、Experience 三项设计能否提高准确性、减少回答上下文和降低 Agent 完成任务的成本。所有优势均为待验证假设。当前 LoCoMo、LongMemEval、BEAM 的 User Memory Adapter 与独立评测服务已经实现但未正式运行；OpenClaw / EvoAgentBench 保留为后续范围。具体操作见 [User Memory 实验说明](USER_MEMORY_GUIDE_CN.md)。
 
 ## 1. 实验总体设计

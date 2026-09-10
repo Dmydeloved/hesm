@@ -1,27 +1,32 @@
-"""Tiny synthetic format fixtures. These are NOT benchmark score datasets."""
+"""Build smoke inputs, using one unchanged official LoCoMo conversation."""
+import argparse
+import copy
 import json
 from pathlib import Path
 
 from experiments.settings import ROOT
 
 
-def prepare(directory=None):
+def prepare(directory=None, locomo_source=None, conversation_index=0):
     root = Path(directory or ROOT / 'experiments/.runtime/smoke_data')
     root.mkdir(parents=True, exist_ok=True)
-    conversation = {
-        'speaker_a': 'Mina', 'speaker_b': 'Jo',
-        'session_1_date_time': '1:00 pm on 1 January, 2024',
-        'session_1': [
-            {'speaker': 'Mina', 'text': 'I live in Berlin. My favorite color is purple.', 'dia_id': 'D1:1'},
-            {'speaker': 'Jo', 'text': 'My access code is ambernine.', 'dia_id': 'D1:2'}],
-        'session_2_date_time': '1:00 pm on 1 February, 2024',
-        'session_2': [{'speaker': 'Mina', 'text': 'I have moved to Paris and no longer live in Berlin.', 'dia_id': 'D2:1'}],
-    }
-    locomo = [{'sample_id': 'hesm_format_smoke', 'conversation': conversation, 'qa': [
-        {'question': 'Where does Mina live now?', 'answer': 'Paris', 'category': 4, 'evidence': ['D2:1']},
-        {'question': 'What is Jo\'s access code?', 'answer': 'ambernine', 'category': 4, 'evidence': ['D1:2']}
-    ]}]
-    (root / 'locomo.json').write_text(json.dumps(locomo), encoding='utf-8')
+    source = Path(
+        locomo_source
+        or ROOT.parent / 'OmniMemEval/data/locomo/locomo10.json'
+    ).expanduser().resolve(strict=True)
+    source_data = json.loads(source.read_text(encoding='utf-8'))
+    if not isinstance(source_data, list) or not source_data:
+        raise ValueError('LoCoMo source must be a nonempty JSON array')
+    if not 0 <= int(conversation_index) < len(source_data):
+        raise IndexError(
+            f'conversation_index must be between 0 and {len(source_data) - 1}'
+        )
+    # Deep-copy one complete record without changing conversation, QA, evidence,
+    # summaries, observations, sample_id, or any other benchmark field.
+    locomo = [copy.deepcopy(source_data[int(conversation_index)])]
+    (root / 'locomo.json').write_text(
+        json.dumps(locomo, ensure_ascii=False), encoding='utf-8'
+    )
     sessions = [[{'role': 'user', 'content': 'I live in Berlin.', 'has_answer': False},
                  {'role': 'assistant', 'content': 'The access code is ambernine.', 'has_answer': False}],
                 [{'role': 'user', 'content': 'I moved to Paris and no longer live in Berlin.', 'has_answer': True}]]
@@ -39,9 +44,17 @@ def prepare(directory=None):
             'rubric': ['The user currently lives in Paris.'], 'difficulty': 'easy'}]})}
     (root / 'beam').mkdir(exist_ok=True)
     (root / 'beam/beam_100k.json').write_text(json.dumps(beam) + '\n', encoding='utf-8')
-    print(f'Created synthetic smoke fixtures: {root} (not LoCoMo/LME/BEAM benchmark results)')
+    print(
+        f'Created one-conversation LoCoMo smoke input from {source} '
+        f'(index={conversation_index}) and synthetic LME/BEAM fixtures: {root}'
+    )
     return root
 
 
 if __name__ == '__main__':
-    prepare()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output')
+    parser.add_argument('--locomo-source')
+    parser.add_argument('--conversation-index', type=int, default=0)
+    args = parser.parse_args()
+    prepare(args.output, args.locomo_source, args.conversation_index)
