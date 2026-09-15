@@ -196,12 +196,10 @@ def build_vector_document(memory_type: str, memory: dict[str, Any]) -> str:
             ]
         )
 
-    goal = str(summary.get("goal") or "").strip()
     if memory_type == "experience_route":
-        return "\n".join(
-            [f"主题：{topic}", f"核心实体：{core_entity}", f"目标：{goal}"]
-        )
+        return "\n".join([f"主题：{topic}", f"核心实体：{core_entity}"])
 
+    goal = str(summary.get("goal") or "").strip()
     current_state = _json_object(summary.get("current_state"))
     trajectory = [
         f"{item.get('intent', '')}：{item.get('result', '')}"
@@ -238,6 +236,7 @@ def build_vector_metadata(
             "qa_id": str(memory.get("qa_id") or ""),
             "source_id": str(memory.get("source_id") or ""),
             "segment_id": str(memory.get("segment_id") or ""),
+            "experience_id": str(memory.get("experience_id") or ""),
             "intent": str(memory.get("intent") or ""),
             "timestamp": _metadata_timestamp(memory.get("timestamp")),
         }

@@ -20,7 +20,18 @@ class FakeHESMService:
 
     def add_memory(self, **kwargs):
         self.added.append(kwargs)
-        return {"memories": [{"qa_id": f"qa_{len(self.added)}"}]}
+        extraction = {
+            "topic": kwargs["user_input"],
+            "core_entity": f"entity-{len(self.added)}",
+            "intent": "remember",
+            "entities": [kwargs["user_input"]],
+            "confidence": 1.0,
+            "reasoning": "test",
+        }
+        return {
+            "memories": [{"qa_id": f"qa_{len(self.added)}"}],
+            "topic_results": [extraction],
+        }
 
     def retrieve(self, **kwargs):
         return {
@@ -95,6 +106,49 @@ def test_add_isolates_native_hesm_by_user_and_is_idempotent(monkeypatch, tmp_pat
     assert rows[0]["user_hash"] != rows[2]["user_hash"]
 
 
+def test_add_passes_only_the_previous_five_extraction_rounds(monkeypatch, tmp_path):
+    backend = make_backend(monkeypatch, tmp_path)
+    messages = [
+        {"role": "user", "content": f"turn-{index}"}
+        for index in range(1, 8)
+    ]
+
+    backend.add("user-a", messages, "session-a")
+
+    service = FakeHESMService.instances[0]
+    assert service.added[0]["context"] == ""
+    sixth_context = service.added[5]["context"]
+    seventh_context = service.added[6]["context"]
+    assert all(f'"topic":"turn-{index}"' in sixth_context for index in range(1, 6))
+    assert '"topic":"turn-6"' not in sixth_context
+    assert '"topic":"turn-1"' not in seventh_context
+    assert all(f'"topic":"turn-{index}"' in seventh_context for index in range(2, 7))
+
+    with backend._request_connection() as connection:
+        stored = connection.execute(
+            "SELECT COUNT(*) FROM topic_extraction_history WHERE user_hash = ?",
+            (user_hash("user-a"),),
+        ).fetchone()[0]
+    assert stored == 7
+
+
+def test_topic_extraction_history_persists_across_backend_restart(
+    monkeypatch, tmp_path
+):
+    backend = make_backend(monkeypatch, tmp_path)
+    backend.add("user-a", [{"content": "first"}], "session-a")
+    backend.close()
+
+    restarted = backend_module.EvaluationBackend(
+        backend.settings, backend.dataset_id
+    )
+    restarted.add("user-a", [{"content": "second"}], "session-b")
+
+    service = FakeHESMService.instances[-1]
+    assert '"topic":"first"' in service.added[0]["context"]
+    assert '"topic":"second"' not in service.added[0]["context"]
+
+
 def test_search_uses_only_requested_user_store_and_records_status(monkeypatch, tmp_path):
     backend = make_backend(monkeypatch, tmp_path)
     result_a = backend.search("user-a", "question", 20, "2024-01-02")
@@ -108,6 +162,28 @@ def test_search_uses_only_requested_user_store_and_records_status(monkeypatch, t
     rows = request_rows(backend)
     assert [row["operation"] for row in rows] == ["search", "search"]
     assert all(row["status"] == "success" for row in rows)
+
+
+def test_search_rejects_failed_derivation_jobs(monkeypatch, tmp_path):
+    backend = make_backend(monkeypatch, tmp_path)
+    target = backend.users_root / user_hash("user-a") / "hesm.sqlite3"
+    target.parent.mkdir(parents=True)
+    with sqlite3.connect(target) as connection:
+        connection.execute(
+            "CREATE TABLE memory_outbox (status TEXT NOT NULL)"
+        )
+        connection.execute("INSERT INTO memory_outbox VALUES ('failed')")
+
+    try:
+        backend.search("user-a", "question", 20)
+    except RuntimeError as exc:
+        assert "failed jobs: 1" in str(exc)
+    else:
+        raise AssertionError("expected failed derivation barrier")
+
+    row = request_rows(backend)[0]
+    assert row["status"] == "failed"
+    assert row["error_type"] == "RuntimeError"
 
 
 def test_write_locks_are_stable_per_user_and_distinct_between_users(

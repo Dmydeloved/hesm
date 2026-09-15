@@ -64,7 +64,9 @@ experiments/.runtime/user_memory/<dataset_id>/
 - 同一数据集内按 `user_id` 隔离 HESM SQLite 和 Chroma。
 - 写锁按 `user_id` 建立：同一用户串行，不同用户可并行。
 - `requests.sqlite3/request_log` 只记录请求哈希、状态、耗时、错误类型和幂等命中，不保存请求正文。
+- `requests.sqlite3/topic_extraction_history` 按用户保存成功的主题提取结果；添加每条记忆时，会把此前最近 5 轮结果按时间顺序传给本轮主题提取，同一批消息也逐条滚动更新。
 - add 调用原生 `HESMService.add_memory()`；search 调用只读版原生层级检索，不在检索时创建 Experience。
+- search 前等待该用户的 outbox 全部完成；出现失败任务或超过 `outbox_settle_timeout_seconds` 时直接让实验失败，避免使用未完成摘要的记忆评分。
 
 ## 6. 准备数据
 

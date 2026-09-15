@@ -22,6 +22,7 @@ from core.session import SessionManager
 from core.storage import MemoryStorage
 from core.summarizer import LLMSummarizer
 from core.vector_store import ChromaVectorStore
+from core.worker import MemoryDerivationWorker
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ class HESMService:
         summary_config = self.config.get("summarization", {})
         chat_config = self.config.get("chat", summary_config)
         management_config = self.config.get("memory_management", {})
+        retrieval_config = self.config.get("retrieval", {})
         self.api_config = self.config.get("api", {})
 
         self.storage = MemoryStorage(
@@ -114,12 +116,29 @@ class HESMService:
             experience_similarity_threshold=float(
                 management_config.get("experience_similarity_threshold", 0.82)
             ),
+            experience_route_margin=float(
+                retrieval_config.get("experience_route_margin", 0.05)
+            ),
             min_segment_qas=int(management_config.get("min_segment_qas", 2)),
             experience_recaller=self.recaller,
         )
-        self.retriever = (retriever_class or HybridRetriever)(
-            manager=self.manager,
-        )
+        if retriever_class is None:
+            self.retriever = HybridRetriever(
+                manager=self.manager,
+                segment_limit=int(self.api_config.get("top_segment", 2)),
+                qa_limit=int(self.api_config.get("top_qa", 5)),
+                qa_candidate_limit=int(
+                    retrieval_config.get("qa_candidate_limit", 40)
+                ),
+                qa_similarity_threshold=float(
+                    retrieval_config.get("qa_similarity_threshold", 0.45)
+                ),
+                experience_route_margin=float(
+                    retrieval_config.get("experience_route_margin", 0.05)
+                ),
+            )
+        else:
+            self.retriever = retriever_class(manager=self.manager)
         self.answerer = LLMAnswerer(
             api_key=str(chat_config.get("api_key") or ""),
             model=str(chat_config.get("model") or ""),
@@ -128,6 +147,50 @@ class HESMService:
             retry_delay=float(chat_config.get("retry_delay", 2.0)),
         )
         self.chat_model = str(chat_config.get("model") or "")
+        self._worker_storage: MemoryStorage | None = None
+        self.derivation_worker: MemoryDerivationWorker | None = None
+        if bool(management_config.get("async_derivation", True)):
+            # The worker owns a separate SQLite connection and lock so slow LLM/
+            # embedding calls never block the request-side critical section.
+            self._worker_storage = MemoryStorage(
+                database_path,
+                check_same_thread=False,
+            )
+            worker_recaller = ExperienceRecaller(
+                storage=self._worker_storage,
+                vector_store=self.vector_store,
+                embedder=self.embedder,
+            )
+            worker_manager = MemoryManager(
+                storage=self._worker_storage,
+                vector_store=self.vector_store,
+                embedder=self.embedder,
+                summarizer=summarizer,
+                segment_summary_qa_threshold=int(
+                    management_config.get("segment_qa_threshold", 5)
+                ),
+                experience_summary_segment_threshold=int(
+                    management_config.get("experience_segment_threshold", 5)
+                ),
+                experience_similarity_threshold=float(
+                    management_config.get("experience_similarity_threshold", 0.82)
+                ),
+                experience_route_margin=float(
+                    retrieval_config.get("experience_route_margin", 0.05)
+                ),
+                min_segment_qas=int(management_config.get("min_segment_qas", 2)),
+                experience_recaller=worker_recaller,
+            )
+            self.derivation_worker = MemoryDerivationWorker(
+                manager=worker_manager,
+                lock=RLock(),
+                poll_interval=float(
+                    management_config.get("async_poll_interval", 0.5)
+                ),
+                batch_size=int(management_config.get("async_batch_size", 8)),
+                max_retries=int(management_config.get("async_max_retries", 3)),
+            )
+            self.derivation_worker.start()
         logger.info(
             "HESMService initialized db=%s chroma=%s chat_model=%s",
             database_path,
@@ -181,6 +244,8 @@ class HESMService:
                 )
                 for item in topic_results
             ]
+        if self.derivation_worker is not None:
+            self.derivation_worker.notify()
         logger.info(
             "Add memory completed state_key=%s memory_count=%s memories=%s",
             state_key,
@@ -232,6 +297,7 @@ class HESMService:
                 query=text,
                 intent=str(primary.get("intent") or ""),
                 state_key=state_key,
+                entities=[str(item) for item in primary.get("entities") or []],
             )
             retrieval_ms = round(
                 (time.perf_counter() - retrieval_started_at) * 1000, 3
@@ -368,6 +434,7 @@ class HESMService:
                 query=text,
                 intent=str(primary.get("intent") or ""),
                 state_key=session_identifier,
+                entities=[str(item) for item in primary.get("entities") or []],
             )
             timings["retrieval_ms"] = round(
                 (time.perf_counter() - retrieval_started_at) * 1000, 3
@@ -528,6 +595,10 @@ class HESMService:
         yield {"event": "final", "result": result}
 
     def close(self) -> None:
+        if self.derivation_worker is not None:
+            self.derivation_worker.stop()
+        if self._worker_storage is not None:
+            self._worker_storage.close()
         with self._lock:
             self.storage.close()
 

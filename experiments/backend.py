@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +31,20 @@ CREATE TABLE IF NOT EXISTS request_log (
 );
 CREATE INDEX IF NOT EXISTS idx_request_idempotency
 ON request_log (operation, user_hash, request_hash, status);
+
+CREATE TABLE IF NOT EXISTS topic_extraction_history (
+    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_hash TEXT NOT NULL,
+    source_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL DEFAULT '',
+    topic_results_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_topic_extraction_history_user
+ON topic_extraction_history (user_hash, history_id DESC);
 """
+
+TOPIC_EXTRACTION_HISTORY_LIMIT = 5
 
 
 class EvaluationBackend:
@@ -173,6 +187,90 @@ class EvaluationBackend:
                 (status, result_count, error_type, self._now(), request_id),
             )
 
+    def _recent_topic_extraction_context(self, user_hash: str) -> str:
+        """Return the last five successful extraction rounds for one user."""
+        with self._request_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT topic_results_json
+                FROM topic_extraction_history
+                WHERE user_hash = ?
+                ORDER BY history_id DESC
+                LIMIT ?
+                """,
+                (user_hash, TOPIC_EXTRACTION_HISTORY_LIMIT),
+            ).fetchall()
+        if not rows:
+            return ""
+        results = [json.loads(row["topic_results_json"]) for row in reversed(rows)]
+        return (
+            "最近5轮主题提取结果（按时间从早到晚，仅供当前主题提取参考）：\n"
+            + json.dumps(results, ensure_ascii=False, separators=(",", ":"))
+        )
+
+    def _record_topic_extraction(
+        self,
+        *,
+        user_hash: str,
+        source_id: str,
+        session_id: str,
+        topic_results,
+    ) -> None:
+        """Persist one successful extraction round in the experiment store."""
+        if isinstance(topic_results, dict):
+            topic_results = [topic_results]
+        if not isinstance(topic_results, list) or not topic_results:
+            raise RuntimeError("HESM add_memory returned no topic extraction results")
+        with self._request_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO topic_extraction_history (
+                    user_hash, source_id, session_id, topic_results_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(source_id) DO NOTHING
+                """,
+                (
+                    user_hash,
+                    source_id,
+                    str(session_id or ""),
+                    json.dumps(topic_results, ensure_ascii=False),
+                    self._now(),
+                ),
+            )
+
+    def _wait_for_outbox(self, user_hash: str) -> None:
+        """Wait until experiment-only memory derivations are queryable."""
+        database_path = self.users_root / user_hash / "hesm.sqlite3"
+        if not database_path.exists():
+            return
+        timeout = float(self.settings.get("outbox_settle_timeout_seconds", 3600))
+        deadline = time.monotonic() + max(1.0, timeout)
+        while True:
+            with sqlite3.connect(database_path, timeout=60) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT status, COUNT(*)
+                    FROM memory_outbox
+                    WHERE status IN ('pending', 'processing', 'failed')
+                    GROUP BY status
+                    """
+                ).fetchall()
+            counts = {str(status): int(count) for status, count in rows}
+            if counts.get("failed", 0):
+                raise RuntimeError(
+                    "HESM derivation outbox contains failed jobs: "
+                    f"{counts['failed']}"
+                )
+            if not counts.get("pending", 0) and not counts.get("processing", 0):
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for HESM derivation outbox to settle "
+                    f"(pending={counts.get('pending', 0)}, "
+                    f"processing={counts.get('processing', 0)})"
+                )
+            time.sleep(0.1)
+
     def add(self, user_id, messages, session_id=""):
         """Apply request idempotency, then call native HESM ``add_memory``."""
         raw_user_id = str(user_id or "").strip()
@@ -206,13 +304,21 @@ class EvaluationBackend:
                     content = message["content"]
                     if not content.strip():
                         continue
-                    service.add_memory(
+                    source_id = f"{request_hash}:{index}"
+                    result = service.add_memory(
                         user_input=content,
                         assistant_output="",
+                        context=self._recent_topic_extraction_context(user_hash),
                         tools=message.get("tools") or [],
                         timestamp=message.get("chat_time"),
                         state_key="evaluation",
-                        source_id=f"{request_hash}:{index}",
+                        source_id=source_id,
+                    )
+                    self._record_topic_extraction(
+                        user_hash=user_hash,
+                        source_id=source_id,
+                        session_id=session_id,
+                        topic_results=result.get("topic_results") or [],
                     )
                     added += 1
             except Exception as exc:
@@ -247,17 +353,19 @@ class EvaluationBackend:
                 raise ValueError("query must be nonempty")
             if type(top_k) is not int or not 1 <= top_k <= self.settings["max_top_k"]:
                 raise ValueError("top_k outside configured range")
-            # Serialize initialization with a write for this user only. Native
-            # HESM owns its internal read/write consistency after initialization.
+            # The experiment requires a complete-memory barrier before scoring.
+            # Holding the user lock also prevents a concurrent add from opening
+            # a new derivation window between the barrier and retrieval.
             with self._write_lock(user_hash):
                 service = self._service(user_hash)
-            result = service.retrieve(
-                question=query,
-                state_key="evaluation",
-                extraction_context=(
-                    f"Question date: {question_date}" if question_date else ""
-                ),
-            )
+                self._wait_for_outbox(user_hash)
+                result = service.retrieve(
+                    question=query,
+                    state_key="evaluation",
+                    extraction_context=(
+                        f"Question date: {question_date}" if question_date else ""
+                    ),
+                )
         except Exception as exc:
             self._finish_request(
                 request_id, "failed", error_type=type(exc).__name__
@@ -308,6 +416,8 @@ class EvaluationBackend:
             "capabilities": [
                 "dataset_isolation", "user_isolation", "native_add",
                 "readonly_retrieval", "request_hash_idempotency",
+                "five_round_topic_extraction_context",
+                "derivation_completion_barrier",
             ],
         }
 

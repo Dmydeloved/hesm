@@ -32,6 +32,7 @@ class MemoryManager:
         segment_summary_qa_threshold: int = 5,
         experience_summary_segment_threshold: int = 5,
         experience_similarity_threshold: float = 0.82,
+        experience_route_margin: float = 0.05,
         min_segment_qas: int = 2,
         experience_recaller: ExperienceRecaller | None = None,
     ) -> None:
@@ -43,6 +44,7 @@ class MemoryManager:
         self.experience_summary_segment_threshold = experience_summary_segment_threshold
         # 语义路由阈值。
         self.experience_similarity_threshold = experience_similarity_threshold
+        self.experience_route_margin = max(0.0, float(experience_route_margin))
         self.min_segment_qas = min_segment_qas
         self.experience_recaller = experience_recaller
 
@@ -95,15 +97,33 @@ class MemoryManager:
                 timestamp=timestamp,
             )
 
-            # Segment intent 边界只在真正写入 QA 时判断。route_experience
-            # 仅负责定位 Experience 及其最新 Segment，供检索和写入共用。
+            # Segment intent 边界只在写入路径判断。父层更新统一交给 outbox。
+            action = "append_segment"
             if not current_segment or self._should_cut_segment(current_segment, intent):
                 if current_segment:
-                    current_segment["status"] = "completed"
-                    self._summarize_segment(
-                        current_segment,
+                    old_qa_count = self.storage.count_qas_by_segment(
+                        current_segment["segment_id"]
+                    )
+                    self._enqueue_job(
+                        "update_segment",
+                        "segment",
+                        current_segment["segment_id"],
+                        old_qa_count,
                         timestamp,
-                        reason="intent_switch",
+                        payload={
+                            "desired_status": "completed",
+                            "force_summary": True,
+                            "force_experience_summary": True,
+                        },
+                    )
+                    action = "new_segment"
+                else:
+                    action = (
+                        "new_experience"
+                        if self.storage.count_segments_by_experience(
+                            current_experience["experience_id"]
+                        ) == 0
+                        else "new_segment"
                     )
                 current_segment = self._create_segment(
                     current_experience,
@@ -118,10 +138,6 @@ class MemoryManager:
                 current_segment_id=current_segment["segment_id"],
                 updated_at=timestamp,
             )
-            action = self._resolve_add_action(
-                current_experience,
-                current_segment,
-            )
 
             qa = {
                 "qa_id": self._new_id("qa"),
@@ -135,6 +151,7 @@ class MemoryManager:
                 "core_entity": core_entity,
                 "entities": [str(entity) for entity in entities if str(entity).strip()],
                 "segment_id": current_segment["segment_id"],
+                "experience_id": current_experience["experience_id"],
                 "status": "open",
                 "confidence": confidence,
                 "reason": reasoning,
@@ -148,16 +165,19 @@ class MemoryManager:
                 current_experience["experience_id"],
             )
 
-            current_segment["qa_ids"].append(qa["qa_id"])
-            current_segment["updated_at"] = timestamp
-            self._maybe_summarize_segment_by_threshold(current_segment, timestamp)
-            self.storage.update_segment(current_segment)
-            self.upsert_segment_vector(current_segment["segment_id"])
-
-            self._attach_segment_to_experience(current_experience, current_segment, intent, timestamp)
-            self._maybe_summarize_experience_by_threshold(current_experience, timestamp)
-            self.storage.update_experience(current_experience)
-            self.upsert_experience_vector(current_experience["experience_id"])
+            qa_count = self.storage.count_qas_by_segment(current_segment["segment_id"])
+            self._enqueue_job(
+                "update_segment",
+                "segment",
+                current_segment["segment_id"],
+                qa_count,
+                timestamp,
+                payload={
+                    "desired_status": "open",
+                    "force_summary": False,
+                    "force_experience_summary": False,
+                },
+            )
             self.storage.commit()
             logger.info(
                 "Memory add committed state=%s qa_id=%s segment_id=%s experience_id=%s action=%s",
@@ -237,17 +257,35 @@ class MemoryManager:
                 (current_experience or {}).get("experience_id", ""),
             )
             if current_segment:
-                current_segment["status"] = "completed"
-                self._summarize_segment(
-                    current_segment,
-                    timestamp,
-                    reason="experience_switch",
+                old_qa_count = self.storage.count_qas_by_segment(
+                    current_segment["segment_id"]
                 )
-            if current_experience:
-                self._summarize_experience(
-                    current_experience,
+                self._enqueue_job(
+                    "update_segment",
+                    "segment",
+                    current_segment["segment_id"],
+                    old_qa_count,
                     timestamp,
-                    reason="experience_switch",
+                    payload={
+                        "desired_status": "completed",
+                        "force_summary": True,
+                        "force_experience_summary": True,
+                    },
+                )
+            elif current_experience:
+                old_segment_count = self.storage.count_segments_by_experience(
+                    current_experience["experience_id"]
+                )
+                self._enqueue_job(
+                    "update_experience",
+                    "experience",
+                    current_experience["experience_id"],
+                    old_segment_count,
+                    timestamp,
+                    payload={
+                        "desired_status": "open",
+                        "force_summary": True,
+                    },
                 )
 
             current_experience = self.storage.find_active_experience(
@@ -303,18 +341,6 @@ class MemoryManager:
         )
         return current_experience, current_segment
 
-    @staticmethod
-    def _resolve_add_action(
-        current_experience: dict[str, Any],
-        current_segment: dict[str, Any],
-    ) -> str:
-        """根据路由结果生成兼容现有返回结构的写入动作。"""
-        if current_segment.get("qa_ids"):
-            return "append_segment"
-        if current_experience.get("segment_ids"):
-            return "new_segment"
-        return "new_experience"
-
     def create_experience(
         self,
         *,
@@ -322,10 +348,9 @@ class MemoryManager:
         core_entity: str,
         query: str,
         intent: str = "",
-        history_experience: dict[str, Any] | str | None = None,
         timestamp: str | None = None,
     ) -> dict[str, Any]:
-        """创建进行中的 Experience，并注入召回的历史经验。"""
+        """Create the minimal Experience and enqueue its one-time derivations."""
         topic = str(topic or "").strip()
         core_entity = str(core_entity or "").strip()
         query = str(query or "").strip()
@@ -333,57 +358,67 @@ class MemoryManager:
             raise ValueError("topic, core_entity and query must not be empty")
 
         now = format_timestamp(timestamp)
-        if not history_experience:
-            if self.experience_recaller is None:
-                raise RuntimeError("experience_recaller is not configured")
-            recall_result = self.experience_recaller.recall(
-                topic=topic,
-                core_entity=core_entity,
-                query=query,
-                intent=intent,
-            )
-            history_experience = (
-                recall_result.get("history_experience")
-                if isinstance(recall_result, dict)
-                else ""
-            )
-        try:
-            experience = {
-                "experience_id": self._new_id("exp"),
+        experience = {
+            "experience_id": self._new_id("exp"),
+            "topic": topic,
+            "core_entity": core_entity,
+            "intents_link": [],
+            "segment_ids": [],
+            "summary": {},
+            "status": "open",
+            "created_at": now,
+            "updated_at": now,
+            "version": 1,
+            "last_summarized_segment_count": 0,
+            "history_experience": {},
+        }
+        self.storage.insert_experience(experience)
+        self._enqueue_job(
+            "recall_experience_history",
+            "experience",
+            experience["experience_id"],
+            experience["version"],
+            now,
+            payload={
                 "topic": topic,
                 "core_entity": core_entity,
-                "intents_link": [],
-                "segment_ids": [],
-                "summary": {},
+                "query": query,
+                "intent": intent,
+            },
+        )
+        self._enqueue_job(
+            "create_experience_route_vector",
+            "experience",
+            experience["experience_id"],
+            experience["version"],
+            now,
+            payload={
+                "topic": topic,
+                "core_entity": core_entity,
                 "status": "open",
                 "created_at": now,
                 "updated_at": now,
-                "version": 1,
-                "last_summarized_segment_count": 0,
-                "history_experience": history_experience or "",
-            }
-            self.storage.insert_experience(experience)
-            self.upsert_experience_vector(experience["experience_id"])
-            self.storage.commit()
-            logger.info(
-                "新建 Experience experience_id=%s topic=%s entity=%s",
-                experience["experience_id"],
-                topic,
-                core_entity,
-            )
-            return experience
-        except Exception:
-            self.storage.rollback()
-            raise
+            },
+        )
+        logger.info(
+            "新建 Experience experience_id=%s topic=%s entity=%s",
+            experience["experience_id"],
+            topic,
+            core_entity,
+        )
+        return experience
 
     def _mark_experience_completed(
         self, experience: dict[str, Any], now: str
     ) -> None:
-        experience["status"] = "completed"
-        experience["updated_at"] = now
-        experience["version"] = int(experience.get("version") or 0) + 1
-        self.storage.update_experience(experience)
-        self.upsert_experience_vector(experience["experience_id"])
+        self._enqueue_job(
+            "update_experience",
+            "experience",
+            experience["experience_id"],
+            self.storage.count_segments_by_experience(experience["experience_id"]),
+            now,
+            payload={"desired_status": "completed", "force_summary": True},
+        )
 
     def _create_segment(
         self,
@@ -408,7 +443,6 @@ class MemoryManager:
             "last_summarized_qa_count": 0,
         }
         self.storage.insert_segment(segment)
-        self.upsert_segment_vector(segment["segment_id"])
         logger.info(
             "新建 Segment segment_id=%s experience_id=%s intent=%s",
             segment["segment_id"],
@@ -417,125 +451,15 @@ class MemoryManager:
         )
         return segment
 
-    def _attach_segment_to_experience(
-        self,
-        experience: dict[str, Any],
-        segment: dict[str, Any],
-        intent: str,
-        now: str,
-    ) -> None:
-        if segment["segment_id"] not in experience["segment_ids"]:
-            experience["segment_ids"].append(segment["segment_id"])
-        if intent not in experience["intents_link"]:
-            experience["intents_link"].append(intent)
-        experience["status"] = "open"
-        experience["updated_at"] = now
-
-    def _maybe_summarize_segment_by_threshold(self, segment: dict[str, Any], now: str) -> None:
-        qa_count = len(segment["qa_ids"])
-        if qa_count - segment["last_summarized_qa_count"] >= self.segment_summary_qa_threshold:
-            logger.info(
-                "Segment summary threshold reached segment_id=%s qa_count=%s last_summarized=%s threshold=%s",
-                segment.get("segment_id", ""),
-                qa_count,
-                segment.get("last_summarized_qa_count", 0),
-                self.segment_summary_qa_threshold,
-            )
-            self._summarize_segment(segment, now, reason="qa_threshold")
-
-    def _maybe_summarize_experience_by_threshold(self, experience: dict[str, Any], now: str) -> None:
-        segment_count = len(experience["segment_ids"])
-        if segment_count - experience["last_summarized_segment_count"] >= self.experience_summary_segment_threshold:
-            logger.info(
-                "Experience summary threshold reached experience_id=%s segment_count=%s last_summarized=%s threshold=%s",
-                experience.get("experience_id", ""),
-                segment_count,
-                experience.get("last_summarized_segment_count", 0),
-                self.experience_summary_segment_threshold,
-            )
-            self._summarize_experience(experience, now, reason="segment_threshold")
-
-    def _summarize_segment(self, segment: dict[str, Any], now: str, reason: str) -> None:
-        qa_items = [
-            self._get_qa(qa_id)
-            for qa_id in segment.get("qa_ids", [])
-        ]
-        qa_items = [qa for qa in qa_items if qa]
-        if not qa_items:
-            logger.info(
-                "Segment summary skipped because no QA items segment_id=%s reason=%s",
-                segment.get("segment_id", ""),
-                reason,
-            )
-            return
-        logger.info(
-            "Segment summary invoking summarizer segment_id=%s reason=%s qa_count=%s",
-            segment.get("segment_id", ""),
-            reason,
-            len(qa_items),
-        )
-        summary = self.summarizer.summarize_segment(segment, qa_items)
-        segment["summary"] = self._summary_object(summary)
-        summary_state = segment["summary"].get("state") or {}
-        if summary_state.get("status") == "completed":
-            segment["status"] = "completed"
-        segment["last_summarized_qa_count"] = len(segment["qa_ids"])
-        segment["version"] += 1
-        segment["updated_at"] = now
-        self.storage.update_segment(segment)
-        self.upsert_segment_vector(segment["segment_id"])
-        logger.info(
-            "Segment 总结已更新 segment_id=%s reason=%s qa_count=%s version=%s",
-            segment["segment_id"],
-            reason,
-            len(segment["qa_ids"]),
-            segment["version"],
-        )
-
-    def _summarize_experience(self, experience: dict[str, Any], now: str, reason: str) -> None:
-        segments = [
-            self.storage.get_segment(segment_id)
-            for segment_id in experience.get("segment_ids", [])
-        ]
-        segments = [segment for segment in segments if segment]
-        logger.info(
-            "Experience summary invoking summarizer experience_id=%s reason=%s segment_count=%s",
-            experience.get("experience_id", ""),
-            reason,
-            len(segments),
-        )
-        summary = self.summarizer.summarize_experience(experience, segments)
-        experience["summary"] = self._summary_object(summary)
-        current_state = experience["summary"].get("current_state") or {}
-        if current_state.get("status") == "completed":
-            experience["status"] = "completed"
-        experience["last_summarized_segment_count"] = len(experience["segment_ids"])
-        experience["version"] += 1
-        experience["updated_at"] = now
-        self.storage.update_experience(experience)
-        self.upsert_experience_vector(experience["experience_id"])
-        logger.info(
-            "Experience 总结已更新 experience_id=%s reason=%s segment_count=%s version=%s",
-            experience["experience_id"],
-            reason,
-            len(experience["segment_ids"]),
-            experience["version"],
-        )
-
-    def _get_qa(self, qa_id: str) -> dict[str, Any] | None:
-        return self.storage.get_qa(qa_id)
-
-    def upsert_experience_vector(self, experience_id: str) -> None:
-        """同步 Experience 内容向量与主题实体路由向量。"""
+    def upsert_experience_content_vector(self, experience_id: str) -> None:
+        """Update the Experience content vector only."""
         experience = self.storage.get_experience(experience_id)
         if not experience:
             raise ValueError(f"Unknown experience_id: {experience_id}")
         recent_segments = self.storage.list_segments_by_experience_ids([experience_id])[:3]
         vector_memory = {**experience, "recent_segments": recent_segments}
         text = build_vector_document("experience", vector_memory)
-        route_text = build_vector_document("experience_route", vector_memory)
         normal_embedding = self.embedder.embed(text)
-        route_embedding = self.embedder.embed(route_text)
         metadata = build_vector_metadata("experience", experience)
         self.vector_store.upsert(
             memory_type="experience",
@@ -545,6 +469,27 @@ class MemoryManager:
             updated_at=experience["updated_at"],
             metadata=metadata,
         )
+
+    def create_experience_route_vector(
+        self,
+        experience_id: str,
+        creation_snapshot: dict[str, Any],
+    ) -> None:
+        """Create an idempotent route vector from immutable creation fields."""
+        experience = {
+            "experience_id": experience_id,
+            "topic": str(creation_snapshot.get("topic") or ""),
+            "core_entity": str(creation_snapshot.get("core_entity") or ""),
+            "status": "open",
+            "created_at": creation_snapshot.get("created_at"),
+            "updated_at": creation_snapshot.get("updated_at")
+            or creation_snapshot.get("created_at"),
+        }
+        if not experience["topic"] or not experience["core_entity"]:
+            raise ValueError("Experience route creation snapshot is incomplete")
+        route_text = build_vector_document("experience_route", experience)
+        route_embedding = self.embedder.embed(route_text)
+        metadata = build_vector_metadata("experience_route", experience)
         self.vector_store.upsert(
             memory_type="experience_route",
             memory_id=experience_id,
@@ -553,7 +498,30 @@ class MemoryManager:
             updated_at=experience["updated_at"],
             metadata=metadata,
         )
-        logger.debug("Experience 双向量已同步 id=%s", experience_id)
+        logger.debug("Experience 路由向量已创建 id=%s", experience_id)
+
+    def upsert_experience_vector(self, experience_id: str) -> None:
+        """Compatibility helper for the mutable Experience content vector."""
+        self.upsert_experience_content_vector(experience_id)
+
+    def _enqueue_job(
+        self,
+        job_type: str,
+        memory_type: str,
+        memory_id: str,
+        target_version: int,
+        timestamp: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.storage.enqueue_memory_job(
+            job_id=self._new_id("job"),
+            job_type=job_type,
+            memory_type=memory_type,
+            memory_id=memory_id,
+            target_version=target_version,
+            timestamp=timestamp,
+            payload=payload,
+        )
 
     def upsert_segment_vector(self, segment_id: str) -> None:
         segment = self.storage.get_segment(segment_id)
@@ -584,14 +552,19 @@ class MemoryManager:
         qa = self.storage.get_qa(qa_id)
         if not qa:
             raise ValueError(f"Unknown qa_id: {qa_id}")
-        text = build_vector_document("qa", qa)
+        segment = self.storage.get_segment(qa.get("segment_id"))
+        vector_memory = {
+            **qa,
+            "experience_id": (segment or {}).get("experience_id", ""),
+        }
+        text = build_vector_document("qa", vector_memory)
         self.vector_store.upsert(
             memory_type="qa",
             memory_id=qa_id,
             text=text,
             embedding=self.embedder.embed(text),
             updated_at=qa["timestamp"],
-            metadata=build_vector_metadata("qa", qa),
+            metadata=build_vector_metadata("qa", vector_memory),
         )
         logger.debug("QA 向量已写入 id=%s", qa_id)
 
@@ -625,6 +598,7 @@ class MemoryManager:
             memory_type="experience_route",
             top_k=5,
         )
+        candidates: list[tuple[dict[str, Any], float]] = []
         for item in results:
             if item["similarity"] <= self.experience_similarity_threshold:
                 break  # results are sorted by similarity desc; no point checking rest
@@ -641,15 +615,29 @@ class MemoryManager:
                 experience
                 and experience.get("status") == "open"
             ):
-                logger.info(
-                    "Experience 路由向量命中 id=%s sim=%.3f topic=%s entity=%s",
-                    exp_id,
-                    item["similarity"],
-                    experience["topic"],
-                    experience["core_entity"],
-                )
-                return experience
-        return None
+                candidates.append((experience, float(item["similarity"])))
+        if not candidates:
+            return None
+        if (
+            len(candidates) > 1
+            and candidates[0][1] - candidates[1][1] < self.experience_route_margin
+        ):
+            logger.info(
+                "Experience 路由向量候选不明确 first=%.3f second=%.3f margin=%.3f",
+                candidates[0][1],
+                candidates[1][1],
+                self.experience_route_margin,
+            )
+            return None
+        experience, similarity = candidates[0]
+        logger.info(
+            "Experience 路由向量命中 id=%s sim=%.3f topic=%s entity=%s",
+            experience["experience_id"],
+            similarity,
+            experience["topic"],
+            experience["core_entity"],
+        )
+        return experience
 
     def _should_cut_segment(self, segment: dict[str, Any], intent: str) -> bool:
         """判断是否应该切断当前 Segment，开启新 Segment。
@@ -687,11 +675,12 @@ class MemoryManager:
             )
             return False
 
-        if len(segment.get("qa_ids") or []) < self.min_segment_qas:
+        qa_count = self.storage.count_qas_by_segment(segment["segment_id"])
+        if qa_count < self.min_segment_qas:
             logger.info(
                 "Segment retained because QA count is below threshold segment_id=%s qa_count=%s min_segment_qas=%s similarity=%.3f",
                 segment.get("segment_id", ""),
-                len(segment.get("qa_ids") or []),
+                qa_count,
                 self.min_segment_qas,
                 similarity,
             )
@@ -702,7 +691,7 @@ class MemoryManager:
             segment.get("segment_id", ""),
             segment["intent"],
             intent,
-            len(segment.get("qa_ids") or []),
+            qa_count,
             similarity,
         )
         return True

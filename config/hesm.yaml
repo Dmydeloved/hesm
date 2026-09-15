@@ -4,7 +4,7 @@ paths:
 
 # Production HESM provider settings. This file is never read by experiments.
 _llm_connection: &llm_connection
-  api_key: "sk-RFUNAF0b6zfJWCVz9dA1Aa244aEa43Dc974693370b8d4338"
+  api_key: "sk-IXbHAW109t16ciajF2B5Bd4e75E34a0a8112DbAa2dF828Fa"
   base_url: https://api.gpt.ge/v1/
   max_retries: 3
   retry_delay: 2.0
@@ -28,6 +28,10 @@ retrieval:
   experience_vector_recall_limit: 12
   experience_relational_recall_limit: 12
   experience_similarity_threshold: 0.82
+  # Vector-route ambiguity and QA hybrid fallback (dense + SQLite fields).
+  experience_route_margin: 0.05
+  qa_candidate_limit: 40
+  qa_similarity_threshold: 0.45
 
 summarization: *strong_llm
 
@@ -39,6 +43,11 @@ memory_management:
   experience_segment_threshold: 5
   experience_similarity_threshold: 0.82
   min_segment_qas: 2
+  # QA vectors stay synchronous; aggregate parent updates and vectors use outbox.
+  async_derivation: true
+  async_poll_interval: 0.5
+  async_batch_size: 8
+  async_max_retries: 3
 
 api:
   top_experience: 1

@@ -82,6 +82,21 @@ CREATE TABLE IF NOT EXISTS chat_session (
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS memory_outbox (
+    job_id TEXT PRIMARY KEY,
+    job_type TEXT NOT NULL,
+    memory_type TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    target_version INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(job_type, memory_type, memory_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_qa_segment_id ON qa_memory(segment_id);
 CREATE INDEX IF NOT EXISTS idx_qa_topic_entity_intent
 ON qa_memory(topic, core_entity, intent);
@@ -95,6 +110,8 @@ CREATE INDEX IF NOT EXISTS idx_qa_topic
 ON qa_memory(topic);
 CREATE INDEX IF NOT EXISTS idx_chat_session_updated_at
 ON chat_session(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_outbox_status_created
+ON memory_outbox(status, created_at);
 """
 
 
@@ -110,6 +127,7 @@ JSON_FIELDS = {
     "vector_json",
     "messages_json",
     "metadata_json",
+    "payload_json",
 }
 
 JSON_DEFAULTS: dict[str, Any] = {
@@ -155,10 +173,14 @@ class MemoryStorage:
             )
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
+        self.connection.execute("PRAGMA busy_timeout = 15000")
         if not read_only:
+            self.connection.execute("PRAGMA journal_mode = WAL")
+            self.connection.execute("PRAGMA synchronous = NORMAL")
             self.connection.executescript(SCHEMA)
             self._ensure_runtime_state_columns()
             self._ensure_memory_columns()
+            self._drop_legacy_qa_search_index()
             self._normalize_stored_timestamps()
             self.connection.commit()
         logger.info("结构化记忆库已初始化 db=%s", self.db_path.resolve())
@@ -196,7 +218,7 @@ class MemoryStorage:
                 self.connection.execute(
                     "UPDATE qa_memory SET reason = reasoning WHERE reason = ''"
                 )
-        self.connection.execute(
+        cursor = self.connection.execute(
             "UPDATE qa_memory SET status = 'open' WHERE status = 'active'"
         )
 
@@ -241,6 +263,17 @@ class MemoryStorage:
                     END
                     """
                 )
+
+        outbox_columns = self._table_columns("memory_outbox")
+        if "payload_json" not in outbox_columns:
+            self.connection.execute(
+                "ALTER TABLE memory_outbox "
+                "ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'"
+            )
+
+    def _drop_legacy_qa_search_index(self) -> None:
+        """Remove the retired full-text virtual table from existing databases."""
+        self.connection.execute("DROP TABLE IF EXISTS qa_memory_fts")
 
     def _normalize_stored_timestamps(self) -> None:
         """将已有记忆及会话中的时间统一迁移为标准格式。"""
@@ -483,6 +516,193 @@ class MemoryStorage:
             ),
         )
 
+    def enqueue_memory_job(
+        self,
+        *,
+        job_id: str,
+        job_type: str,
+        memory_type: str,
+        memory_id: str,
+        target_version: int,
+        timestamp: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist or coalesce one asynchronous derived-memory job."""
+        now = format_timestamp(timestamp)
+        incoming_payload = dict(payload or {})
+        existing = self.connection.execute(
+            """
+            SELECT payload_json FROM memory_outbox
+            WHERE job_type = ? AND memory_type = ? AND memory_id = ?
+            """,
+            (job_type, memory_type, memory_id),
+        ).fetchone()
+        if existing:
+            try:
+                previous_payload = json.loads(existing["payload_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                previous_payload = {}
+            if not isinstance(previous_payload, dict):
+                previous_payload = {}
+            incoming_payload = self._merge_memory_job_payload(
+                previous_payload,
+                incoming_payload,
+            )
+        self.connection.execute(
+            """
+            INSERT INTO memory_outbox (
+                job_id, job_type, memory_type, memory_id, target_version,
+                status, retry_count, last_error, payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', 0, '', ?, ?, ?)
+            ON CONFLICT(job_type, memory_type, memory_id) DO UPDATE SET
+                target_version = MAX(memory_outbox.target_version, excluded.target_version),
+                status = 'pending',
+                retry_count = 0,
+                last_error = '',
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                job_id,
+                job_type,
+                memory_type,
+                memory_id,
+                max(0, int(target_version)),
+                json.dumps(incoming_payload, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _merge_memory_job_payload(
+        previous: dict[str, Any],
+        incoming: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge coalesced update intent without losing force/status signals."""
+        merged = {**previous, **incoming}
+        for key in ("force_summary", "force_experience_summary"):
+            if key in previous or key in incoming:
+                merged[key] = bool(previous.get(key)) or bool(incoming.get(key))
+        if "desired_status" in previous or "desired_status" in incoming:
+            status_rank = {"open": 0, "completed": 1, "deleted": 2}
+            statuses = [
+                str(value or "open")
+                for value in (
+                    previous.get("desired_status"),
+                    incoming.get("desired_status"),
+                )
+            ]
+            merged["desired_status"] = max(
+                statuses,
+                key=lambda value: status_rank.get(value, 0),
+            )
+        return merged
+
+    def recover_processing_memory_jobs(self) -> int:
+        """Return interrupted jobs to the pending queue after a restart."""
+        cursor = self.connection.execute(
+            """
+            UPDATE memory_outbox
+            SET status = 'pending', updated_at = created_at
+            WHERE status = 'processing'
+            """
+        )
+        return int(cursor.rowcount)
+
+    def list_pending_memory_jobs(self, limit: int = 10) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT * FROM memory_outbox
+            WHERE status = 'pending'
+            ORDER BY created_at, job_id
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        jobs = []
+        for row in rows:
+            job = dict(row)
+            try:
+                job["payload"] = json.loads(job.pop("payload_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                job["payload"] = {}
+            jobs.append(job)
+        return jobs
+
+    def get_memory_job(self, job_id: str) -> dict[str, Any] | None:
+        """Reload the latest coalesced job state after it has been claimed."""
+        row = self.connection.execute(
+            "SELECT * FROM memory_outbox WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if not row:
+            return None
+        job = dict(row)
+        try:
+            job["payload"] = json.loads(job.pop("payload_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            job["payload"] = {}
+        return job
+
+    def mark_memory_job_processing(self, job_id: str, timestamp: str) -> bool:
+        cursor = self.connection.execute(
+            """
+            UPDATE memory_outbox
+            SET status = 'processing', updated_at = ?
+            WHERE job_id = ? AND status = 'pending'
+            """,
+            (format_timestamp(timestamp), job_id),
+        )
+        return bool(cursor.rowcount)
+
+    def mark_memory_job_completed(
+        self,
+        job_id: str,
+        target_version: int,
+        timestamp: str,
+    ) -> bool:
+        cursor = self.connection.execute(
+            """
+            UPDATE memory_outbox
+            SET status = 'completed', last_error = '', updated_at = ?
+            WHERE job_id = ?
+              AND status = 'processing'
+              AND target_version <= ?
+            """,
+            (format_timestamp(timestamp), job_id, int(target_version)),
+        )
+        return bool(cursor.rowcount)
+
+    def mark_memory_job_failed(
+        self,
+        job_id: str,
+        error: str,
+        timestamp: str,
+        *,
+        max_retries: int,
+    ) -> None:
+        row = self.connection.execute(
+            "SELECT retry_count FROM memory_outbox WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        retry_count = int(row["retry_count"] if row else 0) + 1
+        status = "failed" if retry_count >= max(1, int(max_retries)) else "pending"
+        self.connection.execute(
+            """
+            UPDATE memory_outbox
+            SET status = ?, retry_count = ?, last_error = ?, updated_at = ?
+            WHERE job_id = ? AND status = 'processing'
+            """,
+            (
+                status,
+                retry_count,
+                str(error or "")[:4000],
+                format_timestamp(timestamp),
+                job_id,
+            ),
+        )
+
     def insert_qa(self, qa: dict[str, Any]) -> None:
         columns = [
             "qa_id", "source_id", "timestamp", "user_input", "assistant_output", "tools_json",
@@ -533,6 +753,27 @@ class MemoryStorage:
         rows = self.connection.execute(
             f"SELECT * FROM qa_memory WHERE qa_id IN ({placeholders})",
             qa_ids,
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def count_qas_by_segment(self, segment_id: str) -> int:
+        """Count live QA rows without relying on the async Segment projection."""
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM qa_memory "
+            "WHERE segment_id = ? AND status = 'open'",
+            (segment_id,),
+        ).fetchone()
+        return int(row["count"] if row else 0)
+
+    def list_qas_by_segment(self, segment_id: str) -> list[dict[str, Any]]:
+        """Load live QA evidence directly from the normalized relation."""
+        rows = self.connection.execute(
+            """
+            SELECT * FROM qa_memory
+            WHERE segment_id = ? AND status = 'open'
+            ORDER BY timestamp, qa_id
+            """,
+            (segment_id,),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
@@ -614,6 +855,137 @@ class MemoryStorage:
                 version = ?,
                 last_summarized_qa_count = ?,
                 status = ?
+                {legacy_assignment}
+            WHERE segment_id = ?
+            """,
+            parameters,
+        )
+
+    def update_segment_activity(self, segment: dict[str, Any]) -> None:
+        """Update request-owned Segment fields while preserving derived summary fields."""
+        self.connection.execute(
+            """
+            UPDATE segment_memory SET
+                qa_ids_json = ?,
+                updated_at = ?,
+                status = ?
+            WHERE segment_id = ?
+            """,
+            (
+                json.dumps(segment.get("qa_ids") or [], ensure_ascii=False),
+                format_timestamp(segment["updated_at"]),
+                self._normalize_status(segment.get("status")),
+                segment["segment_id"],
+            ),
+        )
+
+    def reconcile_segment(
+        self,
+        *,
+        segment_id: str,
+        desired_status: str = "open",
+        updated_at: str,
+        summary: dict[str, Any] | None = None,
+        summarized_qa_count: int | None = None,
+    ) -> None:
+        """Apply one aggregate Segment update from normalized QA evidence."""
+        qa_rows = self.connection.execute(
+            """
+            SELECT qa_id, timestamp FROM qa_memory
+            WHERE segment_id = ? AND status = 'open'
+            ORDER BY timestamp, qa_id
+            """,
+            (segment_id,),
+        ).fetchall()
+        qa_ids = [str(row["qa_id"]) for row in qa_rows]
+        latest_qa_at = str(qa_rows[-1]["timestamp"]) if qa_rows else ""
+        effective_updated_at = max(
+            format_timestamp(updated_at),
+            format_timestamp(latest_qa_at) if latest_qa_at else "",
+        )
+        normalized_status = self._normalize_status(desired_status)
+        summary_assignment = ""
+        legacy_assignment = ""
+        parameters: list[Any] = [json.dumps(qa_ids, ensure_ascii=False)]
+        if summary is not None:
+            summary_payload = self._segment_summary_payload(summary)
+            summary_assignment = (
+                ", summary_json = ?, "
+                "last_summarized_qa_count = MAX(last_summarized_qa_count, ?)"
+            )
+            parameters.extend(
+                [
+                    json.dumps(summary_payload, ensure_ascii=False),
+                    max(0, int(summarized_qa_count or 0)),
+                ]
+            )
+            if "summary" in self._table_columns("segment_memory"):
+                legacy_assignment = ", summary = ?"
+                parameters.append(json.dumps(summary_payload, ensure_ascii=False))
+        parameters.extend(
+            [
+                effective_updated_at,
+                normalized_status,
+                normalized_status,
+                segment_id,
+            ]
+        )
+        self.connection.execute(
+            f"""
+            UPDATE segment_memory SET
+                qa_ids_json = ?
+                {summary_assignment}
+                {legacy_assignment},
+                updated_at = MAX(updated_at, ?),
+                status = CASE
+                    WHEN status = 'deleted' THEN 'deleted'
+                    WHEN ? = 'deleted' THEN 'deleted'
+                    WHEN status = 'completed' OR ? = 'completed' THEN 'completed'
+                    ELSE 'open'
+                END,
+                version = version + 1
+            WHERE segment_id = ?
+            """,
+            parameters,
+        )
+
+    def update_segment_summary(
+        self,
+        *,
+        segment_id: str,
+        summary: dict[str, Any],
+        last_summarized_qa_count: int,
+        status: str,
+        updated_at: str,
+    ) -> None:
+        """Update derived Segment fields without overwriting concurrently added QA ids."""
+        summary_payload = self._segment_summary_payload(summary)
+        legacy_assignment = (
+            ", summary = ?"
+            if "summary" in self._table_columns("segment_memory")
+            else ""
+        )
+        parameters: list[Any] = [
+            json.dumps(summary_payload, ensure_ascii=False),
+            max(0, int(last_summarized_qa_count)),
+            self._normalize_status(status),
+            format_timestamp(updated_at),
+        ]
+        if legacy_assignment:
+            parameters.append(json.dumps(summary_payload, ensure_ascii=False))
+        parameters.append(segment_id)
+        self.connection.execute(
+            f"""
+            UPDATE segment_memory SET
+                summary_json = ?,
+                last_summarized_qa_count = MAX(last_summarized_qa_count, ?),
+                status = CASE
+                    WHEN status = 'deleted' THEN 'deleted'
+                    WHEN ? = 'completed' THEN 'completed'
+                    ELSE status
+                END,
+                updated_at = ?,
+                version = version + 1
                 {legacy_assignment}
             WHERE segment_id = ?
             """,
@@ -798,33 +1170,43 @@ class MemoryStorage:
         topic: str,
         core_entity: str,
         entities: list[str],
-        keywords: list[str],
         limit: int,
+        intent: str = "",
+        keywords: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Broad relational QA recall used only for low-confidence queries."""
+        """Recall QA rows by keywords already stored in structured SQLite fields."""
         conditions: list[str] = []
         parameters: list[Any] = []
+        score_parts: list[str] = []
+        score_parameters: list[Any] = []
         topic = str(topic or "").strip()
         core_entity = str(core_entity or "").strip()
+        intent = str(intent or "").strip()
         normalized_entities = sorted({
             str(value).strip().casefold()
             for value in entities
             if str(value).strip()
         })
-        normalized_keywords = [
-            str(value).strip() for value in keywords if str(value).strip()
-        ]
 
         if topic:
             conditions.append("q.topic = ?")
             parameters.append(topic)
+            score_parts.append("CASE WHEN q.topic = ? THEN 4 ELSE 0 END")
+            score_parameters.append(topic)
         if core_entity:
             conditions.append("q.core_entity = ?")
             parameters.append(core_entity)
+            score_parts.append("CASE WHEN q.core_entity = ? THEN 6 ELSE 0 END")
+            score_parameters.append(core_entity)
+        if intent:
+            conditions.append("q.intent = ?")
+            parameters.append(intent)
+            score_parts.append("CASE WHEN q.intent = ? THEN 2 ELSE 0 END")
+            score_parameters.append(intent)
         if normalized_entities:
             placeholders = ", ".join("?" for _ in normalized_entities)
             # JSON1 membership avoids substring matches in serialized entity data.
-            conditions.append(
+            entity_match = (
                 "EXISTS ("
                 "SELECT 1 FROM json_each("
                 "CASE WHEN json_valid(q.entities_json) THEN q.entities_json ELSE '[]' END"
@@ -832,27 +1214,22 @@ class MemoryStorage:
                 f"IN ({placeholders})"
                 ")"
             )
+            conditions.append(entity_match)
             parameters.extend(normalized_entities)
-        searchable = (
-            "COALESCE(q.user_input, '') || ' ' || "
-            "COALESCE(q.assistant_output, '') || ' ' || "
-            "COALESCE(q.intent, '')"
-        )
-        for keyword in normalized_keywords:
-            conditions.append(f"({searchable}) LIKE ?")
-            parameters.append(f"%{keyword}%")
+            score_parts.append(f"CASE WHEN {entity_match} THEN 3 ELSE 0 END")
+            score_parameters.extend(normalized_entities)
         if not conditions:
             return []
 
         rows = self.connection.execute(
             f"""
-            SELECT q.*
+            SELECT q.*, ({' + '.join(score_parts)}) AS keyword_score
             FROM qa_memory AS q
             WHERE q.status = 'open' AND ({' OR '.join(conditions)})
-            ORDER BY q.timestamp DESC
+            ORDER BY keyword_score DESC, q.timestamp DESC
             LIMIT ?
             """,
-            (*parameters, max(1, int(limit))),
+            (*score_parameters, *parameters, max(1, int(limit))),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
@@ -865,6 +1242,15 @@ class MemoryStorage:
             experience_ids,
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
+
+    def count_segments_by_experience(self, experience_id: str) -> int:
+        """Count live Segment rows without relying on async Experience fields."""
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM segment_memory "
+            "WHERE experience_id = ? AND status != 'deleted'",
+            (experience_id,),
+        ).fetchone()
+        return int(row["count"] if row else 0)
 
     def insert_experience(self, experience: dict[str, Any]) -> None:
         summary = self._experience_summary_payload(experience.get("summary"))
@@ -950,6 +1336,181 @@ class MemoryStorage:
             parameters,
         )
 
+    def update_experience_activity(self, experience: dict[str, Any]) -> None:
+        """Update hierarchy links while preserving async summary/history fields."""
+        self.connection.execute(
+            """
+            UPDATE experience_memory SET
+                intents_link_json = ?,
+                segment_ids_json = ?,
+                updated_at = ?,
+                status = ?
+            WHERE experience_id = ?
+            """,
+            (
+                json.dumps(experience.get("intents_link") or [], ensure_ascii=False),
+                json.dumps(experience.get("segment_ids") or [], ensure_ascii=False),
+                format_timestamp(experience["updated_at"]),
+                self._normalize_status(experience.get("status")),
+                experience["experience_id"],
+            ),
+        )
+
+    def reconcile_experience(
+        self,
+        *,
+        experience_id: str,
+        desired_status: str = "open",
+        updated_at: str,
+        summary: dict[str, Any] | None = None,
+        summarized_segment_count: int | None = None,
+    ) -> None:
+        """Apply one aggregate Experience update from normalized Segment data."""
+        segment_rows = self.connection.execute(
+            """
+            SELECT segment_id, intent, updated_at FROM segment_memory
+            WHERE experience_id = ? AND status != 'deleted'
+            ORDER BY created_at, segment_id
+            """,
+            (experience_id,),
+        ).fetchall()
+        segment_ids = [str(row["segment_id"]) for row in segment_rows]
+        intents = list(
+            dict.fromkeys(
+                str(row["intent"]).strip()
+                for row in segment_rows
+                if str(row["intent"] or "").strip()
+            )
+        )
+        latest_segment_at = max(
+            (str(row["updated_at"] or "") for row in segment_rows),
+            default="",
+        )
+        effective_updated_at = max(
+            format_timestamp(updated_at),
+            format_timestamp(latest_segment_at) if latest_segment_at else "",
+        )
+        normalized_status = self._normalize_status(desired_status)
+        summary_assignment = ""
+        parameters: list[Any] = [
+            json.dumps(intents, ensure_ascii=False),
+            json.dumps(segment_ids, ensure_ascii=False),
+        ]
+        if summary is not None:
+            summary_assignment = (
+                ", summary_json = ?, "
+                "last_summarized_segment_count = MAX("
+                "last_summarized_segment_count, ?)"
+            )
+            parameters.extend(
+                [
+                    json.dumps(
+                        self._experience_summary_payload(summary),
+                        ensure_ascii=False,
+                    ),
+                    max(0, int(summarized_segment_count or 0)),
+                ]
+            )
+        parameters.extend(
+            [
+                effective_updated_at,
+                normalized_status,
+                normalized_status,
+                experience_id,
+            ]
+        )
+        self.connection.execute(
+            f"""
+            UPDATE experience_memory SET
+                intents_link_json = ?,
+                segment_ids_json = ?
+                {summary_assignment},
+                updated_at = MAX(updated_at, ?),
+                status = CASE
+                    WHEN status = 'deleted' THEN 'deleted'
+                    WHEN ? = 'deleted' THEN 'deleted'
+                    WHEN status = 'completed' OR ? = 'completed' THEN 'completed'
+                    ELSE 'open'
+                END,
+                version = version + 1
+            WHERE experience_id = ?
+            """,
+            parameters,
+        )
+        if "state_json" in self._table_columns("experience_memory"):
+            row = self.connection.execute(
+                "SELECT status FROM experience_memory WHERE experience_id = ?",
+                (experience_id,),
+            ).fetchone()
+            if row:
+                self.connection.execute(
+                    "UPDATE experience_memory SET state_json = ? "
+                    "WHERE experience_id = ?",
+                    (
+                        json.dumps({"status": row["status"]}, ensure_ascii=False),
+                        experience_id,
+                    ),
+                )
+
+    def update_experience_summary(
+        self,
+        *,
+        experience_id: str,
+        summary: dict[str, Any],
+        last_summarized_segment_count: int,
+        status: str,
+        updated_at: str,
+    ) -> None:
+        """Update derived Experience fields without overwriting live hierarchy links."""
+        summary_payload = self._experience_summary_payload(summary)
+        self.connection.execute(
+            """
+            UPDATE experience_memory SET
+                summary_json = ?,
+                last_summarized_segment_count = MAX(
+                    last_summarized_segment_count, ?
+                ),
+                status = CASE
+                    WHEN status = 'deleted' THEN 'deleted'
+                    WHEN ? = 'completed' THEN 'completed'
+                    ELSE status
+                END,
+                updated_at = ?,
+                version = version + 1
+            WHERE experience_id = ?
+            """,
+            (
+                json.dumps(summary_payload, ensure_ascii=False),
+                max(0, int(last_summarized_segment_count)),
+                self._normalize_status(status),
+                format_timestamp(updated_at),
+                experience_id,
+            ),
+        )
+
+    def update_experience_history(
+        self,
+        *,
+        experience_id: str,
+        history_experience: dict[str, Any] | str,
+        updated_at: str,
+    ) -> None:
+        """Update recalled history without overwriting concurrent Experience changes."""
+        self.connection.execute(
+            """
+            UPDATE experience_memory SET
+                history_experience_json = ?,
+                updated_at = ?,
+                version = version + 1
+            WHERE experience_id = ? AND status != 'deleted'
+            """,
+            (
+                json.dumps(history_experience or {}, ensure_ascii=False),
+                format_timestamp(updated_at),
+                experience_id,
+            ),
+        )
+
     def list_segments_by_experience_ids(
         self, experience_ids: list[str]
     ) -> list[dict[str, Any]]:
@@ -1019,6 +1580,7 @@ class MemoryStorage:
             "experience_memory",
             "runtime_state",
             "chat_session",
+            "memory_outbox",
         }:
             raise ValueError(f"Unsupported table: {table}")
         return int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
