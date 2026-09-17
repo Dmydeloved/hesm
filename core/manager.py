@@ -30,10 +30,13 @@ class MemoryManager:
         embedder: TextEmbedder,
         summarizer: SummarizerProtocol | None = None,
         segment_summary_qa_threshold: int = 5,
-        experience_summary_segment_threshold: int = 5,
+        experience_summary_segment_threshold: int = 2,
         experience_similarity_threshold: float = 0.82,
         experience_route_margin: float = 0.05,
         min_segment_qas: int = 2,
+        segment_similarity_threshold: float = 0.8,
+        segment_route_margin: float = 0.1,
+        segment_route_window: int = 5,
         experience_recaller: ExperienceRecaller | None = None,
     ) -> None:
         self.storage = storage
@@ -45,7 +48,12 @@ class MemoryManager:
         # 语义路由阈值。
         self.experience_similarity_threshold = experience_similarity_threshold
         self.experience_route_margin = max(0.0, float(experience_route_margin))
+        # Kept as a compatibility attribute; Segment routing no longer merges
+        # unrelated intents merely to reach a minimum QA count.
         self.min_segment_qas = min_segment_qas
+        self.segment_similarity_threshold = float(segment_similarity_threshold)
+        self.segment_route_margin = max(0.0, float(segment_route_margin))
+        self.segment_route_window = max(1, int(segment_route_window))
         self.experience_recaller = experience_recaller
 
     def add_qa(
@@ -97,10 +105,16 @@ class MemoryManager:
                 timestamp=timestamp,
             )
 
-            # Segment intent 边界只在写入路径判断。父层更新统一交给 outbox。
+            # Route across a small window of open Segments.  A low QA count is
+            # never used as permission to mix an incompatible intent.
             action = "append_segment"
-            if not current_segment or self._should_cut_segment(current_segment, intent):
-                if current_segment:
+            routed_segment = self._find_segment_for_intent(
+                current_experience["experience_id"],
+                intent,
+                preferred=current_segment,
+            )
+            if routed_segment is None:
+                if current_segment and current_segment.get("status") == "open":
                     old_qa_count = self.storage.count_qas_by_segment(
                         current_segment["segment_id"]
                     )
@@ -113,7 +127,6 @@ class MemoryManager:
                         payload={
                             "desired_status": "completed",
                             "force_summary": True,
-                            "force_experience_summary": True,
                         },
                     )
                     action = "new_segment"
@@ -132,6 +145,27 @@ class MemoryManager:
                     intent,
                     timestamp,
                 )
+            else:
+                if (
+                    current_segment
+                    and current_segment.get("status") == "open"
+                    and current_segment.get("segment_id")
+                    != routed_segment.get("segment_id")
+                ):
+                    self._enqueue_job(
+                        "update_segment",
+                        "segment",
+                        current_segment["segment_id"],
+                        self.storage.count_qas_by_segment(
+                            current_segment["segment_id"]
+                        ),
+                        timestamp,
+                        payload={
+                            "desired_status": "completed",
+                            "force_summary": True,
+                        },
+                    )
+                current_segment = routed_segment
             self.storage.upsert_runtime_state(
                 state_key=state_key,
                 current_experience_id=current_experience["experience_id"],
@@ -173,10 +207,9 @@ class MemoryManager:
                 qa_count,
                 timestamp,
                 payload={
-                    "desired_status": "open",
-                    "force_summary": False,
-                    "force_experience_summary": False,
-                },
+                        "desired_status": "open",
+                        "force_summary": False,
+                    },
             )
             self.storage.commit()
             logger.info(
@@ -269,22 +302,7 @@ class MemoryManager:
                     payload={
                         "desired_status": "completed",
                         "force_summary": True,
-                        "force_experience_summary": True,
-                    },
-                )
-            elif current_experience:
-                old_segment_count = self.storage.count_segments_by_experience(
-                    current_experience["experience_id"]
-                )
-                self._enqueue_job(
-                    "update_experience",
-                    "experience",
-                    current_experience["experience_id"],
-                    old_segment_count,
-                    timestamp,
-                    payload={
-                        "desired_status": "open",
-                        "force_summary": True,
+                        "allow_experience_completion": True,
                     },
                 )
 
@@ -370,6 +388,7 @@ class MemoryManager:
             "updated_at": now,
             "version": 1,
             "last_summarized_segment_count": 0,
+            "last_summarized_child_revision": 0,
             "history_experience": {},
         }
         self.storage.insert_experience(experience)
@@ -441,6 +460,8 @@ class MemoryManager:
             "updated_at": now,
             "version": 1,
             "last_summarized_qa_count": 0,
+            "summarized_qa_ids": [],
+            "summary_version": 0,
         }
         self.storage.insert_segment(segment)
         logger.info(
@@ -577,10 +598,17 @@ class MemoryManager:
         """仅在主题、核心实体和开放状态均匹配时返回真。"""
         return bool(
             experience
-            and experience["topic"] == topic
-            and experience["core_entity"] == core_entity
+            and self._normalize_route_text(experience["topic"])
+            == self._normalize_route_text(topic)
+            and self._normalize_route_text(experience["core_entity"])
+            == self._normalize_route_text(core_entity)
             and experience.get("status") == "open"
         )
+
+    @staticmethod
+    def _normalize_route_text(value: Any) -> str:
+        """Normalize harmless formatting differences in route identities."""
+        return "".join(str(value or "").casefold().split())
 
     def _find_experience_by_vector(
         self, topic: str, core_entity: str
@@ -639,62 +667,82 @@ class MemoryManager:
         )
         return experience
 
-    def _should_cut_segment(self, segment: dict[str, Any], intent: str) -> bool:
-        """判断是否应该切断当前 Segment，开启新 Segment。
+    def _find_segment_for_intent(
+        self,
+        experience_id: str,
+        intent: str,
+        *,
+        preferred: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Select one unambiguous open Segment from a bounded recent window."""
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in [
+            preferred,
+            *self.storage.list_recent_open_segments(
+                experience_id,
+                getattr(self, "segment_route_window", 5),
+            ),
+        ]:
+            if (
+                not item
+                or item.get("status") != "open"
+                or item.get("experience_id") != experience_id
+            ):
+                continue
+            segment_id = str(item.get("segment_id") or "")
+            if segment_id and self.storage.has_pending_terminal_update(
+                job_type="update_segment",
+                memory_type="segment",
+                memory_id=segment_id,
+            ):
+                continue
+            if segment_id and segment_id not in seen:
+                seen.add(segment_id)
+                candidates.append(item)
 
-        三个条件必须同时满足才切：
-        1. intent 字符串不完全相同
-        2. 当前 intent 与 segment intent 的 token 余弦相似度 < 0.8
-           （措辞不同但语义相近时保留，避免碎片化）
-        3. 当前 Segment 已积累了足够的 QA（>= min_segment_qas）
-        """
-        if segment.get("status") != "open":
-            logger.info(
-                "Segment cut because status is not open segment_id=%s status=%s",
-                segment.get("segment_id", ""),
-                segment.get("status", ""),
-            )
-            return True
+        normalized_intent = self._normalize_route_text(intent)
+        for segment in candidates:
+            if self._normalize_route_text(segment.get("intent")) == normalized_intent:
+                return segment
 
-        if segment["intent"] == intent:
-            logger.info(
-                "Segment retained because intent is unchanged segment_id=%s intent=%s",
-                segment.get("segment_id", ""),
-                intent,
-            )
-            return False
-
-        similarity = self._intent_similarity(segment["intent"], intent)
-        if similarity >= 0.8:
-            logger.info(
-                "Segment retained because intent similarity is high segment_id=%s old_intent=%s new_intent=%s similarity=%.3f",
-                segment.get("segment_id", ""),
-                segment["intent"],
-                intent,
-                similarity,
-            )
-            return False
-
-        qa_count = self.storage.count_qas_by_segment(segment["segment_id"])
-        if qa_count < self.min_segment_qas:
-            logger.info(
-                "Segment retained because QA count is below threshold segment_id=%s qa_count=%s min_segment_qas=%s similarity=%.3f",
-                segment.get("segment_id", ""),
-                qa_count,
-                self.min_segment_qas,
-                similarity,
-            )
-            return False
-
-        logger.info(
-            "Segment cut because intent changed segment_id=%s old_intent=%s new_intent=%s qa_count=%s similarity=%.3f",
-            segment.get("segment_id", ""),
-            segment["intent"],
-            intent,
-            qa_count,
-            similarity,
+        ranked = sorted(
+            (
+                (segment, self._intent_similarity(str(segment.get("intent") or ""), intent))
+                for segment in candidates
+            ),
+            key=lambda item: item[1],
+            reverse=True,
         )
-        return True
+        similarity_threshold = float(
+            getattr(self, "segment_similarity_threshold", 0.8)
+        )
+        route_margin = float(getattr(self, "segment_route_margin", 0.1))
+        if not ranked or ranked[0][1] < similarity_threshold:
+            return None
+        if (
+            len(ranked) > 1
+            and ranked[0][1] - ranked[1][1] < route_margin
+        ):
+            logger.info(
+                "Segment route ambiguous first=%.3f second=%.3f margin=%.3f",
+                ranked[0][1],
+                ranked[1][1],
+                route_margin,
+            )
+            return None
+        return ranked[0][0]
+
+    def _should_cut_segment(self, segment: dict[str, Any], intent: str) -> bool:
+        """Compatibility helper using the stricter semantic boundary rule."""
+        if segment.get("status") != "open":
+            return True
+        return not (
+            self._normalize_route_text(segment.get("intent"))
+            == self._normalize_route_text(intent)
+            or self._intent_similarity(str(segment.get("intent") or ""), intent)
+            >= float(getattr(self, "segment_similarity_threshold", 0.8))
+        )
 
     @staticmethod
     def _intent_similarity(a: str, b: str) -> float:

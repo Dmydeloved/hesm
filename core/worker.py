@@ -143,10 +143,20 @@ class MemoryDerivationWorker:
                 return
             qa_items = self.storage.list_qas_by_segment(memory_id)
             qa_count = len(qa_items)
+            summarized_qa_ids = {
+                str(qa_id)
+                for qa_id in segment.get("summarized_qa_ids") or []
+                if str(qa_id).strip()
+            }
+            delta_qas = [
+                qa for qa in qa_items if str(qa.get("qa_id") or "") not in summarized_qa_ids
+            ]
             should_summarize = bool(qa_items) and (
-                bool(payload.get("force_summary"))
-                or qa_count - int(segment.get("last_summarized_qa_count") or 0)
-                >= self.manager.segment_summary_qa_threshold
+                (
+                    bool(payload.get("force_summary"))
+                    and (bool(delta_qas) or not bool(segment.get("summary")))
+                )
+                or len(delta_qas) >= self.manager.segment_summary_qa_threshold
             )
             summary = None
             desired_status = str(payload.get("desired_status") or "open")
@@ -158,15 +168,11 @@ class MemoryDerivationWorker:
                 summary = self.manager._summary_object(
                     self.manager.summarizer.summarize_segment(
                         summary_input,
-                        qa_items,
+                        delta_qas or qa_items,
                     )
                 )
-                summary_state = summary.get("state") or {}
-                if summary_state.get("status") == "completed":
-                    desired_status = self._merge_status(
-                        desired_status,
-                        "completed",
-                    )
+            previous_qa_ids = list(segment.get("qa_ids") or [])
+            previous_status = str(segment.get("status") or "open")
             self.storage.reconcile_segment(
                 segment_id=memory_id,
                 desired_status=desired_status,
@@ -175,20 +181,31 @@ class MemoryDerivationWorker:
                 summarized_qa_count=qa_count if summary is not None else None,
             )
             refreshed = self.storage.get_segment(memory_id) or segment
-            self.manager._enqueue_job(
-                "embed_segment",
-                "segment",
-                memory_id,
-                int(refreshed.get("version") or 0),
-                now,
-            )
+            if (
+                not previous_qa_ids
+                or summary is not None
+                or str(refreshed.get("status") or "") != previous_status
+            ):
+                self.manager._enqueue_job(
+                    "embed_segment",
+                    "segment",
+                    memory_id,
+                    int(refreshed.get("version") or 0),
+                    now,
+                )
             experience_id = str(refreshed.get("experience_id") or "")
-            if experience_id:
+            parent_changed = (
+                not previous_qa_ids
+                or summary is not None
+                or str(refreshed.get("status") or "") != previous_status
+            )
+            if experience_id and parent_changed:
                 segments = self.storage.list_segments_by_experience_ids(
                     [experience_id]
                 )
                 child_revision = sum(
-                    max(1, int(item.get("version") or 0)) for item in segments
+                    max(0, int(item.get("summary_version") or 0))
+                    for item in segments
                 )
                 self.manager._enqueue_job(
                     "update_experience",
@@ -199,8 +216,11 @@ class MemoryDerivationWorker:
                     payload={
                         "desired_status": "open",
                         "force_summary": (
-                            summary is not None
-                            or bool(payload.get("force_experience_summary"))
+                            previous_status != "completed"
+                            and str(refreshed.get("status") or "") == "completed"
+                        ),
+                        "allow_summary_completion": bool(
+                            payload.get("allow_experience_completion")
                         ),
                     },
                 )
@@ -218,10 +238,21 @@ class MemoryDerivationWorker:
                 ),
             )
             segment_count = len(segments)
+            child_revision = sum(
+                max(0, int(segment.get("summary_version") or 0))
+                for segment in segments
+            )
             should_summarize = (
-                bool(payload.get("force_summary"))
-                or segment_count
-                - int(experience.get("last_summarized_segment_count") or 0)
+                (
+                    bool(payload.get("force_summary"))
+                    and (
+                        child_revision
+                        > int(experience.get("last_summarized_child_revision") or 0)
+                        or not bool(experience.get("summary"))
+                    )
+                )
+                or child_revision
+                - int(experience.get("last_summarized_child_revision") or 0)
                 >= self.manager.experience_summary_segment_threshold
             )
             summary = None
@@ -246,12 +277,18 @@ class MemoryDerivationWorker:
                         segments,
                     )
                 )
-                current_state = summary.get("current_state") or {}
-                if current_state.get("status") == "completed":
+                if (
+                    bool(payload.get("allow_summary_completion"))
+                    and (summary.get("current_state") or {}).get("status")
+                    == "completed"
+                ):
                     desired_status = self._merge_status(
                         desired_status,
                         "completed",
                     )
+            previous_segment_ids = list(experience.get("segment_ids") or [])
+            previous_intents = list(experience.get("intents_link") or [])
+            previous_status = str(experience.get("status") or "open")
             self.storage.reconcile_experience(
                 experience_id=memory_id,
                 desired_status=desired_status,
@@ -260,15 +297,24 @@ class MemoryDerivationWorker:
                 summarized_segment_count=(
                     segment_count if summary is not None else None
                 ),
+                summarized_child_revision=(
+                    child_revision if summary is not None else None
+                ),
             )
             refreshed = self.storage.get_experience(memory_id) or experience
-            self.manager._enqueue_job(
-                "embed_experience",
-                "experience",
-                memory_id,
-                int(refreshed.get("version") or 0),
-                now,
-            )
+            if (
+                summary is not None
+                or list(refreshed.get("segment_ids") or []) != previous_segment_ids
+                or list(refreshed.get("intents_link") or []) != previous_intents
+                or str(refreshed.get("status") or "") != previous_status
+            ):
+                self.manager._enqueue_job(
+                    "embed_experience",
+                    "experience",
+                    memory_id,
+                    int(refreshed.get("version") or 0),
+                    now,
+                )
             return
 
         if job_type == "recall_experience_history":

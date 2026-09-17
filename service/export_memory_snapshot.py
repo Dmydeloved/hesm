@@ -59,6 +59,13 @@ def export_snapshot(database: Path, output: Path) -> None:
             "updatedAt": row["updated_at"],
             "version": row["version"],
             "lastSummarizedQaCount": row["last_summarized_qa_count"],
+            "summarizedQaIds": parse_json(
+                row["summarized_qa_ids_json"],
+                [],
+            ) if "summarized_qa_ids_json" in row.keys() else [],
+            "summaryVersion": (
+                row["summary_version"] if "summary_version" in row.keys() else 0
+            ),
             "qas": qa_by_segment.get(row["segment_id"], []),
         }
         segments_by_experience.setdefault(row["experience_id"], []).append(segment)
@@ -80,6 +87,11 @@ def export_snapshot(database: Path, output: Path) -> None:
                 "updatedAt": row["updated_at"],
                 "version": row["version"],
                 "lastSummarizedSegmentCount": row["last_summarized_segment_count"],
+                "lastSummarizedChildRevision": (
+                    row["last_summarized_child_revision"]
+                    if "last_summarized_child_revision" in row.keys()
+                    else 0
+                ),
                 "segments": segments_by_experience.get(row["experience_id"], []),
             }
         )

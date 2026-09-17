@@ -40,9 +40,13 @@ chat: *nano_llm
 
 memory_management:
   segment_qa_threshold: 5
-  experience_segment_threshold: 5
+  # Summarize Experience after this many child-summary revisions.
+  experience_segment_threshold: 2
   experience_similarity_threshold: 0.82
-  min_segment_qas: 2
+  # Segment write routing uses semantic consistency, not a minimum-size bypass.
+  segment_similarity_threshold: 0.8
+  segment_route_margin: 0.1
+  segment_route_window: 5
   # QA vectors stay synchronous; aggregate parent updates and vectors use outbox.
   async_derivation: true
   async_poll_interval: 0.5

@@ -304,7 +304,7 @@ class LLMSummarizer:
 
     def _normalized_qas(self, qa_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
-        for item in qa_items[-5:]:
+        for item in qa_items:
             normalized.append(
                 {
                     "qa_id": item.get("qa_id", ""),
@@ -315,6 +315,7 @@ class LLMSummarizer:
                     "entities": item.get("entities", []),
                     "user_input": str(item.get("user_input") or ""),
                     "assistant_output": str(item.get("assistant_output") or "")[:1200],
+                    "tools": item.get("tools") or [],
                     "confidence": item.get("confidence", 0.0),
                     "reason": str(
                         item.get("reason") or item.get("reasoning") or ""
@@ -325,7 +326,7 @@ class LLMSummarizer:
 
     def _normalized_segments(self, segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
-        for item in segments[-2:]:
+        for item in segments:
             normalized.append(
                 {
                     "segment_id": item.get("segment_id", ""),

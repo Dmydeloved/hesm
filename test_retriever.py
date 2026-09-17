@@ -162,6 +162,9 @@ class FallbackStorage:
     def get_qa(self, qa_id):
         return self.qas.get(qa_id)
 
+    def get_qas(self, qa_ids):
+        return [self.qas[qa_id] for qa_id in qa_ids if qa_id in self.qas]
+
     def search_qas(self, **kwargs):
         return self.relational_qas[: kwargs["limit"]]
 
@@ -172,14 +175,28 @@ class FakeEmbedder:
 
 
 class FakeVectorStore:
-    def __init__(self, *, route_items=None, qa_items=None):
+    def __init__(
+        self,
+        *,
+        route_items=None,
+        qa_items=None,
+        segment_items=None,
+        experience_items=None,
+    ):
         self.route_items = route_items or []
         self.qa_items = qa_items or []
+        self.segment_items = segment_items or []
+        self.experience_items = experience_items or []
         self.queries = []
 
     def query(self, embedding, *, memory_type, top_k, metadata_filter):
         self.queries.append(memory_type)
-        return self.route_items if memory_type == "experience_route" else self.qa_items
+        return {
+            "experience_route": self.route_items,
+            "qa": self.qa_items,
+            "segment": self.segment_items,
+            "experience": self.experience_items,
+        }[memory_type]
 
 
 class ConfigurableRecaller(FakeRecaller):
@@ -334,7 +351,12 @@ def test_completed_history_recaller_is_not_used_by_retrieval_miss():
     assert result["route_status"] == "qa_fallback"
     assert result["qas"] == []
     assert recaller.calls == []
-    assert vector_store.queries == ["experience_route", "qa"]
+    assert vector_store.queries == [
+        "experience_route",
+        "qa",
+        "segment",
+        "experience",
+    ]
 
 
 def test_sqlite_keyword_candidate_can_reconstruct_hierarchy_without_dense_match():
@@ -348,6 +370,7 @@ def test_sqlite_keyword_candidate_can_reconstruct_hierarchy_without_dense_match(
         relational_qas=[qa],
     )
     manager = FallbackManager(storage, vector_store, recaller)
+    qa["keyword_score"] = 10
 
     result = HybridRetriever(manager).retriever(
         topic="旅行",
@@ -361,3 +384,60 @@ def test_sqlite_keyword_candidate_can_reconstruct_hierarchy_without_dense_match(
     assert result["retrieval_channels"] == ["keyword"]
     assert result["experiences"] == [experience]
     assert result["segments"] == [segment]
+
+
+def test_weak_structured_match_cannot_bypass_dense_threshold():
+    experience, segment, qa = _qa_hierarchy()
+    qa["keyword_score"] = 2
+    storage = FallbackStorage(
+        [experience],
+        [segment],
+        [qa],
+        relational_qas=[qa],
+    )
+    manager = FallbackManager(storage, FakeVectorStore(), ConfigurableRecaller({}))
+
+    result = HybridRetriever(manager).retriever(
+        topic="different",
+        core_entity="different",
+        query="generic question",
+        intent=qa["intent"],
+    )
+
+    assert result["qas"] == []
+
+
+def test_segment_summary_provenance_expands_qa_fallback_candidates():
+    experience, segment, qa = _qa_hierarchy()
+    segment["summary"] = {
+        "goal": "remember the trip",
+        "key_facts": [
+            {"fact": "visited the Bund", "source_qa_ids": [qa["qa_id"]]}
+        ],
+        "state_changes": [],
+        "state": {"status": "ongoing", "current_conclusion": ""},
+    }
+    vector_store = FakeVectorStore(
+        segment_items=[
+            {
+                "metadata": {"segment_id": segment["segment_id"]},
+                "similarity": 0.91,
+            }
+        ]
+    )
+    manager = FallbackManager(
+        FallbackStorage([experience], [segment], [qa]),
+        vector_store,
+        ConfigurableRecaller({}),
+    )
+
+    result = HybridRetriever(manager).retriever(
+        topic="unmatched",
+        core_entity="unmatched",
+        query="where did I visit",
+        intent="recall",
+    )
+
+    assert result["qas"] == [qa]
+    assert result["retrieval_channels"] == ["summary"]
+    assert result["qa_matches"][0]["parent_similarity"] == 0.91

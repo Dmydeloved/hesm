@@ -111,7 +111,7 @@ class HESMService:
                 management_config.get("segment_qa_threshold", 5)
             ),
             experience_summary_segment_threshold=int(
-                management_config.get("experience_segment_threshold", 5)
+                management_config.get("experience_segment_threshold", 2)
             ),
             experience_similarity_threshold=float(
                 management_config.get("experience_similarity_threshold", 0.82)
@@ -120,6 +120,15 @@ class HESMService:
                 retrieval_config.get("experience_route_margin", 0.05)
             ),
             min_segment_qas=int(management_config.get("min_segment_qas", 2)),
+            segment_similarity_threshold=float(
+                management_config.get("segment_similarity_threshold", 0.8)
+            ),
+            segment_route_margin=float(
+                management_config.get("segment_route_margin", 0.1)
+            ),
+            segment_route_window=int(
+                management_config.get("segment_route_window", 5)
+            ),
             experience_recaller=self.recaller,
         )
         if retriever_class is None:
@@ -170,7 +179,7 @@ class HESMService:
                     management_config.get("segment_qa_threshold", 5)
                 ),
                 experience_summary_segment_threshold=int(
-                    management_config.get("experience_segment_threshold", 5)
+                    management_config.get("experience_segment_threshold", 2)
                 ),
                 experience_similarity_threshold=float(
                     management_config.get("experience_similarity_threshold", 0.82)
@@ -179,6 +188,15 @@ class HESMService:
                     retrieval_config.get("experience_route_margin", 0.05)
                 ),
                 min_segment_qas=int(management_config.get("min_segment_qas", 2)),
+                segment_similarity_threshold=float(
+                    management_config.get("segment_similarity_threshold", 0.8)
+                ),
+                segment_route_margin=float(
+                    management_config.get("segment_route_margin", 0.1)
+                ),
+                segment_route_window=int(
+                    management_config.get("segment_route_window", 5)
+                ),
                 experience_recaller=worker_recaller,
             )
             self.derivation_worker = MemoryDerivationWorker(
@@ -291,13 +309,20 @@ class HESMService:
                 json.dumps(primary, ensure_ascii=False),
             )
             retrieval_started_at = time.perf_counter()
+            retrieval_arguments = {
+                "topic": str(primary.get("topic") or ""),
+                "core_entity": str(primary.get("core_entity") or ""),
+                "query": text,
+                "intent": str(primary.get("intent") or ""),
+                "state_key": state_key,
+                "entities": [str(item) for item in primary.get("entities") or []],
+            }
+            if isinstance(self.retriever, HybridRetriever):
+                retrieval_arguments["query_candidates"] = [
+                    item for item in candidates if isinstance(item, dict)
+                ]
             result = self.retriever.retriever(
-                topic=str(primary.get("topic") or ""),
-                core_entity=str(primary.get("core_entity") or ""),
-                query=text,
-                intent=str(primary.get("intent") or ""),
-                state_key=state_key,
-                entities=[str(item) for item in primary.get("entities") or []],
+                **retrieval_arguments,
             )
             retrieval_ms = round(
                 (time.perf_counter() - retrieval_started_at) * 1000, 3

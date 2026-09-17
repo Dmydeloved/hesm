@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS segment_memory (
     updated_at TEXT NOT NULL,
     version INTEGER NOT NULL,
     last_summarized_qa_count INTEGER NOT NULL,
+    summarized_qa_ids_json TEXT NOT NULL DEFAULT '[]',
+    summary_version INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL CHECK (status IN ('open', 'completed', 'deleted')),
     FOREIGN KEY (experience_id) REFERENCES experience_memory(experience_id)
 );
@@ -61,6 +63,7 @@ CREATE TABLE IF NOT EXISTS experience_memory (
     updated_at TEXT NOT NULL,
     version INTEGER NOT NULL,
     last_summarized_segment_count INTEGER NOT NULL,
+    last_summarized_child_revision INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL CHECK (status IN ('open', 'completed', 'deleted'))
 );
 
@@ -119,6 +122,7 @@ JSON_FIELDS = {
     "tools_json",
     "entities_json",
     "qa_ids_json",
+    "summarized_qa_ids_json",
     "intents_link_json",
     "segment_ids_json",
     "summary_json",
@@ -134,6 +138,7 @@ JSON_DEFAULTS: dict[str, Any] = {
     "tools_json": [],
     "entities_json": [],
     "qa_ids_json": [],
+    "summarized_qa_ids_json": [],
     "intents_link_json": [],
     "segment_ids_json": [],
     "summary_json": {},
@@ -238,6 +243,39 @@ class MemoryStorage:
                         "UPDATE segment_memory SET summary_json = ? WHERE segment_id = ?",
                         (json.dumps(payload, ensure_ascii=False), row["segment_id"]),
                     )
+        if "summary_version" not in segment_columns:
+            self.connection.execute(
+                "ALTER TABLE segment_memory "
+                "ADD COLUMN summary_version INTEGER NOT NULL DEFAULT 0"
+            )
+            self.connection.execute(
+                "UPDATE segment_memory SET summary_version = 1 "
+                "WHERE last_summarized_qa_count > 0"
+            )
+        if "summarized_qa_ids_json" not in segment_columns:
+            self.connection.execute(
+                "ALTER TABLE segment_memory ADD COLUMN "
+                "summarized_qa_ids_json TEXT NOT NULL DEFAULT '[]'"
+            )
+            rows = self.connection.execute(
+                "SELECT segment_id, qa_ids_json, last_summarized_qa_count "
+                "FROM segment_memory"
+            ).fetchall()
+            for row in rows:
+                try:
+                    qa_ids = json.loads(row["qa_ids_json"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    qa_ids = []
+                summarized_ids = (
+                    qa_ids[: max(0, int(row["last_summarized_qa_count"] or 0))]
+                    if isinstance(qa_ids, list)
+                    else []
+                )
+                self.connection.execute(
+                    "UPDATE segment_memory SET summarized_qa_ids_json = ? "
+                    "WHERE segment_id = ?",
+                    (json.dumps(summarized_ids, ensure_ascii=False), row["segment_id"]),
+                )
 
         experience_columns = self._table_columns("experience_memory")
         if "history_experience_json" not in experience_columns:
@@ -263,6 +301,11 @@ class MemoryStorage:
                     END
                     """
                 )
+        if "last_summarized_child_revision" not in experience_columns:
+            self.connection.execute(
+                "ALTER TABLE experience_memory ADD COLUMN "
+                "last_summarized_child_revision INTEGER NOT NULL DEFAULT 0"
+            )
 
         outbox_columns = self._table_columns("memory_outbox")
         if "payload_json" not in outbox_columns:
@@ -581,7 +624,12 @@ class MemoryStorage:
     ) -> dict[str, Any]:
         """Merge coalesced update intent without losing force/status signals."""
         merged = {**previous, **incoming}
-        for key in ("force_summary", "force_experience_summary"):
+        for key in (
+            "force_summary",
+            "force_experience_summary",
+            "allow_experience_completion",
+            "allow_summary_completion",
+        ):
             if key in previous or key in incoming:
                 merged[key] = bool(previous.get(key)) or bool(incoming.get(key))
         if "desired_status" in previous or "desired_status" in incoming:
@@ -644,6 +692,33 @@ class MemoryStorage:
         except (json.JSONDecodeError, TypeError):
             job["payload"] = {}
         return job
+
+    def has_pending_terminal_update(
+        self,
+        *,
+        job_type: str,
+        memory_type: str,
+        memory_id: str,
+    ) -> bool:
+        """Return whether an outstanding coalesced job intends to close memory."""
+        row = self.connection.execute(
+            """
+            SELECT payload_json FROM memory_outbox
+            WHERE job_type = ? AND memory_type = ? AND memory_id = ?
+              AND status IN ('pending', 'processing')
+            """,
+            (job_type, memory_type, memory_id),
+        ).fetchone()
+        if not row:
+            return False
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return False
+        return str(payload.get("desired_status") or "open") in {
+            "completed",
+            "deleted",
+        }
 
     def mark_memory_job_processing(self, job_id: str, timestamp: str) -> bool:
         cursor = self.connection.execute(
@@ -801,7 +876,8 @@ class MemoryStorage:
         columns = [
             "segment_id", "topic", "intent", "core_entity", "qa_ids_json",
             "summary_json", "experience_id", "created_at", "updated_at",
-            "version", "last_summarized_qa_count", "status",
+            "version", "last_summarized_qa_count", "summarized_qa_ids_json",
+            "summary_version", "status",
         ]
         values: list[Any] = [
             segment["segment_id"],
@@ -815,6 +891,8 @@ class MemoryStorage:
             format_timestamp(segment["updated_at"]),
             segment["version"],
             segment["last_summarized_qa_count"],
+            json.dumps(segment.get("summarized_qa_ids") or [], ensure_ascii=False),
+            int(segment.get("summary_version") or 0),
             self._normalize_status(segment.get("status")),
         ]
         # 旧库的 summary 字段仍为必填，保留一份 JSON 文本兼容旧读端。
@@ -841,6 +919,8 @@ class MemoryStorage:
             format_timestamp(segment["updated_at"]),
             segment["version"],
             segment["last_summarized_qa_count"],
+            json.dumps(segment.get("summarized_qa_ids") or [], ensure_ascii=False),
+            int(segment.get("summary_version") or 0),
             self._normalize_status(segment.get("status")),
         ]
         if legacy_assignment:
@@ -854,6 +934,8 @@ class MemoryStorage:
                 updated_at = ?,
                 version = ?,
                 last_summarized_qa_count = ?,
+                summarized_qa_ids_json = ?,
+                summary_version = ?,
                 status = ?
                 {legacy_assignment}
             WHERE segment_id = ?
@@ -911,12 +993,15 @@ class MemoryStorage:
             summary_payload = self._segment_summary_payload(summary)
             summary_assignment = (
                 ", summary_json = ?, "
-                "last_summarized_qa_count = MAX(last_summarized_qa_count, ?)"
+                "last_summarized_qa_count = MAX(last_summarized_qa_count, ?), "
+                "summarized_qa_ids_json = ?, "
+                "summary_version = summary_version + 1"
             )
             parameters.extend(
                 [
                     json.dumps(summary_payload, ensure_ascii=False),
                     max(0, int(summarized_qa_count or 0)),
+                    json.dumps(qa_ids, ensure_ascii=False),
                 ]
             )
             if "summary" in self._table_columns("segment_memory"):
@@ -960,6 +1045,15 @@ class MemoryStorage:
     ) -> None:
         """Update derived Segment fields without overwriting concurrently added QA ids."""
         summary_payload = self._segment_summary_payload(summary)
+        summarized_ids = [
+            str(row["qa_id"])
+            for row in self.connection.execute(
+                "SELECT qa_id FROM qa_memory "
+                "WHERE segment_id = ? AND status = 'open' "
+                "ORDER BY timestamp, qa_id",
+                (segment_id,),
+            ).fetchall()
+        ]
         legacy_assignment = (
             ", summary = ?"
             if "summary" in self._table_columns("segment_memory")
@@ -968,6 +1062,7 @@ class MemoryStorage:
         parameters: list[Any] = [
             json.dumps(summary_payload, ensure_ascii=False),
             max(0, int(last_summarized_qa_count)),
+            json.dumps(summarized_ids, ensure_ascii=False),
             self._normalize_status(status),
             format_timestamp(updated_at),
         ]
@@ -979,6 +1074,8 @@ class MemoryStorage:
             UPDATE segment_memory SET
                 summary_json = ?,
                 last_summarized_qa_count = MAX(last_summarized_qa_count, ?),
+                summarized_qa_ids_json = ?,
+                summary_version = summary_version + 1,
                 status = CASE
                     WHEN status = 'deleted' THEN 'deleted'
                     WHEN ? = 'completed' THEN 'completed'
@@ -1003,6 +1100,23 @@ class MemoryStorage:
             (experience_id,),
         ).fetchone()
         return self._row_to_dict(row)
+
+    def list_recent_open_segments(
+        self,
+        experience_id: str,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Return recent reusable Segment candidates for write routing."""
+        rows = self.connection.execute(
+            """
+            SELECT * FROM segment_memory
+            WHERE experience_id = ? AND status = 'open'
+            ORDER BY updated_at DESC, created_at DESC, segment_id DESC
+            LIMIT ?
+            """,
+            (experience_id, max(1, int(limit))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
 
     def get_experience(self, experience_id: str | None) -> dict[str, Any] | None:
         if not experience_id:
@@ -1032,8 +1146,10 @@ class MemoryStorage:
         row = self.connection.execute(
             """
             SELECT * FROM experience_memory
-            WHERE topic = ?
-              AND core_entity = ?
+            WHERE lower(replace(trim(topic), ' ', '')) =
+                  lower(replace(trim(?), ' ', ''))
+              AND lower(replace(trim(core_entity), ' ', '')) =
+                  lower(replace(trim(?), ' ', ''))
               AND status = 'open'
             ORDER BY updated_at DESC, created_at DESC
             LIMIT 1
@@ -1265,7 +1381,8 @@ class MemoryStorage:
         columns = [
             "experience_id", "history_experience_json", "topic", "core_entity",
             "intents_link_json", "segment_ids_json", "summary_json", "created_at",
-            "updated_at", "version", "last_summarized_segment_count", "status",
+            "updated_at", "version", "last_summarized_segment_count",
+            "last_summarized_child_revision", "status",
         ]
         values: list[Any] = [
             experience["experience_id"],
@@ -1279,6 +1396,7 @@ class MemoryStorage:
             format_timestamp(experience["updated_at"]),
             experience["version"],
             experience["last_summarized_segment_count"],
+            int(experience.get("last_summarized_child_revision") or 0),
             status,
         ]
         # 旧库的 state_json 字段仍为必填，同步生成兼容状态对象。
@@ -1310,6 +1428,7 @@ class MemoryStorage:
             format_timestamp(experience["updated_at"]),
             experience["version"],
             experience["last_summarized_segment_count"],
+            int(experience.get("last_summarized_child_revision") or 0),
             json.dumps(
                 experience.get("history_experience") or {},
                 ensure_ascii=False,
@@ -1328,6 +1447,7 @@ class MemoryStorage:
                 updated_at = ?,
                 version = ?,
                 last_summarized_segment_count = ?,
+                last_summarized_child_revision = ?,
                 history_experience_json = ?,
                 status = ?
                 {legacy_assignment}
@@ -1364,6 +1484,7 @@ class MemoryStorage:
         updated_at: str,
         summary: dict[str, Any] | None = None,
         summarized_segment_count: int | None = None,
+        summarized_child_revision: int | None = None,
     ) -> None:
         """Apply one aggregate Experience update from normalized Segment data."""
         segment_rows = self.connection.execute(
@@ -1400,7 +1521,9 @@ class MemoryStorage:
             summary_assignment = (
                 ", summary_json = ?, "
                 "last_summarized_segment_count = MAX("
-                "last_summarized_segment_count, ?)"
+                "last_summarized_segment_count, ?), "
+                "last_summarized_child_revision = MAX("
+                "last_summarized_child_revision, ?)"
             )
             parameters.extend(
                 [
@@ -1409,6 +1532,7 @@ class MemoryStorage:
                         ensure_ascii=False,
                     ),
                     max(0, int(summarized_segment_count or 0)),
+                    max(0, int(summarized_child_revision or 0)),
                 ]
             )
         parameters.extend(
