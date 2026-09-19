@@ -40,7 +40,7 @@ chat: *nano_llm
 
 memory_management:
   segment_qa_threshold: 5
-  # Summarize Experience after this many child-summary revisions.
+  # Summarize Experience after this many not-yet-consumed Segment updates.
   experience_segment_threshold: 2
   experience_similarity_threshold: 0.82
   # Segment write routing uses semantic consistency, not a minimum-size bypass.
@@ -55,5 +55,7 @@ memory_management:
 
 api:
   top_experience: 1
+  # These caps apply to QA fallback candidate/result shaping only. Normal
+  # hierarchy retrieval is bounded by last_updated_segment_id/last_updated_qa_id.
   top_segment: 2
   top_qa: 4

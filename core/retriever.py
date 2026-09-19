@@ -146,6 +146,7 @@ class HybridRetriever:
         state_key: str,
         topic: str,
         core_entity: str,
+        query: str = "",
     ) -> tuple[dict[str, Any] | None, str, float, str]:
         """按 runtime、SQLite、路由向量的顺序查找已有 Experience。"""
         runtime = self.storage.get_runtime_state(state_key)
@@ -170,7 +171,21 @@ class HybridRetriever:
         if len(candidates) > 1:
             margin = confidence - candidates[1][1]
             if margin < self.experience_route_margin:
-                return None, "qa_fallback", confidence, "ambiguous_route"
+                selector = getattr(self.manager, "_select_ambiguous_by_goal", None)
+                if selector is None:
+                    current = max(
+                        (item[0] for item in candidates[:2]),
+                        key=lambda item: (
+                            str(item.get("updated_at") or ""),
+                            str(item.get("created_at") or ""),
+                        ),
+                    )
+                else:
+                    current = selector(candidates[:2], query)
+                confidence = next(
+                    score for candidate, score in candidates[:2]
+                    if candidate.get("experience_id") == current.get("experience_id")
+                )
         return current, "vector", confidence, ""
 
     def _experience_vector_candidates(
@@ -694,6 +709,7 @@ class HybridRetriever:
                 state_key=state_key,
                 topic=route_topic,
                 core_entity=route_entity,
+                query=query,
             )
             if confidence > route_confidence:
                 route_confidence = confidence
@@ -733,10 +749,13 @@ class HybridRetriever:
                 "context": "",
             }
 
-        latest_segments = self.storage.list_latest_segments(
-            str(experience["experience_id"]),
-            self.segment_limit,
-        )
+        if hasattr(self.storage, "list_unupdated_segments"):
+            latest_segments = self.storage.list_unupdated_segments(experience)
+        else:
+            latest_segments = self.storage.list_latest_segments(
+                str(experience["experience_id"]),
+                self.segment_limit,
+            )
         segments = sorted(
             latest_segments,
             key=lambda item: (
@@ -746,8 +765,12 @@ class HybridRetriever:
             ),
         )
 
-        segment_ids = [str(segment["segment_id"]) for segment in segments]
-        latest_qas = self.storage.list_latest_qas(segment_ids, self.qa_limit)
+        latest_segment = segments[-1] if segments else None
+        if latest_segment and hasattr(self.storage, "list_unupdated_qas"):
+            latest_qas = self.storage.list_unupdated_qas(latest_segment)
+        else:
+            segment_ids = [str(segment["segment_id"]) for segment in segments]
+            latest_qas = self.storage.list_latest_qas(segment_ids, self.qa_limit)
         qas = sorted(
             latest_qas,
             key=lambda item: (

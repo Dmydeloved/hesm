@@ -57,7 +57,7 @@ chat: *nano_llm
 
 memory_management:
   segment_qa_threshold: 5
-  experience_segment_threshold: 5
+  experience_segment_threshold: 2
   experience_similarity_threshold: 0.82
   min_segment_qas: 2
   async_derivation: true

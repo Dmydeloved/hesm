@@ -59,6 +59,11 @@ def export_snapshot(database: Path, output: Path) -> None:
             "updatedAt": row["updated_at"],
             "version": row["version"],
             "lastSummarizedQaCount": row["last_summarized_qa_count"],
+            "lastUpdatedQaId": (
+                row["last_updated_qa_id"]
+                if "last_updated_qa_id" in row.keys()
+                else None
+            ),
             "summarizedQaIds": parse_json(
                 row["summarized_qa_ids_json"],
                 [],
@@ -87,6 +92,16 @@ def export_snapshot(database: Path, output: Path) -> None:
                 "updatedAt": row["updated_at"],
                 "version": row["version"],
                 "lastSummarizedSegmentCount": row["last_summarized_segment_count"],
+                "lastUpdatedSegmentId": (
+                    row["last_updated_segment_id"]
+                    if "last_updated_segment_id" in row.keys()
+                    else None
+                ),
+                "lastUpdatedSegmentAt": (
+                    row["last_updated_segment_at"]
+                    if "last_updated_segment_at" in row.keys()
+                    else None
+                ),
                 "lastSummarizedChildRevision": (
                     row["last_summarized_child_revision"]
                     if "last_summarized_child_revision" in row.keys()

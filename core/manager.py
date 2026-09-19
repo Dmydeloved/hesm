@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import uuid
 from typing import Any
 
@@ -112,6 +113,7 @@ class MemoryManager:
                 current_experience["experience_id"],
                 intent,
                 preferred=current_segment,
+                query=user_input,
             )
             if routed_segment is None:
                 if current_segment and current_segment.get("status") == "open":
@@ -321,6 +323,7 @@ class MemoryManager:
                 current_experience = self._find_experience_by_vector(
                     topic,
                     core_entity,
+                    query,
                 )
 
             if current_experience:
@@ -389,6 +392,8 @@ class MemoryManager:
             "version": 1,
             "last_summarized_segment_count": 0,
             "last_summarized_child_revision": 0,
+            "last_updated_segment_id": None,
+            "last_updated_segment_at": None,
             "history_experience": {},
         }
         self.storage.insert_experience(experience)
@@ -436,7 +441,7 @@ class MemoryManager:
             experience["experience_id"],
             self.storage.count_segments_by_experience(experience["experience_id"]),
             now,
-            payload={"desired_status": "completed", "force_summary": True},
+            payload={"desired_status": "completed"},
         )
 
     def _create_segment(
@@ -461,6 +466,7 @@ class MemoryManager:
             "version": 1,
             "last_summarized_qa_count": 0,
             "summarized_qa_ids": [],
+            "last_updated_qa_id": None,
             "summary_version": 0,
         }
         self.storage.insert_segment(segment)
@@ -611,7 +617,7 @@ class MemoryManager:
         return "".join(str(value or "").casefold().split())
 
     def _find_experience_by_vector(
-        self, topic: str, core_entity: str
+        self, topic: str, core_entity: str, query: str = ""
     ) -> dict[str, Any] | None:
         """Route through the dedicated topic+core_entity Experience vectors."""
         query_text = f"主题：{topic}\n核心实体：{core_entity}"
@@ -656,7 +662,7 @@ class MemoryManager:
                 candidates[1][1],
                 self.experience_route_margin,
             )
-            return None
+            return self._select_ambiguous_by_goal(candidates[:2], query)
         experience, similarity = candidates[0]
         logger.info(
             "Experience 路由向量命中 id=%s sim=%.3f topic=%s entity=%s",
@@ -673,6 +679,7 @@ class MemoryManager:
         intent: str,
         *,
         preferred: dict[str, Any] | None = None,
+        query: str = "",
     ) -> dict[str, Any] | None:
         """Select one unambiguous open Segment from a bounded recent window."""
         candidates: list[dict[str, Any]] = []
@@ -701,11 +708,6 @@ class MemoryManager:
                 seen.add(segment_id)
                 candidates.append(item)
 
-        normalized_intent = self._normalize_route_text(intent)
-        for segment in candidates:
-            if self._normalize_route_text(segment.get("intent")) == normalized_intent:
-                return segment
-
         ranked = sorted(
             (
                 (segment, self._intent_similarity(str(segment.get("intent") or ""), intent))
@@ -730,8 +732,55 @@ class MemoryManager:
                 ranked[1][1],
                 route_margin,
             )
-            return None
+            return self._select_ambiguous_by_goal(ranked[:2], query)
         return ranked[0][0]
+
+    def _select_ambiguous_by_goal(
+        self,
+        candidates: list[tuple[dict[str, Any], float]],
+        query: str,
+    ) -> dict[str, Any]:
+        """Resolve a close top-two route by goal, then by update recency."""
+        top_two = [item[0] for item in candidates[:2]]
+        goals = [self._summary_goal(item) for item in top_two]
+        if len(top_two) == 1:
+            return top_two[0]
+        if not all(goals) or not str(query or "").strip():
+            return max(top_two, key=self._updated_sort_key)
+        try:
+            query_embedding = self.embedder.embed(str(query))
+            goal_scores = [
+                self._cosine_similarity(query_embedding, self.embedder.embed(goal))
+                for goal in goals
+            ]
+        except Exception:
+            logger.warning("Goal tie-break embedding failed", exc_info=True)
+            goal_scores = [self._intent_similarity(str(query), goal) for goal in goals]
+        if math.isclose(goal_scores[0], goal_scores[1], abs_tol=1e-9):
+            return max(top_two, key=self._updated_sort_key)
+        return top_two[0] if goal_scores[0] > goal_scores[1] else top_two[1]
+
+    @staticmethod
+    def _summary_goal(memory: dict[str, Any]) -> str:
+        summary = memory.get("summary") or {}
+        return str(summary.get("goal") or "").strip() if isinstance(summary, dict) else ""
+
+    @staticmethod
+    def _updated_sort_key(memory: dict[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(memory.get("updated_at") or ""),
+            str(memory.get("created_at") or ""),
+            str(memory.get("experience_id") or memory.get("segment_id") or ""),
+        )
+
+    @staticmethod
+    def _cosine_similarity(left: list[float], right: list[float]) -> float:
+        if not left or not right or len(left) != len(right):
+            return 0.0
+        dot = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(value * value for value in left))
+        right_norm = math.sqrt(sum(value * value for value in right))
+        return dot / (left_norm * right_norm) if left_norm and right_norm else 0.0
 
     def _should_cut_segment(self, segment: dict[str, Any], intent: str) -> bool:
         """Compatibility helper using the stricter semantic boundary rule."""

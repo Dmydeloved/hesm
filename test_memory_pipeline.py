@@ -5,6 +5,7 @@ from threading import RLock
 
 from core.embedder import HashingEmbedder
 from core.manager import MemoryManager
+from core.retriever import HybridRetriever
 from core.storage import MemoryStorage
 from core.summarizer import TemplateSummarizer
 from core.vector_store import ChromaVectorStore
@@ -452,7 +453,7 @@ def test_aggregate_segment_update_summarizes_only_at_threshold(tmp_path):
     storage.close()
 
 
-def test_experience_updates_never_enqueue_route_vector_refresh(tmp_path):
+def test_one_updated_segment_does_not_trigger_experience_summary(tmp_path):
     storage = MemoryStorage(tmp_path / "memory.sqlite3")
     storage.insert_experience(_experience())
     segment = _segment()
@@ -477,9 +478,7 @@ def test_experience_updates_never_enqueue_route_vector_refresh(tmp_path):
     worker = MemoryDerivationWorker(manager, RLock())
 
     assert worker.drain_once() == 1
-    assert [job["job_type"] for job in storage.list_pending_memory_jobs()] == [
-        "embed_experience"
-    ]
+    assert storage.list_pending_memory_jobs() == []
     storage.close()
 
 
@@ -660,6 +659,7 @@ def test_segment_summary_consumes_only_unsummarized_qas(tmp_path):
         worker.drain_once()
 
     assert summarizer.segment_batches == [["qa-1", "qa-2"], ["qa-3"]]
+    assert storage.get_segment("seg-1")["last_updated_qa_id"] == "qa-3"
     storage.close()
 
 
@@ -699,13 +699,14 @@ def test_experience_summary_receives_every_current_segment(tmp_path):
         vector_store=ChromaVectorStore(ephemeral=True),
         embedder=HashingEmbedder(),
         summarizer=summarizer,
-        experience_summary_segment_threshold=99,
+        experience_summary_segment_threshold=2,
     )
 
     MemoryDerivationWorker(manager, RLock()).drain_once()
 
     assert summarizer.experience_batches == [expected_ids]
     assert storage.get_experience("exp-1")["last_summarized_child_revision"] == 3
+    assert storage.get_experience("exp-1")["last_updated_segment_id"] == "seg-2"
     storage.close()
 
 
@@ -756,7 +757,7 @@ def test_summary_suggested_completion_does_not_close_memory(tmp_path):
     storage.close()
 
 
-def test_experience_completion_requires_route_boundary_and_summary_agreement(tmp_path):
+def test_experience_still_waits_for_two_segments_at_route_boundary(tmp_path):
     storage = MemoryStorage(tmp_path / "memory.sqlite3")
     storage.insert_experience(_experience())
     storage.insert_segment(_segment())
@@ -804,7 +805,112 @@ def test_experience_completion_requires_route_boundary_and_summary_agreement(tmp
         pass
 
     assert storage.get_segment("seg-1")["status"] == "completed"
-    assert storage.get_experience("exp-1")["status"] == "completed"
+    assert storage.get_experience("exp-1")["status"] == "open"
+    storage.close()
+
+
+def test_hierarchy_retrieval_returns_only_content_after_update_markers(tmp_path):
+    storage = MemoryStorage(tmp_path / "memory.sqlite3")
+    experience = _experience()
+    experience["last_updated_segment_id"] = "seg-1"
+    experience["last_updated_segment_at"] = "2026-01-02 00:00:00"
+    storage.insert_experience(experience)
+
+    for index in (1, 2, 3):
+        segment = _segment()
+        segment["segment_id"] = f"seg-{index}"
+        segment["intent"] = f"stage-{index}"
+        segment["created_at"] = f"2026-01-0{index + 1} 00:00:00"
+        segment["updated_at"] = segment["created_at"]
+        segment["summary_version"] = 1
+        if index == 3:
+            segment["last_updated_qa_id"] = "qa-31"
+        storage.insert_segment(segment)
+
+    for qa_id, timestamp in (
+        ("qa-31", "2026-01-04 00:00:01"),
+        ("qa-32", "2026-01-04 00:00:02"),
+        ("qa-33", "2026-01-04 00:00:03"),
+    ):
+        storage.insert_qa(
+            {
+                "qa_id": qa_id,
+                "source_id": None,
+                "timestamp": timestamp,
+                "user_input": qa_id,
+                "assistant_output": "answer",
+                "tools": [],
+                "topic": experience["topic"],
+                "intent": "stage-3",
+                "core_entity": experience["core_entity"],
+                "entities": [],
+                "segment_id": "seg-3",
+                "status": "open",
+                "confidence": 1.0,
+                "reason": "",
+            }
+        )
+    storage.upsert_runtime_state(
+        state_key="session-1",
+        current_experience_id="exp-1",
+        current_segment_id="seg-3",
+        updated_at="2026-01-04 00:00:03",
+    )
+    storage.commit()
+    manager = MemoryManager(
+        storage=storage,
+        vector_store=ChromaVectorStore(ephemeral=True),
+        embedder=HashingEmbedder(),
+    )
+
+    result = HybridRetriever(manager).retriever(
+        topic=experience["topic"],
+        core_entity=experience["core_entity"],
+        query="continue",
+        state_key="session-1",
+    )
+
+    assert [item["segment_id"] for item in result["segments"]] == ["seg-2", "seg-3"]
+    assert [item["qa_id"] for item in result["qas"]] == ["qa-32", "qa-33"]
+    storage.close()
+
+
+def test_close_routes_use_goal_then_recency(tmp_path):
+    class EqualRouteVectorStore:
+        def query(self, *args, **kwargs):
+            return [
+                {"metadata": {"experience_id": "exp-old"}, "similarity": 0.9},
+                {"metadata": {"experience_id": "exp-new"}, "similarity": 0.89},
+            ]
+
+    storage = MemoryStorage(tmp_path / "memory.sqlite3")
+    for experience_id, goal, updated_at in (
+        ("exp-old", "book hotel", "2026-01-02 00:00:00"),
+        ("exp-new", "visit museum", "2026-01-03 00:00:00"),
+    ):
+        experience = _experience()
+        experience["experience_id"] = experience_id
+        experience["summary"] = {"goal": goal}
+        experience["updated_at"] = updated_at
+        storage.insert_experience(experience)
+    manager = MemoryManager(
+        storage=storage,
+        vector_store=EqualRouteVectorStore(),
+        embedder=HashingEmbedder(),
+        experience_similarity_threshold=0.8,
+        experience_route_margin=0.05,
+    )
+
+    routed = manager._find_experience_by_vector(
+        "travel", "Shanghai", "book hotel"
+    )
+    assert routed["experience_id"] == "exp-old"
+
+    candidates = [
+        ({"segment_id": "seg-old", "summary": {}, "updated_at": "2026-01-02"}, 0.9),
+        ({"segment_id": "seg-new", "summary": {}, "updated_at": "2026-01-03"}, 0.89),
+    ]
+    assert manager._select_ambiguous_by_goal(candidates, "anything")["segment_id"] == "seg-new"
     storage.close()
 
 

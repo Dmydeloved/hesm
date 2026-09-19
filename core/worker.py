@@ -143,19 +143,9 @@ class MemoryDerivationWorker:
                 return
             qa_items = self.storage.list_qas_by_segment(memory_id)
             qa_count = len(qa_items)
-            summarized_qa_ids = {
-                str(qa_id)
-                for qa_id in segment.get("summarized_qa_ids") or []
-                if str(qa_id).strip()
-            }
-            delta_qas = [
-                qa for qa in qa_items if str(qa.get("qa_id") or "") not in summarized_qa_ids
-            ]
-            should_summarize = bool(qa_items) and (
-                (
-                    bool(payload.get("force_summary"))
-                    and (bool(delta_qas) or not bool(segment.get("summary")))
-                )
+            delta_qas = self.storage.list_unupdated_qas(segment)
+            should_summarize = bool(delta_qas) and (
+                bool(payload.get("force_summary"))
                 or len(delta_qas) >= self.manager.segment_summary_qa_threshold
             )
             summary = None
@@ -168,7 +158,7 @@ class MemoryDerivationWorker:
                 summary = self.manager._summary_object(
                     self.manager.summarizer.summarize_segment(
                         summary_input,
-                        delta_qas or qa_items,
+                        delta_qas,
                     )
                 )
             previous_qa_ids = list(segment.get("qa_ids") or [])
@@ -179,6 +169,9 @@ class MemoryDerivationWorker:
                 updated_at=now,
                 summary=summary,
                 summarized_qa_count=qa_count if summary is not None else None,
+                last_updated_qa_id=(
+                    str(delta_qas[-1]["qa_id"]) if summary is not None else None
+                ),
             )
             refreshed = self.storage.get_segment(memory_id) or segment
             if (
@@ -215,10 +208,6 @@ class MemoryDerivationWorker:
                     now,
                     payload={
                         "desired_status": "open",
-                        "force_summary": (
-                            previous_status != "completed"
-                            and str(refreshed.get("status") or "") == "completed"
-                        ),
                         "allow_summary_completion": bool(
                             payload.get("allow_experience_completion")
                         ),
@@ -242,17 +231,13 @@ class MemoryDerivationWorker:
                 max(0, int(segment.get("summary_version") or 0))
                 for segment in segments
             )
+            delta_segments = [
+                segment
+                for segment in self.storage.list_unupdated_segments(experience)
+                if int(segment.get("summary_version") or 0) > 0
+            ]
             should_summarize = (
-                (
-                    bool(payload.get("force_summary"))
-                    and (
-                        child_revision
-                        > int(experience.get("last_summarized_child_revision") or 0)
-                        or not bool(experience.get("summary"))
-                    )
-                )
-                or child_revision
-                - int(experience.get("last_summarized_child_revision") or 0)
+                len(delta_segments)
                 >= self.manager.experience_summary_segment_threshold
             )
             summary = None
@@ -299,6 +284,16 @@ class MemoryDerivationWorker:
                 ),
                 summarized_child_revision=(
                     child_revision if summary is not None else None
+                ),
+                last_updated_segment_id=(
+                    str(delta_segments[-1]["segment_id"])
+                    if summary is not None
+                    else None
+                ),
+                last_updated_segment_at=(
+                    str(delta_segments[-1].get("updated_at") or "")
+                    if summary is not None
+                    else None
                 ),
             )
             refreshed = self.storage.get_experience(memory_id) or experience
