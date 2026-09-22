@@ -18,6 +18,7 @@ from core.config import PROJECT_ROOT, config_path
 from core.logging_config import configure_logging
 from core.session import SessionManager
 from core.storage import MemoryStorage
+from core.trajectory import TraceRepository
 from service.hesm_service import HESMService
 
 
@@ -397,6 +398,7 @@ database_initializer = MemoryStorage(DATABASE_PATH)
 database_initializer.close()
 repository = MemoryRepository(DATABASE_PATH)
 session_manager = SessionManager(DATABASE_PATH)
+trace_repository = TraceRepository(DATABASE_PATH)
 session_manager.import_legacy_chat_turns()
 session_manager.remove_chat_traces_from_qa_tools()
 _service: HESMService | None = None
@@ -471,6 +473,14 @@ def get_session(session_id: str) -> dict[str, Any]:
         return session_manager.get(session_id)
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.get("/api/sessions/{session_id}/traces/{turn_id}")
+def get_turn_trace(session_id: str, turn_id: str) -> dict[str, Any]:
+    trace = trace_repository.get(session_id, turn_id)
+    if trace is None:
+        raise HTTPException(status_code=404, detail="对话轨迹不存在")
+    return trace
 
 
 @app.patch("/api/sessions/{session_id}")

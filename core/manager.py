@@ -540,6 +540,9 @@ class MemoryManager:
         timestamp: str,
         payload: dict[str, Any] | None = None,
     ) -> None:
+        trace_ids = getattr(self, "trace_turn_ids", [])
+        if trace_ids:
+            payload = {**(payload or {}), "trace_turn_ids": list(trace_ids)}
         self.storage.enqueue_memory_job(
             job_id=self._new_id("job"),
             job_type=job_type,

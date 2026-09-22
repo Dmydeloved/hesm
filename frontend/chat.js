@@ -8,7 +8,8 @@
     .replaceAll("'", "&#039;");
   const currentSessionStorageKey = "hesm.currentChatSession";
   const state = {
-    history: [], running: false, result: null, timer: null,
+    history: [], running: false, result: null, timer: null, traceTimer: null,
+    selectedTurnId: null,
     stateKey: localStorage.getItem(currentSessionStorageKey) || "web_chat",
   };
   const elements = {
@@ -16,7 +17,7 @@
     send: $("#send"), messages: $("#messages"), empty: $("#trace-empty"),
     trace: $("#trace"), total: $("#total-time"), topic: $("#topic-result"),
     retrieval: $("#retrieval-result"), promptText: $("#prompt-text"),
-    store: $("#store-result"), model: $("#model-name"),
+    store: $("#store-result"), model: $("#model-name"), asyncResult: $("#async-result"),
     toast: $("#toast"),
     sessionList: $("#session-list"), sessionTitle: $("#current-session-title"),
   };
@@ -58,10 +59,15 @@
     return role === "user" ? '<span class="user-avatar">我</span>' : '<span class="assistant-avatar">H</span>';
   }
 
-  function addMessage(role, content, meta = "", id = "") {
+  function addMessage(role, content, meta = "", id = "", turnId = "") {
     const node = document.createElement("article");
     node.className = `message ${role}`;
     if (id) node.id = id;
+    if (turnId) {
+      node.dataset.turnId = turnId;
+      node.title = "点击查看本轮对话轨迹";
+      node.tabIndex = 0;
+    }
     node.innerHTML = `${avatar(role)}<div><strong>${role === "user" ? "你" : "HESM Assistant"}</strong><p class="message-content">${escapeHtml(content)}</p>${meta ? `<div class="message-meta">${meta}</div>` : ""}</div>`;
     elements.messages.appendChild(node);
     elements.messages.scrollTop = elements.messages.scrollHeight;
@@ -96,6 +102,7 @@
   }
 
   function startTrace() {
+    clearTimeout(state.traceTimer);
     elements.empty.hidden = true;
     elements.trace.hidden = false;
     elements.total.textContent = "处理中";
@@ -103,6 +110,7 @@
     elements.retrieval.innerHTML = "<p>等待主题提取完成…</p>";
     elements.promptText.textContent = "等待记忆检索完成…";
     elements.store.innerHTML = "<p>等待模型回答完成…</p>";
+    elements.asyncResult.innerHTML = "<p>等待记忆存储完成…</p>";
     document.querySelector(".prompt-content").open = true;
     document.querySelectorAll(".trace-step time").forEach((item) => { item.textContent = "—"; });
     setStep("extract");
@@ -192,6 +200,58 @@
     setStep("store", "done");
   }
 
+  function renderAsyncTrace(trace) {
+    const jobs = trace.jobs || [];
+    const events = (trace.events || []).filter((event) => event.stage === "async_derivation");
+    const pending = jobs.filter((job) => job.status === "pending" || job.status === "processing");
+    const historyJobs = new Map(events.map((event) => [event.payload?.job_id, {
+      job_id: event.payload?.job_id, job_type: event.payload?.job_type,
+      memory_id: event.payload?.memory_id, status: event.status,
+      last_error: event.payload?.error,
+    }]));
+    for (const job of jobs) historyJobs.set(job.job_id, job);
+    const labels = {
+      update_segment: "Segment 更新 / 总结", update_experience: "Experience 更新 / 总结",
+      embed_segment: "Segment 向量", embed_experience: "Experience 向量",
+      create_experience_route_vector: "Experience 路由向量",
+      recall_experience_history: "历史经验召回",
+    };
+    const jobRows = [...historyJobs.values()].map((job) => `<div class="async-job"><strong>${escapeHtml(labels[job.job_type] || job.job_type)}</strong><span>${escapeHtml(job.status)} · ${escapeHtml(job.memory_id)}</span>${job.last_error ? `<p>${escapeHtml(job.last_error)}</p>` : ""}</div>`).join("");
+    const summaries = events.filter((event) => event.payload?.summary_generated).map((event) => `<details class="async-summary"><summary>${escapeHtml(event.payload.memory_type)} 总结 · ${escapeHtml(event.payload.memory_id)}</summary><pre>${escapeHtml(JSON.stringify(event.payload.summary || {}, null, 2))}</pre></details>`).join("");
+    const failures = events.filter((event) => event.status === "failed").map((event) => `<p>任务 ${escapeHtml(event.payload?.job_id)} 失败：${escapeHtml(event.payload?.error || "未知错误")}</p>`).join("");
+    elements.asyncResult.innerHTML = `<p>${historyJobs.size ? `关联 ${historyJobs.size} 个任务，${pending.length} 个进行中` : "本轮暂无异步任务"}</p>${jobRows}${summaries}${failures}`;
+    document.querySelector('[data-step="async"]').classList.toggle("done", historyJobs.size > 0 && pending.length === 0);
+    return pending.length;
+  }
+
+  async function showTurnTrace(turnId) {
+    if (!turnId) return;
+    state.selectedTurnId = turnId;
+    clearTimeout(state.traceTimer);
+    try {
+      const trace = await request(`/api/sessions/${encodeURIComponent(state.stateKey)}/traces/${encodeURIComponent(turnId)}`);
+      if (state.selectedTurnId !== turnId) return;
+      const final = [...trace.events].reverse().find((event) => event.stage === "final");
+      if (final?.payload?.result) {
+        startTrace();
+        renderTrace(final.payload.result);
+      } else {
+        startTrace();
+        for (const event of trace.events) {
+          if (event.payload?.event === "stage_completed") updateTraceEvent(event.payload);
+        }
+        elements.total.textContent = trace.status === "failed" ? "执行失败" : "处理中";
+      }
+      const pending = renderAsyncTrace(trace);
+      if (pending || trace.status === "running") {
+        state.traceTimer = setTimeout(() => showTurnTrace(turnId), 2000);
+      }
+    } catch (error) {
+      if (state.selectedTurnId !== turnId) return;
+      elements.asyncResult.innerHTML = `<p>轨迹加载失败：${escapeHtml(error.message)}</p>`;
+    }
+  }
+
   async function streamRequest(url, body, onEvent) {
     const response = await fetch(url, {
       method: "POST",
@@ -247,6 +307,10 @@
   }
 
   async function loadHistory(stateKey, notify = false) {
+    state.selectedTurnId = null;
+    clearTimeout(state.traceTimer);
+    elements.trace.hidden = true;
+    elements.empty.hidden = false;
     state.stateKey = stateKey;
     localStorage.setItem(currentSessionStorageKey, stateKey);
     let history = [];
@@ -262,8 +326,9 @@
     for (let index = 0; index < state.history.length; index += 2) {
       const user = state.history[index];
       const assistant = state.history[index + 1];
-      if (user?.role === "user") addMessage("user", user.content);
-      if (assistant?.role === "assistant") addMessage("assistant", assistant.content, '<span class="stored-chip">历史记录</span>');
+      const turnId = user?.metadata?.turn_id || assistant?.metadata?.turn_id || "";
+      if (user?.role === "user") addMessage("user", user.content, "", "", turnId);
+      if (assistant?.role === "assistant") addMessage("assistant", assistant.content, '<span class="stored-chip">历史记录</span>', "", turnId);
     }
     cacheCurrentHistory();
     await loadSessions();
@@ -275,7 +340,7 @@
     state.running = true;
     elements.send.disabled = true;
     elements.send.querySelector("span").textContent = "处理中";
-    addMessage("user", message);
+    const userNode = addMessage("user", message);
     const typing = addTyping();
     startTrace();
     try {
@@ -283,15 +348,22 @@
         message,
         session_id: state.stateKey,
       }, (event) => {
+        if (event.event === "start" && event.turn_id) {
+          userNode.dataset.turnId = event.turn_id;
+          userNode.title = "点击查看本轮对话轨迹";
+          userNode.tabIndex = 0;
+        }
         updateTraceEvent(event);
       });
       typing.remove();
-      addMessage("assistant", payload.answer, `<span class="stored-chip">已存入 HESM</span><span>${milliseconds(payload.timing?.chat_total_ms)}</span>`);
-      state.history.push({ role: "user", content: message }, { role: "assistant", content: payload.answer });
+      addMessage("assistant", payload.answer, `<span class="stored-chip">已存入 HESM</span><span>${milliseconds(payload.timing?.chat_total_ms)}</span>`, "", payload.turn_id);
+      state.history.push({ role: "user", content: message, metadata: { turn_id: payload.turn_id } }, { role: "assistant", content: payload.answer, metadata: { turn_id: payload.turn_id } });
       state.history = state.history.slice(-100);
       cacheCurrentHistory();
       state.result = payload;
       renderTrace(payload);
+      state.selectedTurnId = payload.turn_id;
+      showTurnTrace(payload.turn_id);
       await loadSessions();
       setHealth(true, "对话服务就绪");
     } catch (error) {
@@ -315,6 +387,18 @@
     if (!message) return;
     elements.input.value = "";
     send(message);
+  });
+  elements.messages.addEventListener("click", (event) => {
+    const item = event.target.closest(".message[data-turn-id]");
+    if (item && !state.running) showTurnTrace(item.dataset.turnId);
+  });
+  elements.messages.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const item = event.target.closest(".message[data-turn-id]");
+    if (item && !state.running) {
+      event.preventDefault();
+      showTurnTrace(item.dataset.turnId);
+    }
   });
   elements.input.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {

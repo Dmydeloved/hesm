@@ -7,9 +7,119 @@ from core.embedder import HashingEmbedder
 from core.manager import MemoryManager
 from core.retriever import HybridRetriever
 from core.storage import MemoryStorage
+from core.trajectory import TraceRepository
 from core.summarizer import TemplateSummarizer
 from core.vector_store import ChromaVectorStore
 from core.worker import MemoryDerivationWorker
+
+
+def test_coalesced_summary_is_visible_in_each_turn_trace(tmp_path):
+    database = tmp_path / "memory.sqlite3"
+    storage = MemoryStorage(database)
+    traces = TraceRepository(database)
+    first = traces.start("session-1", "第一轮")
+    second = traces.start("session-1", "第二轮")
+    storage.insert_experience(_experience())
+    storage.insert_segment(_segment())
+    storage.insert_qa({
+        "qa_id": "qa-1", "source_id": None,
+        "timestamp": "2026-01-02 00:00:00", "user_input": "去上海",
+        "assistant_output": "好的", "tools": [], "topic": "旅行",
+        "intent": "回忆", "core_entity": "上海", "entities": ["上海"],
+        "segment_id": "seg-1", "status": "open", "confidence": 0.9,
+        "reason": "",
+    })
+    for index, turn_id in enumerate((first, second), start=1):
+        storage.enqueue_memory_job(
+            job_id=f"job-{index}", job_type="update_segment",
+            memory_type="segment", memory_id="seg-1", target_version=index,
+            timestamp="2026-01-02 00:00:00",
+            payload={"force_summary": True, "trace_turn_ids": [turn_id]},
+        )
+    storage.commit()
+    manager = MemoryManager(
+        storage=storage, vector_store=ChromaVectorStore(ephemeral=True),
+        embedder=HashingEmbedder(), summarizer=TemplateSummarizer(),
+    )
+    worker = MemoryDerivationWorker(manager, RLock(), traces=traces)
+    assert worker.drain_once() == 1
+    for turn_id in (first, second):
+        trace = traces.get("session-1", turn_id)
+        assert trace is not None
+        assert any(event["payload"].get("summary_generated") for event in trace["events"])
+        assert any(job["job_type"] == "update_segment" for job in trace["jobs"])
+    third = traces.start("session-1", "第三轮")
+    next_qa = dict(storage.get_qa("qa-1"))
+    next_qa.update(qa_id="qa-2", timestamp="2026-01-03 00:00:00", user_input="再去上海")
+    storage.insert_qa(next_qa)
+    storage.commit()
+    traces.link_memories(third, [{
+        "qa_id": "qa-2", "segment_id": "seg-1", "experience_id": "exp-1",
+    }])
+    storage.enqueue_memory_job(
+        job_id="job-3", job_type="update_segment", memory_type="segment",
+        memory_id="seg-1", target_version=3, timestamp="2026-01-03 00:00:00",
+        payload={"force_summary": True, "trace_turn_ids": [third]},
+    )
+    storage.commit()
+    assert worker.drain_once() >= 1
+    assert len([
+        event for event in traces.get("session-1", first)["events"]
+        if event["stage"] == "async_derivation" and event["payload"]["job_type"] == "update_segment"
+    ]) == 1
+    assert any(
+        event["payload"].get("summary_generated")
+        for event in traces.get("session-1", third)["events"]
+    )
+    storage.close()
+
+
+def test_later_summary_links_earlier_turn_that_waited_for_threshold(tmp_path):
+    database = tmp_path / "memory.sqlite3"
+    storage = MemoryStorage(database)
+    traces = TraceRepository(database)
+    storage.insert_experience(_experience())
+    storage.insert_segment(_segment())
+    storage.commit()
+    manager = MemoryManager(
+        storage=storage, vector_store=ChromaVectorStore(ephemeral=True),
+        embedder=HashingEmbedder(), summarizer=TemplateSummarizer(),
+        segment_summary_qa_threshold=2,
+        experience_summary_segment_threshold=99,
+    )
+    worker = MemoryDerivationWorker(manager, RLock(), traces=traces)
+    turns = []
+    for index in (1, 2):
+        turn_id = traces.start("session-1", f"第{index}轮")
+        turns.append(turn_id)
+        storage.insert_qa({
+            "qa_id": f"qa-{index}", "source_id": None,
+            "timestamp": f"2026-01-0{index} 00:00:00",
+            "user_input": f"问题{index}", "assistant_output": f"回答{index}",
+            "tools": [], "topic": "旅行", "intent": "回忆",
+            "core_entity": "上海", "entities": ["上海"],
+            "segment_id": "seg-1", "status": "open", "confidence": 0.9,
+            "reason": "",
+        })
+        storage.commit()
+        traces.link_memories(turn_id, [{
+            "qa_id": f"qa-{index}", "segment_id": "seg-1",
+            "experience_id": "exp-1",
+        }])
+        storage.enqueue_memory_job(
+            job_id=f"job-{index}", job_type="update_segment",
+            memory_type="segment", memory_id="seg-1", target_version=index,
+            timestamp=f"2026-01-0{index} 00:00:00",
+            payload={"trace_turn_ids": [turn_id]},
+        )
+        storage.commit()
+        worker.drain_once()
+    for turn_id in turns:
+        assert any(
+            event["payload"].get("summary_generated")
+            for event in traces.get("session-1", turn_id)["events"]
+        )
+    storage.close()
 
 
 def _experience():

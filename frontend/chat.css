@@ -47,3 +47,5 @@
 .prompt-content summary{padding:8px;color:#6255c2;cursor:pointer;font-size:11px}
 .prompt-content pre{max-height:360px;overflow:auto;margin:0;padding:10px;border-top:1px solid #e1def4;color:#53605a;white-space:pre-wrap;word-break:break-word;font:13px/1.7 Consolas,"Microsoft YaHei",monospace}
 .trace-step-compact>header{padding-bottom:11px}
+.message[data-turn-id]{cursor:pointer}.message[data-turn-id]:hover .message-content,.message[data-turn-id]:focus-visible .message-content{outline:2px solid #a99fee;outline-offset:2px}
+.async-job{display:grid;gap:3px;margin-top:6px;padding:8px;border:1px solid var(--line);border-radius:7px;background:#fff}.async-job strong{font-size:11px}.async-job span{font:10px Consolas,monospace;word-break:break-all}.async-job p{margin:0}.async-summary{margin-top:6px;border:1px solid #e1def4;border-radius:7px}.async-summary summary{padding:8px;cursor:pointer}.async-summary pre{max-height:350px;overflow:auto;margin:0;padding:8px;white-space:pre-wrap;word-break:break-word;font:11px/1.6 Consolas,monospace}

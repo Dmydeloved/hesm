@@ -630,12 +630,12 @@ class MemoryStorage:
         incoming_payload = dict(payload or {})
         existing = self.connection.execute(
             """
-            SELECT payload_json FROM memory_outbox
+            SELECT payload_json, status FROM memory_outbox
             WHERE job_type = ? AND memory_type = ? AND memory_id = ?
             """,
             (job_type, memory_type, memory_id),
         ).fetchone()
-        if existing:
+        if existing and existing["status"] in {"pending", "processing"}:
             try:
                 previous_payload = json.loads(existing["payload_json"] or "{}")
             except (json.JSONDecodeError, TypeError):
@@ -679,6 +679,9 @@ class MemoryStorage:
     ) -> dict[str, Any]:
         """Merge coalesced update intent without losing force/status signals."""
         merged = {**previous, **incoming}
+        merged["trace_turn_ids"] = list(dict.fromkeys(
+            [*(previous.get("trace_turn_ids") or []), *(incoming.get("trace_turn_ids") or [])]
+        ))
         for key in (
             "force_summary",
             "force_experience_summary",

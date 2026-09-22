@@ -20,6 +20,7 @@ from core.recaller import ExperienceRecaller
 from core.retriever import HybridRetriever
 from core.session import SessionManager
 from core.storage import MemoryStorage
+from core.trajectory import TraceRepository
 from core.summarizer import LLMSummarizer
 from core.vector_store import ChromaVectorStore
 from core.worker import MemoryDerivationWorker
@@ -83,6 +84,7 @@ class HESMService:
             ),
             chunk_tokens=int(embedding_config.get("chunk_tokens", 7800)),
         )
+        self.traces = TraceRepository(database_path)
         self.extractor = TopicExtractor(
             api_key=topic_config.get("api_key"),
             model=topic_config.get("model"),
@@ -202,6 +204,7 @@ class HESMService:
             self.derivation_worker = MemoryDerivationWorker(
                 manager=worker_manager,
                 lock=RLock(),
+                traces=self.traces,
                 poll_interval=float(
                     management_config.get("async_poll_interval", 0.5)
                 ),
@@ -227,6 +230,7 @@ class HESMService:
         timestamp: str | None = None,
         state_key: str = "default",
         source_id: str | None = None,
+        trace_turn_id: str | None = None,
     ) -> dict[str, Any]:
         """Extract and persist one interaction into hierarchical memory."""
         text = str(user_input).strip()
@@ -262,6 +266,8 @@ class HESMService:
                 )
                 for item in topic_results
             ]
+            if trace_turn_id:
+                self.traces.link_memories(trace_turn_id, memories)
         if self.derivation_worker is not None:
             self.derivation_worker.notify()
         logger.info(
@@ -381,6 +387,40 @@ class HESMService:
         history: list[dict[str, Any]] | None = None,
         state_key: str = "default",
         session_id: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Persist each emitted milestone so a turn can be opened again later."""
+        identifier = str(session_id or state_key or "web_chat")
+        turn_id = self.traces.start(identifier, str(message).strip())
+        finished = False
+        try:
+            for event in self._chat_events_impl(
+                message=message, history=history, state_key=state_key,
+                session_id=session_id, turn_id=turn_id,
+            ):
+                event = {**event, "turn_id": turn_id}
+                stage = str(event.get("stage") or event.get("event") or "unknown")
+                self.traces.append(turn_id, stage, str(event.get("event")), event)
+                if event.get("event") == "final":
+                    self.traces.finish(turn_id, "completed")
+                    finished = True
+                yield event
+        except Exception as error:
+            self.traces.append(turn_id, "chat", "failed", {"error": str(error)})
+            self.traces.finish(turn_id, "failed")
+            finished = True
+            raise
+        finally:
+            if not finished:
+                self.traces.finish(turn_id, "interrupted")
+
+    def _chat_events_impl(
+        self,
+        *,
+        message: str,
+        history: list[dict[str, Any]] | None = None,
+        state_key: str = "default",
+        session_id: str | None = None,
+        turn_id: str,
     ) -> Iterator[dict[str, Any]]:
         """Yield real chat processing milestones as each backend stage completes."""
         text = str(message).strip()
@@ -536,16 +576,19 @@ class HESMService:
 
             yield {"event": "stage_started", "stage": "store"}
             storage_started_at = time.perf_counter()
-            stored = self.add_memory(
-                user_input=text,
-                assistant_output=answer,
-                context=prompt,
-                topic_result=retrieval_result["query_extraction"],
-                # tools is reserved exclusively for actual tool invocations.
-                # Topic extraction, retrieval and prompt diagnostics are not tools.
-                tools=[],
-                state_key=session_identifier,
-            )
+            self.manager.trace_turn_ids = [turn_id]
+            try:
+                stored = self.add_memory(
+                    user_input=text,
+                    assistant_output=answer,
+                    context=prompt,
+                    topic_result=retrieval_result["query_extraction"],
+                    tools=[],
+                    state_key=session_identifier,
+                    trace_turn_id=turn_id,
+                )
+            finally:
+                self.manager.trace_turn_ids = []
             timings["storage_ms"] = round((time.perf_counter() - storage_started_at) * 1000, 3)
             logger.info(
                 "Chat store completed session_id=%s timing_ms=%s stored=%s",
@@ -558,6 +601,7 @@ class HESMService:
                 user_content=text,
                 assistant_content=answer,
                 metadata={
+                    "turn_id": turn_id,
                     "last_qa_id": stored["memories"][0].get("qa_id", ""),
                     "model": self.chat_model,
                     "topic": retrieval_result["query_extraction"].get(
@@ -609,6 +653,7 @@ class HESMService:
             },
             "model": self.chat_model,
             "session_id": session_identifier,
+            "turn_id": turn_id,
             "history_turn_count": len(recent_turns),
         }
         logger.info(

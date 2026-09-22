@@ -33,6 +33,8 @@ python -m service.server
 
 聊天历史由独立的 `chat_session` 表管理，并保留浏览器本地缓存作为离线回退。刷新页面后会通过 `session_id` 自动恢复；“新建会话”会生成独立的会话标识，页面左侧可以切换或归档已保存会话。该表只负责会话历史，不改变 Experience、Segment、QA 的业务逻辑。
 
+每轮新对话都会生成 `turn_id`，并将输入、各同步阶段的开始与完成事件、Prompt、回答、存储结果及异步记忆任务写入 SQLite。点击该轮任意一条消息即可在右侧查看轨迹；异步任务仍在运行时页面会自动刷新状态。达到总结阈值后才生成的 Segment 或 Experience 总结，也会关联到参与该总结的较早对话轮次。功能上线前的旧消息没有采集过轨迹，无法回放。
+
 ## 主要接口
 
 - `GET /api/health`
@@ -47,6 +49,7 @@ python -m service.server
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `GET/PATCH/DELETE /api/sessions/{session_id}`
+- `GET /api/sessions/{session_id}/traces/{turn_id}`
 
 服务端对页面与接口统一使用 `Cache-Control: no-store`，静态服务不会返回协商缓存 304；页面资源使用绝对路径，并提供 `/favicon.ico`，避免从嵌套路由访问时产生静态资源 404。
 

@@ -7,7 +7,7 @@
   <title>HESM · 智能对话</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1">
   <link rel="stylesheet" href="/styles.css?v=7">
-  <link rel="stylesheet" href="/chat.css?v=8">
+  <link rel="stylesheet" href="/chat.css?v=9">
 </head>
 <body class="chat-page">
   <header class="topbar">
@@ -43,11 +43,12 @@
         <article class="trace-step" data-step="prompt"><header><span>03</span><div><strong>Prompt 拼接</strong><small>Memory + history + question</small></div><time>—</time></header><div class="trace-body"><details class="prompt-content" open><summary>完整 Prompt</summary><pre id="prompt-text">—</pre></details></div></article>
         <article class="trace-step trace-step-compact" data-step="generate"><header><span>04</span><div><strong>LLM 回答</strong><small id="model-name">Answer model</small></div><time>—</time></header></article>
         <article class="trace-step" data-step="store"><header><span>05</span><div><strong>记忆存储</strong><small>QA → Segment → Experience</small></div><time>—</time></header><div id="store-result" class="trace-body"></div></article>
+        <article class="trace-step" data-step="async"><header><span>06</span><div><strong>异步记忆更新</strong><small>Segment / Experience 总结与向量</small></div><time>—</time></header><div id="async-result" class="trace-body"><p>等待存储完成…</p></div></article>
       </div>
     </aside>
   </main>
 
   <div id="toast" class="toast"></div>
-  <script src="/chat.js?v=8"></script>
+  <script src="/chat.js?v=9"></script>
 </body>
 </html>

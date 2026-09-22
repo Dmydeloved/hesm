@@ -8,6 +8,7 @@ from typing import Any
 
 from .manager import MemoryManager
 from .time_utils import format_timestamp
+from .trajectory import TraceRepository
 
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ class MemoryDerivationWorker:
         manager: MemoryManager,
         lock: RLock,
         *,
+        traces: TraceRepository | None = None,
         poll_interval: float = 0.5,
         batch_size: int = 8,
         max_retries: int = 3,
@@ -28,6 +30,7 @@ class MemoryDerivationWorker:
         self.manager = manager
         self.storage = manager.storage
         self.lock = lock
+        self.traces = traces
         self.poll_interval = max(0.05, float(poll_interval))
         self.batch_size = max(1, int(batch_size))
         self.max_retries = max(1, int(max_retries))
@@ -80,6 +83,7 @@ class MemoryDerivationWorker:
     def _process_job(self, job: dict[str, Any]) -> None:
         job_id = str(job["job_id"])
         now = format_timestamp()
+        trace_ids: list[str] = []
         try:
             with self.lock:
                 claimed = self.storage.mark_memory_job_processing(job_id, now)
@@ -87,13 +91,21 @@ class MemoryDerivationWorker:
                 if not claimed:
                     return
                 claimed_job = self.storage.get_memory_job(job_id) or job
+                trace_ids = list((claimed_job.get("payload") or {}).get("trace_turn_ids") or [])
+                trace_ids = list(dict.fromkeys([
+                    *trace_ids, *self._summary_source_turns(claimed_job),
+                ]))
+                self.manager.trace_turn_ids = trace_ids
+                before = self._snapshot(claimed_job)
                 self._derive(claimed_job, now)
+                after = self._snapshot(claimed_job)
                 self.storage.mark_memory_job_completed(
                     job_id,
                     int(claimed_job.get("target_version") or 0),
                     format_timestamp(),
                 )
                 self.storage.commit()
+            self._trace_job(trace_ids, claimed_job, "completed", before, after)
         except Exception as error:
             with self.lock:
                 self.storage.rollback()
@@ -104,12 +116,86 @@ class MemoryDerivationWorker:
                     max_retries=self.max_retries,
                 )
                 self.storage.commit()
+            self._trace_job(trace_ids, job, "failed", error=str(error))
             logger.exception(
                 "Memory derivation job failed job_id=%s job_type=%s memory_id=%s",
                 job_id,
                 job.get("job_type"),
                 job.get("memory_id"),
             )
+        finally:
+            self.manager.trace_turn_ids = []
+
+    def _summary_source_turns(self, job: dict[str, Any]) -> list[str]:
+        if not self.traces:
+            return []
+        kind = str(job.get("job_type") or "")
+        memory_id = str(job.get("memory_id") or "")
+        payload = job.get("payload") or {}
+        if kind in {"update_segment", "summarize_segment"}:
+            segment = self.storage.get_segment(memory_id)
+            if not segment:
+                return []
+            delta = self.storage.list_unupdated_qas(segment)
+            if not delta or not (
+                payload.get("force_summary") or kind == "summarize_segment"
+                or len(delta) >= self.manager.segment_summary_qa_threshold
+            ):
+                return []
+            return self.traces.turns_for_qas([str(qa["qa_id"]) for qa in delta])
+        if kind in {"update_experience", "summarize_experience"}:
+            experience = self.storage.get_experience(memory_id)
+            if not experience:
+                return []
+            delta = [
+                segment for segment in self.storage.list_unupdated_segments(experience)
+                if int(segment.get("summary_version") or 0) > 0
+            ]
+            if len(delta) < self.manager.experience_summary_segment_threshold:
+                return []
+            return self.traces.turns_for_segments([
+                str(segment["segment_id"]) for segment in delta
+            ])
+        return []
+
+    def _snapshot(self, job: dict[str, Any]) -> dict[str, Any]:
+        kind = str(job.get("memory_type") or "")
+        memory_id = str(job.get("memory_id") or "")
+        if kind == "segment":
+            item = self.storage.get_segment(memory_id)
+        elif kind == "experience":
+            item = self.storage.get_experience(memory_id)
+        else:
+            item = None
+        if not item:
+            return {}
+        return {
+            "summary": item.get("summary") or {},
+            "status": item.get("status"),
+        }
+
+    def _trace_job(
+        self, trace_ids: list[str], job: dict[str, Any], status: str,
+        before: dict[str, Any] | None = None, after: dict[str, Any] | None = None,
+        *, error: str = "",
+    ) -> None:
+        if not self.traces:
+            return
+        payload = {
+            "job_id": job.get("job_id"), "job_type": job.get("job_type"),
+            "memory_type": job.get("memory_type"), "memory_id": job.get("memory_id"),
+            "summary_generated": bool(
+                after and after.get("summary")
+                and after.get("summary") != (before or {}).get("summary")
+            ),
+            "summary": (after or {}).get("summary") if after else None,
+            "memory_status": (after or {}).get("status"), "error": error,
+        }
+        for turn_id in trace_ids:
+            try:
+                self.traces.append(turn_id, "async_derivation", status, payload)
+            except Exception:
+                logger.exception("Could not record derivation trace turn_id=%s job_id=%s", turn_id, job.get("job_id"))
 
     def _derive(self, job: dict[str, Any], now: str) -> None:
         job_type = str(job["job_type"])
