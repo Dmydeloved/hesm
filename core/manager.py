@@ -684,29 +684,31 @@ class MemoryManager:
         preferred: dict[str, Any] | None = None,
         query: str = "",
     ) -> dict[str, Any] | None:
-        """Select one unambiguous open Segment from a bounded recent window."""
+        """Select one reusable Segment from a bounded recent intent history."""
         candidates: list[dict[str, Any]] = []
         seen: set[str] = set()
+        list_candidates = getattr(
+            self.storage,
+            "list_recent_reusable_segments",
+            self.storage.list_recent_open_segments,
+        )
+        find_exact = getattr(self.storage, "find_reusable_segment_by_intent", None)
+        historical_exact = find_exact(experience_id, intent) if find_exact else None
         for item in [
             preferred,
-            *self.storage.list_recent_open_segments(
+            historical_exact,
+            *list_candidates(
                 experience_id,
                 getattr(self, "segment_route_window", 5),
             ),
         ]:
             if (
                 not item
-                or item.get("status") != "open"
+                or item.get("status") == "deleted"
                 or item.get("experience_id") != experience_id
             ):
                 continue
             segment_id = str(item.get("segment_id") or "")
-            if segment_id and self.storage.has_pending_terminal_update(
-                job_type="update_segment",
-                memory_type="segment",
-                memory_id=segment_id,
-            ):
-                continue
             if segment_id and segment_id not in seen:
                 seen.add(segment_id)
                 candidates.append(item)

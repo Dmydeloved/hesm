@@ -88,6 +88,15 @@ CREATE TABLE IF NOT EXISTS chat_session (
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS topic_extraction_history (
+    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    state_key TEXT NOT NULL,
+    user_input TEXT NOT NULL,
+    assistant_output TEXT NOT NULL DEFAULT '',
+    topic_result_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS memory_outbox (
     job_id TEXT PRIMARY KEY,
     job_type TEXT NOT NULL,
@@ -116,6 +125,8 @@ CREATE INDEX IF NOT EXISTS idx_qa_topic
 ON qa_memory(topic);
 CREATE INDEX IF NOT EXISTS idx_chat_session_updated_at
 ON chat_session(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_topic_history_state_id
+ON topic_extraction_history(state_key, history_id DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_outbox_status_created
 ON memory_outbox(status, created_at);
 """
@@ -135,6 +146,7 @@ JSON_FIELDS = {
     "messages_json",
     "metadata_json",
     "payload_json",
+    "topic_result_json",
 }
 
 JSON_DEFAULTS: dict[str, Any] = {
@@ -150,6 +162,8 @@ JSON_DEFAULTS: dict[str, Any] = {
     "vector_json": [],
     "messages_json": [],
     "metadata_json": {},
+    "payload_json": {},
+    "topic_result_json": [],
 }
 
 
@@ -381,6 +395,7 @@ class MemoryStorage:
             "experience_memory": ("created_at", "updated_at"),
             "runtime_state": ("updated_at",),
             "chat_session": ("created_at", "updated_at"),
+            "topic_extraction_history": ("created_at",),
         }
         for table, columns in time_columns.items():
             selected_columns = ", ".join(columns)
@@ -449,6 +464,51 @@ class MemoryStorage:
 
     def rollback(self) -> None:
         self.connection.rollback()
+
+    def insert_topic_extraction_history(
+        self,
+        *,
+        state_key: str,
+        user_input: str,
+        assistant_output: str,
+        topic_result: dict[str, Any] | list[dict[str, Any]],
+        created_at: str | None = None,
+    ) -> int:
+        """Persist one topic-analysis turn independently from chat sessions."""
+        results = topic_result if isinstance(topic_result, list) else [topic_result]
+        cursor = self.connection.execute(
+            """
+            INSERT INTO topic_extraction_history (
+                state_key, user_input, assistant_output,
+                topic_result_json, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(state_key or "default"),
+                str(user_input or ""),
+                str(assistant_output or ""),
+                json.dumps(results, ensure_ascii=False),
+                format_timestamp(created_at),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def list_recent_topic_extractions(
+        self,
+        state_key: str,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Return the latest topic-analysis turns in chronological order."""
+        rows = self.connection.execute(
+            """
+            SELECT * FROM topic_extraction_history
+            WHERE state_key = ?
+            ORDER BY history_id DESC
+            LIMIT ?
+            """,
+            (str(state_key or "default"), max(1, int(limit))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in reversed(rows)]
 
     def _row_to_dict(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:
@@ -1214,6 +1274,42 @@ class MemoryStorage:
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
+    def list_recent_reusable_segments(
+        self,
+        experience_id: str,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Return recent non-deleted Segments, including switched-away history."""
+        rows = self.connection.execute(
+            """
+            SELECT * FROM segment_memory
+            WHERE experience_id = ? AND status != 'deleted'
+            ORDER BY updated_at DESC, created_at DESC, segment_id DESC
+            LIMIT ?
+            """,
+            (experience_id, max(1, int(limit))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def find_reusable_segment_by_intent(
+        self,
+        experience_id: str,
+        intent: str,
+    ) -> dict[str, Any] | None:
+        """Find the latest historical Segment with the same normalized intent."""
+        row = self.connection.execute(
+            """
+            SELECT * FROM segment_memory
+            WHERE experience_id = ? AND status != 'deleted'
+              AND lower(replace(trim(intent), ' ', '')) =
+                  lower(replace(trim(?), ' ', ''))
+            ORDER BY updated_at DESC, created_at DESC, segment_id DESC
+            LIMIT 1
+            """,
+            (experience_id, str(intent or "").strip()),
+        ).fetchone()
+        return self._row_to_dict(row)
+
     def get_experience(self, experience_id: str | None) -> dict[str, Any] | None:
         if not experience_id:
             return None
@@ -1857,6 +1953,7 @@ class MemoryStorage:
             "experience_memory",
             "runtime_state",
             "chat_session",
+            "topic_extraction_history",
             "memory_outbox",
         }:
             raise ValueError(f"Unsupported table: {table}")

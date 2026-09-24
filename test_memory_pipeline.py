@@ -563,6 +563,43 @@ def test_aggregate_segment_update_summarizes_only_at_threshold(tmp_path):
     storage.close()
 
 
+def test_default_segment_update_waits_for_five_new_qas(tmp_path):
+    storage = MemoryStorage(tmp_path / "memory.sqlite3")
+    storage.insert_experience(_experience())
+    storage.insert_segment(_segment())
+    summarizer = CountingSummarizer()
+    manager = MemoryManager(
+        storage=storage,
+        vector_store=ChromaVectorStore(ephemeral=True),
+        embedder=HashingEmbedder(),
+        summarizer=summarizer,
+        experience_summary_segment_threshold=99,
+    )
+    worker = MemoryDerivationWorker(manager, RLock())
+
+    for index in range(1, 6):
+        storage.insert_qa({
+            "qa_id": f"qa-{index}", "source_id": None,
+            "timestamp": f"2026-01-0{index} 00:00:00",
+            "user_input": f"问题 {index}", "assistant_output": f"回答 {index}",
+            "tools": [], "topic": "旅行", "intent": "回忆",
+            "core_entity": "上海", "entities": ["上海"],
+            "segment_id": "seg-1", "status": "open", "confidence": 0.9,
+            "reason": "",
+        })
+        storage.enqueue_memory_job(
+            job_id=f"job-{index}", job_type="update_segment",
+            memory_type="segment", memory_id="seg-1", target_version=index,
+            timestamp=f"2026-01-0{index} 00:00:00",
+            payload={"desired_status": "open", "force_summary": False},
+        )
+        storage.commit()
+        worker.drain_once()
+        assert summarizer.segment_calls == (1 if index == 5 else 0)
+
+    storage.close()
+
+
 def test_one_updated_segment_does_not_trigger_experience_summary(tmp_path):
     storage = MemoryStorage(tmp_path / "memory.sqlite3")
     storage.insert_experience(_experience())
@@ -669,13 +706,14 @@ def test_new_experience_request_only_embeds_qa_synchronously(tmp_path):
     storage.close()
 
 
-def test_low_qa_count_does_not_merge_an_incompatible_segment(tmp_path):
+def test_segment_route_reuses_historical_same_intent_after_switch(tmp_path):
     storage = MemoryStorage(tmp_path / "memory.sqlite3")
+    summarizer = CountingSummarizer()
     manager = MemoryManager(
         storage=storage,
         vector_store=ChromaVectorStore(ephemeral=True),
         embedder=HashingEmbedder(),
-        summarizer=TemplateSummarizer(),
+        summarizer=summarizer,
         experience_recaller=EmptyHistoryRecaller(),
     )
     first = manager.add_qa(
@@ -711,11 +749,48 @@ def test_low_qa_count_does_not_merge_an_incompatible_segment(tmp_path):
 
     assert first["experience_id"] == second["experience_id"]
     assert first["segment_id"] != second["segment_id"]
-    assert third["segment_id"] not in {first["segment_id"], second["segment_id"]}
+    assert third["segment_id"] == first["segment_id"]
     worker = MemoryDerivationWorker(manager, RLock(), batch_size=20)
     while worker.drain_once():
         pass
     assert storage.get_segment(first["segment_id"])["status"] == "completed"
+    assert summarizer.segment_calls == 2
+    assert set(storage.get_segment(first["segment_id"])["qa_ids"]) == {
+        first["qa_id"],
+        third["qa_id"],
+    }
+    storage.close()
+
+
+def test_two_updates_to_same_segment_trigger_experience_summary(tmp_path):
+    storage = MemoryStorage(tmp_path / "memory.sqlite3")
+    storage.insert_experience(_experience())
+    segment = _segment()
+    segment["summary_version"] = 2
+    storage.insert_segment(segment)
+    storage.enqueue_memory_job(
+        job_id="job-exp-summary",
+        job_type="update_experience",
+        memory_type="experience",
+        memory_id="exp-1",
+        target_version=2,
+        timestamp="2026-01-02 00:00:00",
+        payload={"desired_status": "open"},
+    )
+    storage.commit()
+    summarizer = CapturingSummarizer()
+    manager = MemoryManager(
+        storage=storage,
+        vector_store=ChromaVectorStore(ephemeral=True),
+        embedder=HashingEmbedder(),
+        summarizer=summarizer,
+        experience_summary_segment_threshold=2,
+    )
+
+    MemoryDerivationWorker(manager, RLock()).drain_once()
+
+    assert summarizer.experience_batches == [["seg-1"]]
+    assert storage.get_experience("exp-1")["last_summarized_child_revision"] == 2
     storage.close()
 
 
@@ -937,10 +1012,12 @@ def test_hierarchy_retrieval_returns_only_content_after_update_markers(tmp_path)
             segment["last_updated_qa_id"] = "qa-31"
         storage.insert_segment(segment)
 
-    for qa_id, timestamp in (
-        ("qa-31", "2026-01-04 00:00:01"),
-        ("qa-32", "2026-01-04 00:00:02"),
-        ("qa-33", "2026-01-04 00:00:03"),
+    for qa_id, segment_id, timestamp in (
+        ("qa-21", "seg-2", "2026-01-03 00:00:01"),
+        ("qa-22", "seg-2", "2026-01-03 00:00:02"),
+        ("qa-31", "seg-3", "2026-01-04 00:00:01"),
+        ("qa-32", "seg-3", "2026-01-04 00:00:02"),
+        ("qa-33", "seg-3", "2026-01-04 00:00:03"),
     ):
         storage.insert_qa(
             {
@@ -951,10 +1028,10 @@ def test_hierarchy_retrieval_returns_only_content_after_update_markers(tmp_path)
                 "assistant_output": "answer",
                 "tools": [],
                 "topic": experience["topic"],
-                "intent": "stage-3",
+                "intent": f"stage-{segment_id[-1]}",
                 "core_entity": experience["core_entity"],
                 "entities": [],
-                "segment_id": "seg-3",
+                "segment_id": segment_id,
                 "status": "open",
                 "confidence": 1.0,
                 "reason": "",
@@ -981,7 +1058,9 @@ def test_hierarchy_retrieval_returns_only_content_after_update_markers(tmp_path)
     )
 
     assert [item["segment_id"] for item in result["segments"]] == ["seg-2", "seg-3"]
-    assert [item["qa_id"] for item in result["qas"]] == ["qa-32", "qa-33"]
+    assert [item["qa_id"] for item in result["qas"]] == [
+        "qa-21", "qa-22", "qa-32", "qa-33",
+    ]
     storage.close()
 
 

@@ -765,9 +765,15 @@ class HybridRetriever:
             ),
         )
 
-        latest_segment = segments[-1] if segments else None
-        if latest_segment and hasattr(self.storage, "list_unupdated_qas"):
-            latest_qas = self.storage.list_unupdated_qas(latest_segment)
+        if segments and hasattr(self.storage, "list_unupdated_qas"):
+            latest_qas = []
+            seen_qa_ids: set[str] = set()
+            for segment in segments:
+                for qa in self.storage.list_unupdated_qas(segment):
+                    qa_id = str(qa.get("qa_id") or "")
+                    if qa_id and qa_id not in seen_qa_ids:
+                        seen_qa_ids.add(qa_id)
+                        latest_qas.append(qa)
         else:
             segment_ids = [str(segment["segment_id"]) for segment in segments]
             latest_qas = self.storage.list_latest_qas(segment_ids, self.qa_limit)

@@ -147,11 +147,21 @@ class MemoryDerivationWorker:
             experience = self.storage.get_experience(memory_id)
             if not experience:
                 return []
+            segments = self.storage.list_segments_by_experience_ids([memory_id])
+            child_revision = sum(
+                max(0, int(segment.get("summary_version") or 0))
+                for segment in segments
+            )
+            pending_updates = max(
+                0,
+                child_revision
+                - int(experience.get("last_summarized_child_revision") or 0),
+            )
             delta = [
                 segment for segment in self.storage.list_unupdated_segments(experience)
                 if int(segment.get("summary_version") or 0) > 0
             ]
-            if len(delta) < self.manager.experience_summary_segment_threshold:
+            if pending_updates < self.manager.experience_summary_segment_threshold:
                 return []
             return self.traces.turns_for_segments([
                 str(segment["segment_id"]) for segment in delta
@@ -322,8 +332,13 @@ class MemoryDerivationWorker:
                 for segment in self.storage.list_unupdated_segments(experience)
                 if int(segment.get("summary_version") or 0) > 0
             ]
+            pending_segment_updates = max(
+                0,
+                child_revision
+                - int(experience.get("last_summarized_child_revision") or 0),
+            )
             should_summarize = (
-                len(delta_segments)
+                pending_segment_updates
                 >= self.manager.experience_summary_segment_threshold
             )
             summary = None
@@ -360,6 +375,18 @@ class MemoryDerivationWorker:
             previous_segment_ids = list(experience.get("segment_ids") or [])
             previous_intents = list(experience.get("intents_link") or [])
             previous_status = str(experience.get("status") or "open")
+            marker_segment = (
+                delta_segments[-1]
+                if delta_segments
+                else max(
+                    segments,
+                    key=lambda item: (
+                        str(item.get("updated_at") or ""),
+                        str(item.get("segment_id") or ""),
+                    ),
+                    default=None,
+                )
+            )
             self.storage.reconcile_experience(
                 experience_id=memory_id,
                 desired_status=desired_status,
@@ -372,13 +399,13 @@ class MemoryDerivationWorker:
                     child_revision if summary is not None else None
                 ),
                 last_updated_segment_id=(
-                    str(delta_segments[-1]["segment_id"])
-                    if summary is not None
+                    str(marker_segment["segment_id"])
+                    if summary is not None and marker_segment
                     else None
                 ),
                 last_updated_segment_at=(
-                    str(delta_segments[-1].get("updated_at") or "")
-                    if summary is not None
+                    str(marker_segment.get("updated_at") or "")
+                    if summary is not None and marker_segment
                     else None
                 ),
             )

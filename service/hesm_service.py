@@ -242,10 +242,15 @@ class HESMService:
             text,
         )
         with self._lock:
-            extracted = topic_result or self.extractor.extract(
-                user_input=text,
-                context=str(context or ""),
-            )
+            extracted = topic_result
+            if extracted is None:
+                extracted = self.extractor.extract(
+                    user_input=text,
+                    context=self._topic_extraction_context(
+                        state_key,
+                        additional_context=str(context or ""),
+                    ),
+                )
             topic_results = extracted if isinstance(extracted, list) else [extracted]
             if not topic_results or not all(isinstance(item, dict) for item in topic_results):
                 raise ValueError("Topic extraction returned no valid records")
@@ -268,6 +273,14 @@ class HESMService:
             ]
             if trace_turn_id:
                 self.traces.link_memories(trace_turn_id, memories)
+            self.storage.insert_topic_extraction_history(
+                state_key=state_key,
+                user_input=text,
+                assistant_output=str(assistant_output or ""),
+                topic_result=topic_results,
+                created_at=timestamp,
+            )
+            self.storage.commit()
         if self.derivation_worker is not None:
             self.derivation_worker.notify()
         logger.info(
@@ -299,7 +312,10 @@ class HESMService:
             extraction_started_at = time.perf_counter()
             extracted = self.extractor.extract(
                 user_input=text,
-                context=str(extraction_context or ""),
+                context=self._topic_extraction_context(
+                    state_key,
+                    additional_context=str(extraction_context or ""),
+                ),
             )
             extraction_ms = round(
                 (time.perf_counter() - extraction_started_at) * 1000, 3
@@ -330,6 +346,13 @@ class HESMService:
             result = self.retriever.retriever(
                 **retrieval_arguments,
             )
+            self.storage.insert_topic_extraction_history(
+                state_key=state_key,
+                user_input=text,
+                assistant_output="",
+                topic_result=candidates,
+            )
+            self.storage.commit()
             retrieval_ms = round(
                 (time.perf_counter() - retrieval_started_at) * 1000, 3
             )
@@ -434,19 +457,18 @@ class HESMService:
             text,
         )
         session = self.sessions.ensure(session_identifier)
-        persisted_history = session.get("messages") or []
-        requested_history = history or []
-        # The browser only needs to submit session_id. history is retained as a
-        # compatibility fallback for older callers whose session has not been saved.
-        history_source = persisted_history or requested_history
-        recent_turns = self._recent_session_turns(
-            history_source,
-            session.get("metadata") or {},
+        recent_turns = self.storage.list_recent_topic_extractions(
+            session_identifier,
             limit=5,
         )
-        extraction_context = (
-            json.dumps(recent_turns, ensure_ascii=False, indent=2)
-            if recent_turns else ""
+        requested_history = history or []
+        extraction_context = self._topic_extraction_context(
+            session_identifier,
+            additional_context=(
+                json.dumps(requested_history, ensure_ascii=False, indent=2)
+                if requested_history and not recent_turns
+                else ""
+            ),
         )
 
         total_started_at = time.perf_counter()
@@ -680,6 +702,19 @@ class HESMService:
         """构造最近五轮对话及其既有主题、核心实体上下文。"""
         turns = HESMService._recent_session_turns(messages, session_metadata, limit=5)
         return json.dumps(turns, ensure_ascii=False, indent=2) if turns else ""
+
+    def _topic_extraction_context(
+        self,
+        state_key: str,
+        *,
+        additional_context: str = "",
+    ) -> str:
+        """Build extraction context from the dedicated five-turn history."""
+        recent = self.storage.list_recent_topic_extractions(state_key, limit=5)
+        payload: dict[str, Any] = {"recent_topic_history": recent}
+        if str(additional_context or "").strip():
+            payload["additional_context"] = str(additional_context).strip()
+        return json.dumps(payload, ensure_ascii=False, indent=2) if any(payload.values()) else ""
 
     @staticmethod
     def _recent_session_turns(
