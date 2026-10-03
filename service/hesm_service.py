@@ -61,6 +61,8 @@ class HESMService:
 
         embedding_config = self.config.get("embedding", {})
         topic_config = self.config.get("topic_extraction", {})
+        identity_config = self.config.get("identity", {})
+        self.default_user_id = str(identity_config.get("default_user_id") or "default")
         summary_config = self.config.get("summarization", {})
         chat_config = self.config.get("chat", summary_config)
         management_config = self.config.get("memory_management", {})
@@ -70,6 +72,7 @@ class HESMService:
         self.storage = MemoryStorage(
             database_path,
             check_same_thread=False,
+            default_user_id=self.default_user_id,
         )
         self.sessions = SessionManager(database_path)
         self.vector_store = ChromaVectorStore(persist_path=chroma_path)
@@ -230,7 +233,10 @@ class HESMService:
         timestamp: str | None = None,
         state_key: str = "default",
         source_id: str | None = None,
-        trace_turn_id: str | None = None,
+        chat_id: str | None = None,
+        add_id: str | None = None,
+        user_id: str | None = None,
+        record_topic_history: bool = True,
     ) -> dict[str, Any]:
         """Extract and persist one interaction into hierarchical memory."""
         text = str(user_input).strip()
@@ -241,46 +247,101 @@ class HESMService:
             state_key,
             text,
         )
-        with self._lock:
-            extracted = topic_result
-            if extracted is None:
-                extracted = self.extractor.extract(
-                    user_input=text,
-                    context=self._topic_extraction_context(
-                        state_key,
-                        additional_context=str(context or ""),
-                    ),
+        add_identifier = add_id or self.traces.create_add(
+            chat_id=chat_id,
+            user_input=text,
+            assistant_output=str(assistant_output or ""),
+        )
+        started_at = time.perf_counter()
+        extraction_ms = 0.0
+        try:
+            with self._lock:
+                extracted = topic_result
+                if extracted is None:
+                    extraction_started_at = time.perf_counter()
+                    extracted = self.extractor.extract(
+                        user_input=text,
+                        context=self._topic_extraction_context(
+                            state_key,
+                            additional_context=str(context or ""),
+                        ),
+                    )
+                    extraction_ms = round(
+                        (time.perf_counter() - extraction_started_at) * 1000, 3
+                    )
+                topic_results = extracted if isinstance(extracted, list) else [extracted]
+                if not topic_results or not all(isinstance(item, dict) for item in topic_results):
+                    raise ValueError("Topic extraction returned no valid records")
+                if record_topic_history:
+                    self.storage.append_topic_extraction_history(
+                        session_id=state_key,
+                        user_id=user_id,
+                        user_input=text,
+                        topic_extraction_result=topic_results,
+                        source="memory_add" if topic_result is None else "provided_memory_add",
+                        elapsed_ms=extraction_ms,
+                        model=str(getattr(self.extractor, "model", "")),
+                    )
+                logger.info(
+                    "Add memory topic result state_key=%s topic_results=%s",
+                    state_key,
+                    json.dumps(topic_results, ensure_ascii=False),
                 )
-            topic_results = extracted if isinstance(extracted, list) else [extracted]
-            if not topic_results or not all(isinstance(item, dict) for item in topic_results):
-                raise ValueError("Topic extraction returned no valid records")
-            logger.info(
-                "Add memory topic extraction result state_key=%s topic_results=%s",
-                state_key,
-                json.dumps(topic_results, ensure_ascii=False),
-            )
-            memories = [
-                self.manager.add_qa(
-                    topic_result=item,
-                    user_input=text,
-                    assistant_output=str(assistant_output or ""),
-                    tools=tools,
-                    timestamp=timestamp,
-                    state_key=state_key,
-                    source_id=source_id,
+                self.manager.trace_chat_ids = [chat_id] if chat_id else []
+                self.manager.trace_add_ids = [add_identifier]
+                try:
+                    memories = [
+                        self.manager.add_qa(
+                            topic_result=item,
+                            user_input=text,
+                            assistant_output=str(assistant_output or ""),
+                            tools=tools,
+                            timestamp=timestamp,
+                            state_key=state_key,
+                            source_id=source_id,
+                        )
+                        for item in topic_results
+                    ]
+                finally:
+                    self.manager.trace_chat_ids = []
+                    self.manager.trace_add_ids = []
+                self.storage.commit()
+            job_ids = []
+            for memory in memories:
+                job_id = self.storage.get_memory_job_id(
+                    "update_segment", "segment", str(memory.get("segment_id") or "")
                 )
-                for item in topic_results
-            ]
-            if trace_turn_id:
-                self.traces.link_memories(trace_turn_id, memories)
-            self.storage.insert_topic_extraction_history(
-                state_key=state_key,
+                if job_id:
+                    job_ids.append(job_id)
+            job_ids = list(dict.fromkeys(job_ids))
+            elapsed_ms = round((time.perf_counter() - started_at) * 1000, 3)
+            primary = memories[0] if memories else {}
+            self.traces.update_add(
+                add_identifier,
+                topic_extract_json=json.dumps(topic_results, ensure_ascii=False),
+                experience_id=str(primary.get("experience_id") or ""),
+                segment_id=str(primary.get("segment_id") or ""),
+                experience_ids_json=json.dumps(list(dict.fromkeys(str(item.get("experience_id") or "") for item in memories)), ensure_ascii=False),
+                segment_ids_json=json.dumps(list(dict.fromkeys(str(item.get("segment_id") or "") for item in memories)), ensure_ascii=False),
+                qa_ids_json=json.dumps([str(item.get("qa_id") or "") for item in memories], ensure_ascii=False),
+                memory_outbox_id=job_ids[0] if job_ids else None,
+                memory_outbox_ids_json=json.dumps(job_ids, ensure_ascii=False),
                 user_input=text,
                 assistant_output=str(assistant_output or ""),
-                topic_result=topic_results,
-                created_at=timestamp,
+                action=str(primary.get("action") or ""),
+                status="completed",
+                elapsed_ms=elapsed_ms,
             )
-            self.storage.commit()
+        except Exception as error:
+            self.traces.update_add(
+                add_identifier,
+                user_input=text,
+                assistant_output=str(assistant_output or ""),
+                status="failed",
+                error_message=str(error),
+                elapsed_ms=round((time.perf_counter() - started_at) * 1000, 3),
+            )
+            raise
         if self.derivation_worker is not None:
             self.derivation_worker.notify()
         logger.info(
@@ -293,6 +354,8 @@ class HESMService:
             "memories": memories,
             "topic_results": topic_results,
             "state_key": state_key,
+            "add_id": add_identifier,
+            "memory_outbox_ids": job_ids,
         }
 
     def retrieve(
@@ -300,29 +363,54 @@ class HESMService:
         *,
         question: str,
         state_key: str = "default",
+        session_id: str | None = None,
+        user_id: str | None = None,
         extraction_context: str = "",
+        topic_result: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Extract a query and retrieve a bounded hierarchical memory tree."""
+        """Retrieve a bounded hierarchical memory tree.
+
+        ``topic_result`` is an evaluation hook: when supplied, the stored
+        topic/entity records are used verbatim and query-time topic extraction
+        is skipped.  The retriever itself is unchanged.
+        """
         text = str(question).strip()
         if not text:
             raise ValueError("question must not be empty")
         logger.info("Retrieve started state_key=%s question=%s", state_key, text)
         started_at = time.perf_counter()
-        with self._lock:
-            extraction_started_at = time.perf_counter()
-            extracted = self.extractor.extract(
-                user_input=text,
-                context=self._topic_extraction_context(
-                    state_key,
-                    additional_context=str(extraction_context or ""),
-                ),
-            )
-            extraction_ms = round(
-                (time.perf_counter() - extraction_started_at) * 1000, 3
-            )
+        session_identifier = str(session_id or state_key or "default")
+        retriever_id = self.traces.start_retriever(text)
+        try:
+            if topic_result is None:
+                extraction_started_at = time.perf_counter()
+                extracted = self.extractor.extract(
+                    user_input=text,
+                    context=self._topic_extraction_context(
+                        state_key,
+                        additional_context=str(extraction_context or ""),
+                    ),
+                )
+                extraction_ms = round(
+                    (time.perf_counter() - extraction_started_at) * 1000, 3
+                )
+                extraction_source = "llm"
+            else:
+                extracted = topic_result
+                extraction_ms = 0.0
+                extraction_source = "evidence_topic_lookup"
             candidates = extracted if isinstance(extracted, list) else [extracted]
-            if not candidates or not isinstance(candidates[0], dict):
+            if not candidates or not all(isinstance(item, dict) for item in candidates):
                 raise ValueError("Topic extraction returned no valid query")
+            self.storage.append_topic_extraction_history(
+                session_id=session_identifier,
+                user_id=user_id,
+                user_input=text,
+                topic_extraction_result=candidates,
+                source=f"retrieve:{extraction_source}",
+                elapsed_ms=extraction_ms,
+                model=str(getattr(self.extractor, "model", "")),
+            )
             primary = candidates[0]
             logger.info(
                 "Retrieve extraction completed state_key=%s timing_ms=%s extraction=%s",
@@ -346,13 +434,6 @@ class HESMService:
             result = self.retriever.retriever(
                 **retrieval_arguments,
             )
-            self.storage.insert_topic_extraction_history(
-                state_key=state_key,
-                user_input=text,
-                assistant_output="",
-                topic_result=candidates,
-            )
-            self.storage.commit()
             retrieval_ms = round(
                 (time.perf_counter() - retrieval_started_at) * 1000, 3
             )
@@ -364,12 +445,31 @@ class HESMService:
                 len(result.get("segments") or []),
                 len(result.get("qas") or []),
             )
+            total_ms = round((time.perf_counter() - started_at) * 1000, 3)
+            self.traces.update_retriever(
+                retriever_id,
+                topic_extract_json=json.dumps(primary, ensure_ascii=False),
+                query_candidates_json=json.dumps(candidates, ensure_ascii=False),
+                experiences_json=json.dumps(result.get("experiences") or [], ensure_ascii=False),
+                segments_json=json.dumps(result.get("segments") or [], ensure_ascii=False),
+                qas_json=json.dumps(result.get("qas") or [], ensure_ascii=False),
+                context_text=str(result.get("context") or ""),
+                topic_extract_time_ms=extraction_ms,
+                retrieval_time_ms=retrieval_ms,
+                elapsed_ms=total_ms,
+                status="completed",
+            )
+        except Exception as error:
+            self.traces.update_retriever(retriever_id, status="failed", error_message=str(error), elapsed_ms=round((time.perf_counter() - started_at) * 1000, 3))
+            raise
         total_ms = round((time.perf_counter() - started_at) * 1000, 3)
         logger.info("Retrieve completed state_key=%s total_ms=%s", state_key, total_ms)
         return {
             "question": text,
+            "retriever_id": retriever_id,
             "query_extraction": primary,
             "query_candidates": candidates,
+            "topic_extraction_source": extraction_source,
             "timing": {
                 "topic_extraction_ms": extraction_ms,
                 "retrieval_ms": retrieval_ms,
@@ -388,6 +488,7 @@ class HESMService:
         history: list[dict[str, Any]] | None = None,
         state_key: str = "default",
         session_id: str | None = None,
+        user_id: str | None = None,
     ) -> dict[str, Any]:
         """Retrieve memory, answer the user, then persist the complete turn."""
         final_result: dict[str, Any] | None = None
@@ -396,6 +497,7 @@ class HESMService:
             history=history,
             state_key=state_key,
             session_id=session_id,
+            user_id=user_id,
         ):
             if event.get("event") == "final":
                 final_result = event["result"]
@@ -410,31 +512,41 @@ class HESMService:
         history: list[dict[str, Any]] | None = None,
         state_key: str = "default",
         session_id: str | None = None,
+        user_id: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Persist each emitted milestone so a turn can be opened again later."""
         identifier = str(session_id or state_key or "web_chat")
-        turn_id = self.traces.start(identifier, str(message).strip())
+        user_identifier = self.storage.resolve_user_id(user_id)
+        trajectory = self.traces.start(identifier, str(message).strip())
+        chat_id = trajectory["chat_id"]
         finished = False
         try:
             for event in self._chat_events_impl(
                 message=message, history=history, state_key=state_key,
-                session_id=session_id, turn_id=turn_id,
+                session_id=session_id, chat_id=chat_id,
+                user_id=user_identifier,
+                retriever_id=trajectory["retriever_id"], add_id=trajectory["add_id"],
             ):
-                event = {**event, "turn_id": turn_id}
-                stage = str(event.get("stage") or event.get("event") or "unknown")
-                self.traces.append(turn_id, stage, str(event.get("event")), event)
+                event = {**event, "chat_id": chat_id}
                 if event.get("event") == "final":
-                    self.traces.finish(turn_id, "completed")
+                    result = event.get("result") or {}
+                    self.traces.finish_chat(
+                        chat_id,
+                        status="completed",
+                        assistant_output=str(result.get("answer") or ""),
+                        elapsed_ms=float((result.get("timing") or {}).get("chat_total_ms") or 0),
+                        model=str(result.get("model") or ""),
+                        timing=result.get("timing") or {},
+                    )
                     finished = True
                 yield event
         except Exception as error:
-            self.traces.append(turn_id, "chat", "failed", {"error": str(error)})
-            self.traces.finish(turn_id, "failed")
+            self.traces.finish_chat(chat_id, status="failed", error_message=str(error))
             finished = True
             raise
         finally:
             if not finished:
-                self.traces.finish(turn_id, "interrupted")
+                self.traces.finish_chat(chat_id, status="interrupted")
 
     def _chat_events_impl(
         self,
@@ -443,7 +555,10 @@ class HESMService:
         history: list[dict[str, Any]] | None = None,
         state_key: str = "default",
         session_id: str | None = None,
-        turn_id: str,
+        user_id: str | None = None,
+        chat_id: str,
+        retriever_id: str,
+        add_id: str,
     ) -> Iterator[dict[str, Any]]:
         """Yield real chat processing milestones as each backend stage completes."""
         text = str(message).strip()
@@ -457,9 +572,8 @@ class HESMService:
             text,
         )
         session = self.sessions.ensure(session_identifier)
-        recent_turns = self.storage.list_recent_topic_extractions(
-            session_identifier,
-            limit=5,
+        recent_turns = self._recent_session_turns(
+            session.get("messages") or [], {}, limit=5
         )
         requested_history = history or []
         extraction_context = self._topic_extraction_context(
@@ -493,10 +607,22 @@ class HESMService:
             timings["topic_extraction_ms"] = round(
                 (time.perf_counter() - extraction_started_at) * 1000, 3
             )
+            self.traces.update_chat(
+                chat_id, timing_json=json.dumps(timings, ensure_ascii=False)
+            )
             candidates = extracted if isinstance(extracted, list) else [extracted]
             if not candidates or not isinstance(candidates[0], dict):
                 raise ValueError("Topic extraction returned no valid query")
             primary = candidates[0]
+            self.storage.append_topic_extraction_history(
+                session_id=session_identifier,
+                user_id=user_id,
+                user_input=text,
+                topic_extraction_result=candidates,
+                source="chat",
+                elapsed_ms=timings["topic_extraction_ms"],
+                model=str(getattr(self.extractor, "model", "")),
+            )
             logger.info(
                 "Chat extract completed session_id=%s timing_ms=%s extraction=%s candidates=%s",
                 session_identifier,
@@ -512,6 +638,12 @@ class HESMService:
                 "query_candidates": candidates,
                 "history_turn_count": len(recent_turns),
             }
+            self.traces.update_retriever(
+                retriever_id,
+                topic_extract_json=json.dumps(primary, ensure_ascii=False),
+                query_candidates_json=json.dumps(candidates, ensure_ascii=False),
+                topic_extract_time_ms=timings["topic_extraction_ms"],
+            )
 
             yield {"event": "stage_started", "stage": "retrieve"}
             retrieval_started_at = time.perf_counter()
@@ -525,6 +657,9 @@ class HESMService:
             )
             timings["retrieval_ms"] = round(
                 (time.perf_counter() - retrieval_started_at) * 1000, 3
+            )
+            self.traces.update_chat(
+                chat_id, timing_json=json.dumps(timings, ensure_ascii=False)
             )
             retrieval_result = {
                 "question": text,
@@ -550,6 +685,16 @@ class HESMService:
                 "timing_ms": timings["retrieval_ms"],
                 "retrieval": retrieval_result,
             }
+            self.traces.update_retriever(
+                retriever_id,
+                experiences_json=json.dumps(retrieval_payload.get("experiences") or [], ensure_ascii=False),
+                segments_json=json.dumps(retrieval_payload.get("segments") or [], ensure_ascii=False),
+                qas_json=json.dumps(retrieval_payload.get("qas") or [], ensure_ascii=False),
+                context_text=str(retrieval_payload.get("context") or ""),
+                retrieval_time_ms=timings["retrieval_ms"],
+                elapsed_ms=round(timings["topic_extraction_ms"] + timings["retrieval_ms"], 3),
+                status="completed",
+            )
 
             yield {"event": "stage_started", "stage": "prompt"}
             prompt_started_at = time.perf_counter()
@@ -559,6 +704,11 @@ class HESMService:
             )
             timings["prompt_assembly_ms"] = round(
                 (time.perf_counter() - prompt_started_at) * 1000, 3
+            )
+            self.traces.update_chat(
+                chat_id,
+                prompt_text=prompt,
+                timing_json=json.dumps(timings, ensure_ascii=False),
             )
             logger.info(
                 "Chat prompt built session_id=%s timing_ms=%s prompt=%s",
@@ -581,6 +731,9 @@ class HESMService:
             timings["generation_ms"] = round(
                 (time.perf_counter() - generation_started_at) * 1000, 3
             )
+            self.traces.update_chat(
+                chat_id, timing_json=json.dumps(timings, ensure_ascii=False)
+            )
             logger.info(
                 "Chat generation completed session_id=%s timing_ms=%s model=%s answer=%s",
                 session_identifier,
@@ -598,41 +751,26 @@ class HESMService:
 
             yield {"event": "stage_started", "stage": "store"}
             storage_started_at = time.perf_counter()
-            self.manager.trace_turn_ids = [turn_id]
-            try:
-                stored = self.add_memory(
-                    user_input=text,
-                    assistant_output=answer,
-                    context=prompt,
-                    topic_result=retrieval_result["query_extraction"],
-                    tools=[],
-                    state_key=session_identifier,
-                    trace_turn_id=turn_id,
-                )
-            finally:
-                self.manager.trace_turn_ids = []
+            stored = self.add_memory(
+                user_input=text,
+                assistant_output=answer,
+                context=prompt,
+                topic_result=retrieval_result["query_extraction"],
+                tools=[],
+                state_key=session_identifier,
+                chat_id=chat_id,
+                add_id=add_id,
+                record_topic_history=False,
+            )
             timings["storage_ms"] = round((time.perf_counter() - storage_started_at) * 1000, 3)
+            self.traces.update_chat(
+                chat_id, timing_json=json.dumps(timings, ensure_ascii=False)
+            )
             logger.info(
                 "Chat store completed session_id=%s timing_ms=%s stored=%s",
                 session_identifier,
                 timings["storage_ms"],
                 json.dumps(stored, ensure_ascii=False),
-            )
-            self.sessions.append_turn(
-                session_identifier,
-                user_content=text,
-                assistant_content=answer,
-                metadata={
-                    "turn_id": turn_id,
-                    "last_qa_id": stored["memories"][0].get("qa_id", ""),
-                    "model": self.chat_model,
-                    "topic": retrieval_result["query_extraction"].get(
-                        "topic", ""
-                    ),
-                    "core_entity": retrieval_result["query_extraction"].get(
-                        "core_entity", ""
-                    ),
-                },
             )
             yield {
                 "event": "stage_completed",
@@ -675,7 +813,9 @@ class HESMService:
             },
             "model": self.chat_model,
             "session_id": session_identifier,
-            "turn_id": turn_id,
+            "chat_id": chat_id,
+            "retriever_id": retriever_id,
+            "add_id": add_id,
             "history_turn_count": len(recent_turns),
         }
         logger.info(
@@ -710,8 +850,9 @@ class HESMService:
         additional_context: str = "",
     ) -> str:
         """Build extraction context from the dedicated five-turn history."""
-        recent = self.storage.list_recent_topic_extractions(state_key, limit=5)
-        payload: dict[str, Any] = {"recent_topic_history": recent}
+        session = self.sessions.get(state_key, required=False) or {}
+        recent = self._recent_session_turns(session.get("messages") or [], {}, limit=5)
+        payload: dict[str, Any] = {"recent_chat_history": recent}
         if str(additional_context or "").strip():
             payload["additional_context"] = str(additional_context).strip()
         return json.dumps(payload, ensure_ascii=False, indent=2) if any(payload.values()) else ""

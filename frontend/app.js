@@ -113,7 +113,7 @@
 
   function experienceRow(item) {
     const status = item.state?.status || "open";
-    return `<tr>
+    return `<tr data-detail-level="experience" data-detail-id="${esc(item.experience_id)}" class="memory-row-clickable">
       <td class="sequence">${item.sequence}</td>
       <td><strong>${esc(item.topic || "未命名主题")}</strong></td>
       <td>${textCell(item.core_entity)}</td>
@@ -128,7 +128,7 @@
   }
 
   function segmentRow(item) {
-    return `<tr>
+    return `<tr data-detail-level="segment" data-detail-id="${esc(item.segment_id)}" class="memory-row-clickable">
       <td class="sequence">${item.sequence}</td>
       <td><strong>${esc(item.topic || "未命名主题")}</strong></td>
       <td>${textCell(item.core_entity)}</td>
@@ -228,12 +228,19 @@
   });
   els.body.addEventListener("click", (event) => {
     const drill = event.target.closest("[data-drill]");
-    if (!drill) return;
-    switchLevel(drill.dataset.drill, {
-      parentId: drill.dataset.parent,
-      experienceId: drill.dataset.experience,
-      parentLabel: drill.dataset.label,
-    });
+    if (drill) {
+      switchLevel(drill.dataset.drill, {
+        parentId: drill.dataset.parent,
+        experienceId: drill.dataset.experience,
+        parentLabel: drill.dataset.label,
+      });
+      return;
+    }
+    const row = event.target.closest("tr[data-detail-level]");
+    if (row && !event.target.closest("a, button")) {
+      const query = new URLSearchParams({ level: row.dataset.detailLevel, id: row.dataset.detailId });
+      window.location.href = `/detail.html?${query}`;
+    }
   });
   els.context.addEventListener("click", (event) => {
     if (event.target.closest("[data-clear-parent]")) switchLevel(state.level);

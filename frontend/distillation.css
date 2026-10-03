@@ -1,0 +1,12 @@
+.memory-row-clickable{cursor:pointer}
+.memory-row-clickable:hover td{background:#f7f6ff}
+.distillation-history{margin-top:22px;padding-top:4px;border-top:1px solid var(--line)}
+.distillation-history h3{display:flex;align-items:center;gap:8px;margin:0 0 10px;font-size:14px}
+.distill-record{margin:8px 0;border:1px solid var(--line);border-radius:10px;background:#fff;overflow:hidden}
+.distill-record>summary{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 13px;color:var(--ink);font-size:12px;font-weight:700;cursor:pointer;list-style:none}
+.distill-record>summary::-webkit-details-marker{display:none}
+.distill-record>summary:after{content:"+";color:var(--muted);font-size:16px}
+.distill-record[open]>summary:after{content:"−"}
+.distill-meta{color:var(--muted);font-size:11px;font-weight:500}
+.distill-record pre{max-height:560px;margin:0 10px 10px;padding:12px;border:1px solid var(--line);border-radius:8px;background:#f8faf9;color:#46534d;font:11px/1.65 Consolas,"Microsoft YaHei",sans-serif;white-space:pre-wrap;word-break:break-word;overflow:auto}
+.distill-empty{margin:0;padding:12px;color:var(--muted);border:1px dashed var(--line);border-radius:9px;font-size:12px}

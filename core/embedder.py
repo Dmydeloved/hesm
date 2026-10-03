@@ -147,7 +147,11 @@ def split_embedding_text(
             chunks.append(text[start:best])
             start = best
         return [chunk for chunk in chunks if chunk.strip()], token_count
-    except ImportError:
+    except Exception:
+        # tiktoken may be installed while its encoding files are unavailable
+        # (for example in an offline worker).  Falling back here keeps the
+        # configured provider request path usable and still enforces the
+        # conservative byte-based limit.
         raw = text.encode("utf-8")
         token_count = len(raw)
         if token_count <= max_input_tokens:

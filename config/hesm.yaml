@@ -1,6 +1,12 @@
+# paths:
+#   memory_db: memory/hesm.sqlite3
+#   chroma: memory/chroma
+
+identity:
+  default_user_id: default
 paths:
-  memory_db: memory/hesm.sqlite3
-  chroma: memory/chroma
+  memory_db: experiments/.runtime/evidence_topic_retrieval_v2/smoke_evidence_topic_fallback_v2_locomo_030f8f726969f299/users/c1b93c6dcc9f6f32ad9451c56d7a6da749e547dfe74f24f9c10f984c62b31f0c/hesm.sqlite3
+  chroma: experiments/.runtime/evidence_topic_retrieval_v2/smoke_evidence_topic_fallback_v2_locomo_030f8f726969f299/users/c1b93c6dcc9f6f32ad9451c56d7a6da749e547dfe74f24f9c10f984c62b31f0c/chroma
 
 # Production HESM provider settings. This file is never read by experiments.
 _llm_connection: &llm_connection

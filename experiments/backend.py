@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -42,9 +43,21 @@ CREATE TABLE IF NOT EXISTS topic_extraction_history (
 );
 CREATE INDEX IF NOT EXISTS idx_topic_extraction_history_user
 ON topic_extraction_history (user_hash, history_id DESC);
+
+CREATE TABLE IF NOT EXISTS evidence_topic_map (
+    user_hash TEXT NOT NULL,
+    evidence_key TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    topic_results_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_hash, evidence_key)
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_topic_map_source
+ON evidence_topic_map (user_hash, source_id);
 """
 
 TOPIC_EXTRACTION_HISTORY_LIMIT = 5
+logger = logging.getLogger(__name__)
 
 
 class EvaluationBackend:
@@ -238,6 +251,120 @@ class EvaluationBackend:
                 ),
             )
 
+    @staticmethod
+    def _normalize_evidence(evidence) -> list[str]:
+        if evidence is None:
+            return []
+        values = evidence if isinstance(evidence, (list, tuple, set)) else [evidence]
+        normalized = []
+        for item in values:
+            if isinstance(item, dict):
+                item = (
+                    item.get("evidence_key")
+                    or item.get("evidence_id")
+                    or item.get("id")
+                    or item.get("key")
+                )
+            value = str(item or "").strip()
+            if value and value not in normalized:
+                normalized.append(value)
+        return normalized
+
+    def _record_evidence_topic_results(
+        self,
+        *,
+        user_hash: str,
+        source_id: str,
+        evidence,
+        topic_results,
+    ) -> None:
+        evidence_keys = self._normalize_evidence(evidence)
+        if not evidence_keys:
+            return
+        payload = json.dumps(topic_results, ensure_ascii=False)
+        with self._request_connection() as connection:
+            connection.executemany(
+                """
+                INSERT INTO evidence_topic_map (
+                    user_hash, evidence_key, source_id, topic_results_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_hash, evidence_key) DO UPDATE SET
+                    source_id = excluded.source_id,
+                    topic_results_json = excluded.topic_results_json,
+                    created_at = excluded.created_at
+                """,
+                [
+                    (user_hash, key, source_id, payload, self._now())
+                    for key in evidence_keys
+                ],
+            )
+
+    def _topic_results_for_evidence(self, user_hash: str, evidence) -> list[dict]:
+        # A retrieval query is anchored to its first evidence item only.  Keep
+        # this constraint here as well as at the call site so future callers
+        # cannot accidentally merge topic records from multiple turns.
+        evidence_keys = self._normalize_evidence(evidence)[:1]
+        if not evidence_keys:
+            return []
+        # Prefer the native HESM database: the topic/entity values used here
+        # are the exact values stored on the source QA rows.  The adapter index
+        # below remains a compatibility fallback for older isolated stores.
+        database_path = self.users_root / user_hash / "hesm.sqlite3"
+        native_by_key: dict[str, dict] = {}
+        if database_path.exists():
+            with sqlite3.connect(database_path, timeout=60) as connection:
+                connection.row_factory = sqlite3.Row
+                placeholders = ",".join("?" for _ in evidence_keys)
+                rows = connection.execute(
+                    f"""
+                    SELECT source_id, topic, core_entity, intent, entities_json,
+                           confidence, reason
+                    FROM qa_memory
+                    WHERE source_id IN ({placeholders})
+                    """,
+                    tuple(f"evidence:{key}" for key in evidence_keys),
+                ).fetchall()
+            for row in rows:
+                source_id = str(row["source_id"] or "")
+                native_by_key[source_id.removeprefix("evidence:")] = {
+                    "topic": row["topic"],
+                    "core_entity": row["core_entity"],
+                    "intent": row["intent"],
+                    "entities": json.loads(row["entities_json"] or "[]"),
+                    "confidence": row["confidence"],
+                    "reasoning": row["reason"],
+                }
+        if len(native_by_key) == len(evidence_keys):
+            return [native_by_key[key] for key in evidence_keys]
+        placeholders = ",".join("?" for _ in evidence_keys)
+        with self._request_connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT evidence_key, topic_results_json
+                FROM evidence_topic_map
+                WHERE user_hash = ? AND evidence_key IN ({placeholders})
+                """,
+                (user_hash, *evidence_keys),
+            ).fetchall()
+        by_key = {str(row["evidence_key"]): row for row in rows}
+        missing = [key for key in evidence_keys if key not in by_key]
+        if missing:
+            raise ValueError(
+                "No extracted topic/entity record for evidence: "
+                + ", ".join(missing)
+            )
+        results = []
+        for key in evidence_keys:
+            values = json.loads(by_key[key]["topic_results_json"])
+            if isinstance(values, dict):
+                values = [values]
+            if not isinstance(values, list) or not values:
+                raise RuntimeError(f"Invalid topic/entity record for evidence {key}")
+            results.extend(item for item in values if isinstance(item, dict))
+        if not results:
+            raise RuntimeError("Evidence lookup returned no valid topic/entity records")
+        return results
+
     def _wait_for_outbox(self, user_hash: str) -> None:
         """Wait until experiment-only memory derivations are queryable."""
         database_path = self.users_root / user_hash / "hesm.sqlite3"
@@ -305,6 +432,13 @@ class EvaluationBackend:
                     if not content.strip():
                         continue
                     source_id = f"{request_hash}:{index}"
+                    evidence_keys = self._normalize_evidence(
+                        message.get("evidence")
+                        or message.get("evidence_id")
+                        or message.get("evidence_key")
+                    )
+                    if evidence_keys:
+                        source_id = f"evidence:{evidence_keys[0]}"
                     result = service.add_memory(
                         user_input=content,
                         assistant_output="",
@@ -318,6 +452,14 @@ class EvaluationBackend:
                         user_hash=user_hash,
                         source_id=source_id,
                         session_id=session_id,
+                        topic_results=result.get("topic_results") or [],
+                    )
+                    self._record_evidence_topic_results(
+                        user_hash=user_hash,
+                        source_id=source_id,
+                        evidence=message.get("evidence")
+                        or message.get("evidence_id")
+                        or message.get("evidence_key"),
                         topic_results=result.get("topic_results") or [],
                     )
                     added += 1
@@ -335,14 +477,19 @@ class EvaluationBackend:
                 "request_hash": request_hash,
             }
 
-    def search(self, user_id, query, top_k=20, question_date=None):
+    def search(self, user_id, query, top_k=20, question_date=None, evidence=None):
         """Retrieve only from the HESM store belonging to ``user_id``."""
         raw_user_id = str(user_id or "").strip()
         user_hash = self._digest(raw_user_id)
         request_hash = self._content_hash(
             "search",
             raw_user_id,
-            {"query": query, "top_k": top_k, "question_date": question_date},
+            {
+                "query": query,
+                "top_k": top_k,
+                "question_date": question_date,
+                "evidence": self._normalize_evidence(evidence),
+            },
         )
         request_id, _ = self._start_request(
             "search", user_hash, request_hash, idempotent=False
@@ -353,6 +500,28 @@ class EvaluationBackend:
                 raise ValueError("query must be nonempty")
             if type(top_k) is not int or not 1 <= top_k <= self.settings["max_top_k"]:
                 raise ValueError("top_k outside configured range")
+            evidence_keys = self._normalize_evidence(evidence)
+            evidence_lookup = (
+                str(self.settings.get("retrieval_topic_source", "llm"))
+                == "evidence_topic_lookup"
+            )
+            topic_result = None
+            if evidence_lookup and evidence_keys:
+                try:
+                    topic_result = self._topic_results_for_evidence(
+                        user_hash, evidence_keys[:1]
+                    )
+                except Exception as exc:
+                    # Missing evidence rows and SQLite/JSON lookup failures are
+                    # non-fatal: native HESM retrieval falls back to its LLM
+                    # topic extractor when topic_result is None.
+                    logger.warning(
+                        "Evidence topic lookup failed; falling back to LLM "
+                        "user_hash=%s evidence=%s error=%s",
+                        user_hash,
+                        evidence_keys[0],
+                        type(exc).__name__,
+                    )
             # The experiment requires a complete-memory barrier before scoring.
             # Holding the user lock also prevents a concurrent add from opening
             # a new derivation window between the barrier and retrieval.
@@ -365,13 +534,18 @@ class EvaluationBackend:
                     extraction_context=(
                         f"Question date: {question_date}" if question_date else ""
                     ),
+                    topic_result=topic_result,
                 )
         except Exception as exc:
             self._finish_request(
                 request_id, "failed", error_type=type(exc).__name__
             )
             raise
-        self._finish_request(request_id, "success")
+        self._finish_request(
+            request_id,
+            "success",
+            result_count=len(result.get("qas") or []),
+        )
         return {
             "context": result.get("context") or "",
             "route_status": result.get("route_status", ""),
@@ -382,6 +556,10 @@ class EvaluationBackend:
                 "qas": len(result.get("qas") or []),
             },
             "query_date": question_date,
+            "evidence": self._normalize_evidence(evidence),
+            "topic_extraction_source": result.get(
+                "topic_extraction_source", "llm"
+            ),
             "request_hash": request_hash,
             "config_fingerprint": self.settings["config_fingerprint"],
         }
@@ -408,17 +586,23 @@ class EvaluationBackend:
         }
 
     def health(self):
+        capabilities = [
+            "dataset_isolation", "user_isolation", "native_add",
+            "readonly_retrieval", "request_hash_idempotency",
+            "five_round_topic_extraction_context",
+            "derivation_completion_barrier",
+        ]
+        if self.settings.get("retrieval_topic_source") == "evidence_topic_lookup":
+            capabilities.extend([
+                "evidence_topic_lookup", "evidence_lookup_llm_fallback",
+                "native_qa_topic_entity_source",
+            ])
         return {
             "status": "ok",
             "profile": self.settings["profile"],
             "dataset_id": self.dataset_id,
             "config_fingerprint": self.settings["config_fingerprint"],
-            "capabilities": [
-                "dataset_isolation", "user_isolation", "native_add",
-                "readonly_retrieval", "request_hash_idempotency",
-                "five_round_topic_extraction_context",
-                "derivation_completion_barrier",
-            ],
+            "capabilities": capabilities,
         }
 
     def close(self):

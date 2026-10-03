@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import uuid
 from pathlib import Path
 from typing import Any
 
 from .time_utils import format_timestamp
+from .trajectory import TRAJECTORY_SCHEMA
 
 
 logger = logging.getLogger(__name__)
@@ -80,21 +82,10 @@ CREATE TABLE IF NOT EXISTS runtime_state (
 
 CREATE TABLE IF NOT EXISTS chat_session (
     session_id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    messages_json TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'active',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    metadata_json TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE TABLE IF NOT EXISTS topic_extraction_history (
-    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    state_key TEXT NOT NULL,
-    user_input TEXT NOT NULL,
-    assistant_output TEXT NOT NULL DEFAULT '',
-    topic_result_json TEXT NOT NULL DEFAULT '[]',
-    created_at TEXT NOT NULL
+    create_at TEXT NOT NULL,
+    update_at TEXT NOT NULL,
+    chats TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(chats))
 );
 
 CREATE TABLE IF NOT EXISTS memory_outbox (
@@ -112,6 +103,15 @@ CREATE TABLE IF NOT EXISTS memory_outbox (
     UNIQUE(job_type, memory_type, memory_id)
 );
 
+CREATE TABLE IF NOT EXISTS topic_extraction_history (
+    session_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    history_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, user_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_qa_segment_id ON qa_memory(segment_id);
 CREATE INDEX IF NOT EXISTS idx_qa_topic_entity_intent
 ON qa_memory(topic, core_entity, intent);
@@ -124,9 +124,7 @@ ON experience_memory(core_entity);
 CREATE INDEX IF NOT EXISTS idx_qa_topic
 ON qa_memory(topic);
 CREATE INDEX IF NOT EXISTS idx_chat_session_updated_at
-ON chat_session(updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_topic_history_state_id
-ON topic_extraction_history(state_key, history_id DESC);
+ON chat_session(update_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_outbox_status_created
 ON memory_outbox(status, created_at);
 """
@@ -143,10 +141,7 @@ JSON_FIELDS = {
     "history_experience_json",
     "retrieval_cache_json",
     "vector_json",
-    "messages_json",
-    "metadata_json",
     "payload_json",
-    "topic_result_json",
 }
 
 JSON_DEFAULTS: dict[str, Any] = {
@@ -160,10 +155,7 @@ JSON_DEFAULTS: dict[str, Any] = {
     "history_experience_json": {},
     "retrieval_cache_json": {},
     "vector_json": [],
-    "messages_json": [],
-    "metadata_json": {},
     "payload_json": {},
-    "topic_result_json": [],
 }
 
 
@@ -176,9 +168,11 @@ class MemoryStorage:
         *,
         read_only: bool = False,
         check_same_thread: bool = True,
+        default_user_id: str = "default",
     ) -> None:
         self.db_path = Path(db_path)
         self.read_only = read_only
+        self.default_user_id = str(default_user_id or "default").strip() or "default"
         if read_only:
             if not self.db_path.exists():
                 raise FileNotFoundError(f"Memory database not found: {self.db_path}")
@@ -197,15 +191,103 @@ class MemoryStorage:
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 15000")
         if not read_only:
+            self._reset_legacy_trajectory_schema()
+            self._clear_legacy_qa_tools()
+            self.connection.commit()
             self.connection.execute("PRAGMA journal_mode = WAL")
             self.connection.execute("PRAGMA synchronous = NORMAL")
             self.connection.executescript(SCHEMA)
+            self.connection.executescript(TRAJECTORY_SCHEMA)
             self._ensure_runtime_state_columns()
             self._ensure_memory_columns()
             self._drop_legacy_qa_search_index()
             self._normalize_stored_timestamps()
             self.connection.commit()
         logger.info("结构化记忆库已初始化 db=%s", self.db_path.resolve())
+
+    def _reset_legacy_trajectory_schema(self) -> None:
+        """Drop retired operational data while preserving memory tables."""
+        tables = {
+            str(row["name"])
+            for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        chat_columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(chat_session)").fetchall()
+        }
+        if not tables:
+            return
+        # The normalized update tables are durable operation history. Their
+        # presence means this database has reached the current trajectory
+        # model, so never run the legacy cleanup over them (or their parents).
+        if {"segment_update", "experience_update"} & tables:
+            return
+        legacy = bool(
+            {"chat_trace", "chat_trace_event", "chat_trace_memory"} & tables
+            or {"title", "messages_json", "metadata_json", "created_at", "updated_at"} & chat_columns
+            or "chat" not in tables
+            or not {"session_id", "status", "create_at", "update_at", "chats"}.issubset(chat_columns)
+        )
+        if not legacy:
+            return
+        self.connection.executescript(
+            """
+            DROP TABLE IF EXISTS chat_trace_memory;
+            DROP TABLE IF EXISTS chat_trace_event;
+            DROP TABLE IF EXISTS chat_trace;
+            DROP TABLE IF EXISTS "add";
+            DROP TABLE IF EXISTS retriever;
+            DROP TABLE IF EXISTS chat;
+            DROP TABLE IF EXISTS chat_session;
+            """
+        )
+        if "qa_memory" in tables:
+            rows = self.connection.execute(
+                "SELECT qa_id, tools_json FROM qa_memory WHERE tools_json IS NOT NULL"
+            ).fetchall()
+            for row in rows:
+                tools = self._json_list(row["tools_json"])
+                retained = [
+                    item for item in tools
+                    if not (isinstance(item, dict) and item.get("type") == "hesm_chat_turn")
+                ]
+                if retained != tools:
+                    self.connection.execute(
+                        "UPDATE qa_memory SET tools_json=? WHERE qa_id=?",
+                        (json.dumps(retained, ensure_ascii=False), row["qa_id"]),
+                    )
+        logger.warning("Retired HESM session/trajectory data was cleared; memory tables were preserved")
+
+    @staticmethod
+    def _json_list(value: Any) -> list[Any]:
+        try:
+            parsed = json.loads(value or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    def _clear_legacy_qa_tools(self) -> None:
+        """Remove retired chat trace markers from retained QA records."""
+        if not self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='qa_memory'"
+        ).fetchone():
+            return
+        rows = self.connection.execute(
+            "SELECT qa_id, tools_json FROM qa_memory WHERE tools_json IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            tools = self._json_list(row["tools_json"])
+            retained = [
+                item for item in tools
+                if not (isinstance(item, dict) and item.get("type") == "hesm_chat_turn")
+            ]
+            if retained != tools:
+                self.connection.execute(
+                    "UPDATE qa_memory SET tools_json=? WHERE qa_id=?",
+                    (json.dumps(retained, ensure_ascii=False), row["qa_id"]),
+                )
 
     def _ensure_runtime_state_columns(self) -> None:
         columns = {
@@ -394,13 +476,9 @@ class MemoryStorage:
             "segment_memory": ("created_at", "updated_at"),
             "experience_memory": ("created_at", "updated_at"),
             "runtime_state": ("updated_at",),
-            "chat_session": ("created_at", "updated_at"),
-            "topic_extraction_history": ("created_at",),
         }
         for table, columns in time_columns.items():
             selected_columns = ", ".join(columns)
-            if table == "chat_session":
-                selected_columns = f"{selected_columns}, messages_json"
             rows = self.connection.execute(
                 f"SELECT rowid, {selected_columns} FROM {table}"
             ).fetchall()
@@ -424,30 +502,6 @@ class MemoryStorage:
                         updates[column] = normalized
 
                 # 会话消息的创建时间存放在 JSON 中，也需要随表字段一起迁移。
-                if table == "chat_session":
-                    try:
-                        messages = json.loads(row["messages_json"] or "[]")
-                    except (json.JSONDecodeError, TypeError):
-                        messages = []
-                    messages_changed = False
-                    if isinstance(messages, list):
-                        for message in messages:
-                            if not isinstance(message, dict) or not message.get("created_at"):
-                                continue
-                            original = str(message["created_at"]).strip()
-                            try:
-                                normalized = format_timestamp(original)
-                            except ValueError:
-                                continue
-                            if normalized != original:
-                                message["created_at"] = normalized
-                                messages_changed = True
-                    if messages_changed:
-                        updates["messages_json"] = json.dumps(
-                            messages,
-                            ensure_ascii=False,
-                        )
-
                 if not updates:
                     continue
                 assignments = ", ".join(f"{column} = ?" for column in updates)
@@ -459,56 +513,111 @@ class MemoryStorage:
     def close(self) -> None:
         self.connection.close()
 
+    def resolve_user_id(self, user_id: str | None = None) -> str:
+        return str(user_id or self.default_user_id).strip() or self.default_user_id
+
+    def append_topic_extraction_history(
+        self,
+        *,
+        session_id: str,
+        user_id: str | None,
+        user_input: str,
+        topic_extraction_result: Any,
+        source: str,
+        elapsed_ms: float = 0.0,
+        status: str = "completed",
+        error_message: str = "",
+        model: str = "",
+    ) -> dict[str, Any]:
+        """Append one topic extraction event to its session/user history row."""
+        session = str(session_id or "default").strip() or "default"
+        user = self.resolve_user_id(user_id)
+        now = format_timestamp()
+        record = {
+            "extraction_id": f"topic_extract_{uuid.uuid4().hex}",
+            "session_id": session,
+            "user_id": user,
+            "created_at": now,
+            "source": str(source or "unknown"),
+            "status": str(status or "completed"),
+            "user_input": str(user_input or ""),
+            "topic_extraction_result": topic_extraction_result,
+            "elapsed_ms": float(elapsed_ms or 0.0),
+            "error_message": str(error_message or ""),
+            "model": str(model or ""),
+        }
+        with sqlite3.connect(self.db_path, timeout=15) as connection:
+            connection.execute("PRAGMA busy_timeout = 15000")
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT history_json FROM topic_extraction_history "
+                "WHERE session_id=? AND user_id=?",
+                (session, user),
+            ).fetchone()
+            try:
+                history = json.loads(row[0] or "[]") if row else []
+            except (json.JSONDecodeError, TypeError):
+                history = []
+            if not isinstance(history, list):
+                history = []
+            history.append(record)
+            connection.execute(
+                """
+                INSERT INTO topic_extraction_history (
+                    session_id, user_id, history_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, user_id) DO UPDATE SET
+                    history_json=excluded.history_json,
+                    updated_at=excluded.updated_at
+                """,
+                (session, user, json.dumps(history, ensure_ascii=False, default=str), now, now),
+            )
+        return record
+
+    def get_topic_extraction_history(
+        self,
+        session_id: str,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        session = str(session_id or "default").strip() or "default"
+        user = self.resolve_user_id(user_id)
+        with sqlite3.connect(self.db_path, timeout=15) as connection:
+            row = connection.execute(
+                "SELECT history_json, created_at, updated_at "
+                "FROM topic_extraction_history WHERE session_id=? AND user_id=?",
+                (session, user),
+            ).fetchone()
+        if row is None:
+            return {
+                "session_id": session,
+                "user_id": user,
+                "records": [],
+                "created_at": None,
+                "updated_at": None,
+            }
+        try:
+            records = json.loads(row[0] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            records = []
+        if isinstance(records, list):
+            records.sort(
+                key=lambda item: str(item.get("created_at") or "")
+                if isinstance(item, dict)
+                else ""
+            )
+        return {
+            "session_id": session,
+            "user_id": user,
+            "records": records if isinstance(records, list) else [],
+            "created_at": row[1],
+            "updated_at": row[2],
+        }
+
     def commit(self) -> None:
         self.connection.commit()
 
     def rollback(self) -> None:
         self.connection.rollback()
-
-    def insert_topic_extraction_history(
-        self,
-        *,
-        state_key: str,
-        user_input: str,
-        assistant_output: str,
-        topic_result: dict[str, Any] | list[dict[str, Any]],
-        created_at: str | None = None,
-    ) -> int:
-        """Persist one topic-analysis turn independently from chat sessions."""
-        results = topic_result if isinstance(topic_result, list) else [topic_result]
-        cursor = self.connection.execute(
-            """
-            INSERT INTO topic_extraction_history (
-                state_key, user_input, assistant_output,
-                topic_result_json, created_at
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                str(state_key or "default"),
-                str(user_input or ""),
-                str(assistant_output or ""),
-                json.dumps(results, ensure_ascii=False),
-                format_timestamp(created_at),
-            ),
-        )
-        return int(cursor.lastrowid)
-
-    def list_recent_topic_extractions(
-        self,
-        state_key: str,
-        limit: int = 5,
-    ) -> list[dict[str, Any]]:
-        """Return the latest topic-analysis turns in chronological order."""
-        rows = self.connection.execute(
-            """
-            SELECT * FROM topic_extraction_history
-            WHERE state_key = ?
-            ORDER BY history_id DESC
-            LIMIT ?
-            """,
-            (str(state_key or "default"), max(1, int(limit))),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in reversed(rows)]
 
     def _row_to_dict(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:
@@ -650,7 +759,6 @@ class MemoryStorage:
                 retrieval_cache_json,
             ),
         )
-
     def update_runtime_retrieval_cache(
         self,
         state_key: str,
@@ -684,7 +792,7 @@ class MemoryStorage:
         target_version: int,
         timestamp: str,
         payload: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> str:
         """Persist or coalesce one asynchronous derived-memory job."""
         now = format_timestamp(timestamp)
         incoming_payload = dict(payload or {})
@@ -731,6 +839,18 @@ class MemoryStorage:
                 now,
             ),
         )
+        row = self.connection.execute(
+            "SELECT job_id FROM memory_outbox WHERE job_type=? AND memory_type=? AND memory_id=?",
+            (job_type, memory_type, memory_id),
+        ).fetchone()
+        return str(row["job_id"] if row else job_id)
+
+    def get_memory_job_id(self, job_type: str, memory_type: str, memory_id: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT job_id FROM memory_outbox WHERE job_type=? AND memory_type=? AND memory_id=?",
+            (job_type, memory_type, memory_id),
+        ).fetchone()
+        return str(row["job_id"]) if row else None
 
     @staticmethod
     def _merge_memory_job_payload(
@@ -739,9 +859,10 @@ class MemoryStorage:
     ) -> dict[str, Any]:
         """Merge coalesced update intent without losing force/status signals."""
         merged = {**previous, **incoming}
-        merged["trace_turn_ids"] = list(dict.fromkeys(
-            [*(previous.get("trace_turn_ids") or []), *(incoming.get("trace_turn_ids") or [])]
-        ))
+        for key in ("trace_chat_ids", "trace_add_ids"):
+            merged[key] = list(dict.fromkeys(
+                [*(previous.get(key) or []), *(incoming.get(key) or [])]
+            ))
         for key in (
             "force_summary",
             "force_experience_summary",
@@ -1953,8 +2074,13 @@ class MemoryStorage:
             "experience_memory",
             "runtime_state",
             "chat_session",
-            "topic_extraction_history",
             "memory_outbox",
+            "chat",
+            "retriever",
+            "add",
+            "segment_update",
+            "experience_update",
         }:
             raise ValueError(f"Unsupported table: {table}")
-        return int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        sql_table = '"add"' if table == "add" else table
+        return int(self.connection.execute(f"SELECT COUNT(*) FROM {sql_table}").fetchone()[0])

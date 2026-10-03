@@ -33,6 +33,27 @@
     return `<span class="status-pill ${esc(status)}">${esc(statusLabel[status] || status || "未知")}</span>`;
   }
 
+  function distillationHistory(records, memoryType) {
+    const ordered = [...(records || [])].sort((left, right) => {
+      const leftTime = left.started_at || left.created_at || "";
+      const rightTime = right.started_at || right.created_at || "";
+      return leftTime.localeCompare(rightTime) || String(left.created_at || "").localeCompare(String(right.created_at || ""));
+    });
+    const title = memoryType === "experience" ? "Experience 蒸馏记录" : "Segment 蒸馏记录";
+    const entries = ordered.map((record, index) => {
+      const when = record.started_at || record.created_at || "时间未知";
+      const status = record.status || "unknown";
+      const model = record.model || "未记录模型";
+      const kind = record.record_type || memoryType;
+      const id = record.segment_id || record.experience_id || "";
+      return `<details class="distill-record">
+        <summary><span>${index + 1}. ${esc(when)} · ${esc(kind)} ${esc(id)}</span><span class="distill-meta">${esc(status)} · ${esc(model)}</span></summary>
+        <pre>${esc(JSON.stringify(record, null, 2))}</pre>
+      </details>`;
+    }).join("");
+    return `<section class="node-section distillation-history"><h3>${title}（${ordered.length}）</h3>${entries || '<p class="distill-empty">暂无蒸馏记录</p>'}</section>`;
+  }
+
   function facts(rows) {
     return `<div class="node-facts">${rows.map(([label, value, mono]) => `
       <div class="node-fact">
@@ -112,6 +133,7 @@
         ])}
         ${payloadSection("Segment 总结", item.summary)}
         ${statusEditor("segment", item.segment_id, item.status)}
+        ${level === "experience" ? "" : distillationHistory(item.distillation_history, "segment")}
         <div class="node-children qa-children">
           ${qas.map((qa, index) => qaNode(qa, qa.sequence || index + 1)).join("") || "<p class=\"no-children\">暂无 QA</p>"}
         </div>
@@ -145,6 +167,7 @@
         ${payloadSection("Experience 总结", item.summary)}
         ${payloadSection("历史经验", item.history_experience)}
         ${statusEditor("experience", item.experience_id, status)}
+        ${distillationHistory(item.distillation_history, "experience")}
         <div class="node-children segment-children">
           ${segments.map((segment, index) => segmentNode(segment, segment.sequence || index + 1)).join("") || "<p class=\"no-children\">暂无 Segment</p>"}
         </div>

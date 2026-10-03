@@ -18,6 +18,7 @@ class Command(BaseModel):
     session_id: str = ''
     query: str = ''
     question_date: str | None = None
+    evidence: list[str] | str | None = None
     top_k: int = 20
 
 
@@ -40,7 +41,13 @@ def create_app(backend, token):
             if operation == 'add':
                 return backend.add(body.user_id, body.messages, body.session_id)
             if operation == 'search':
-                return backend.search(body.user_id, body.query, body.top_k, body.question_date)
+                return backend.search(
+                    body.user_id,
+                    body.query,
+                    body.top_k,
+                    body.question_date,
+                    body.evidence,
+                )
             if operation == 'delete':
                 return backend.delete(body.user_id)
             raise HTTPException(404, 'Unknown operation')

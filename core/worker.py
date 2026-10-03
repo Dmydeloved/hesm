@@ -83,7 +83,12 @@ class MemoryDerivationWorker:
     def _process_job(self, job: dict[str, Any]) -> None:
         job_id = str(job["job_id"])
         now = format_timestamp()
-        trace_ids: list[str] = []
+        update_id: str | None = None
+        memory_type = str(job.get("memory_type") or "")
+        is_update = str(job.get("job_type") or "") in {"update_segment", "update_experience"}
+        before: dict[str, Any] = {}
+        claimed = False
+        claimed_job = job
         try:
             with self.lock:
                 claimed = self.storage.mark_memory_job_processing(job_id, now)
@@ -91,21 +96,44 @@ class MemoryDerivationWorker:
                 if not claimed:
                     return
                 claimed_job = self.storage.get_memory_job(job_id) or job
-                trace_ids = list((claimed_job.get("payload") or {}).get("trace_turn_ids") or [])
-                trace_ids = list(dict.fromkeys([
-                    *trace_ids, *self._summary_source_turns(claimed_job),
-                ]))
-                self.manager.trace_turn_ids = trace_ids
+                job_payload = claimed_job.get("payload") or {}
+                self.manager.trace_add_ids = list(job_payload.get("trace_add_ids") or [])
+                self.manager.trace_chat_ids = list(job_payload.get("trace_chat_ids") or [])
                 before = self._snapshot(claimed_job)
+                should_distill, input_payload = self._distill_input(claimed_job) if is_update else (False, {})
+                if is_update and memory_type in {"segment", "experience"}:
+                    update_id = self.traces.start_update(
+                        claimed_job,
+                        before=before,
+                        input_payload=input_payload,
+                        model=str(getattr(self.manager.summarizer, "model", "")),
+                    ) if self.traces else None
+                    self.manager.trace_parent_segment_update_id = (
+                        update_id if memory_type == "segment" else None
+                    )
                 self._derive(claimed_job, now)
                 after = self._snapshot(claimed_job)
+                if update_id and self.traces:
+                    trace = getattr(self.manager.summarizer, "last_trace", {}) or {}
+                    self.traces.finish_update(
+                        memory_type,
+                        update_id,
+                        after=after,
+                        prompt=str(trace.get("prompt") or "") if should_distill else "",
+                        output=str(trace.get("output") or "") if should_distill else "",
+                        elapsed_ms=float(trace.get("elapsed_ms") or 0) if should_distill else 0,
+                        status="completed" if should_distill else "skipped",
+                        skip_reason="threshold_not_reached" if not should_distill else "",
+                        # Keep the trace update in the same SQLite transaction as
+                        # the derived memory changes and outbox completion.
+                        connection=self.storage.connection,
+                    )
                 self.storage.mark_memory_job_completed(
                     job_id,
                     int(claimed_job.get("target_version") or 0),
                     format_timestamp(),
                 )
                 self.storage.commit()
-            self._trace_job(trace_ids, claimed_job, "completed", before, after)
         except Exception as error:
             with self.lock:
                 self.storage.rollback()
@@ -116,7 +144,34 @@ class MemoryDerivationWorker:
                     max_retries=self.max_retries,
                 )
                 self.storage.commit()
-            self._trace_job(trace_ids, job, "failed", error=str(error))
+            # If preparation failed before start_update(), still persist a
+            # failed operation row for this claimed Segment/Experience update.
+            if (
+                claimed
+                and is_update
+                and memory_type in {"segment", "experience"}
+                and self.traces
+                and not update_id
+            ):
+                try:
+                    update_id = self.traces.start_update(
+                        claimed_job,
+                        before=before,
+                        input_payload={},
+                        model=str(getattr(self.manager.summarizer, "model", "")),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not record failed memory update job_id=%s", job_id
+                    )
+            if update_id and self.traces:
+                self.traces.finish_update(
+                    memory_type,
+                    update_id,
+                    after=before,
+                    status="failed",
+                    error_message=str(error),
+                )
             logger.exception(
                 "Memory derivation job failed job_id=%s job_type=%s memory_id=%s",
                 job_id,
@@ -124,49 +179,9 @@ class MemoryDerivationWorker:
                 job.get("memory_id"),
             )
         finally:
-            self.manager.trace_turn_ids = []
-
-    def _summary_source_turns(self, job: dict[str, Any]) -> list[str]:
-        if not self.traces:
-            return []
-        kind = str(job.get("job_type") or "")
-        memory_id = str(job.get("memory_id") or "")
-        payload = job.get("payload") or {}
-        if kind in {"update_segment", "summarize_segment"}:
-            segment = self.storage.get_segment(memory_id)
-            if not segment:
-                return []
-            delta = self.storage.list_unupdated_qas(segment)
-            if not delta or not (
-                payload.get("force_summary") or kind == "summarize_segment"
-                or len(delta) >= self.manager.segment_summary_qa_threshold
-            ):
-                return []
-            return self.traces.turns_for_qas([str(qa["qa_id"]) for qa in delta])
-        if kind in {"update_experience", "summarize_experience"}:
-            experience = self.storage.get_experience(memory_id)
-            if not experience:
-                return []
-            segments = self.storage.list_segments_by_experience_ids([memory_id])
-            child_revision = sum(
-                max(0, int(segment.get("summary_version") or 0))
-                for segment in segments
-            )
-            pending_updates = max(
-                0,
-                child_revision
-                - int(experience.get("last_summarized_child_revision") or 0),
-            )
-            delta = [
-                segment for segment in self.storage.list_unupdated_segments(experience)
-                if int(segment.get("summary_version") or 0) > 0
-            ]
-            if pending_updates < self.manager.experience_summary_segment_threshold:
-                return []
-            return self.traces.turns_for_segments([
-                str(segment["segment_id"]) for segment in delta
-            ])
-        return []
+            self.manager.trace_add_ids = []
+            self.manager.trace_chat_ids = []
+            self.manager.trace_parent_segment_update_id = None
 
     def _snapshot(self, job: dict[str, Any]) -> dict[str, Any]:
         kind = str(job.get("memory_type") or "")
@@ -179,59 +194,37 @@ class MemoryDerivationWorker:
             item = None
         if not item:
             return {}
-        return {
-            "summary": item.get("summary") or {},
-            "status": item.get("status"),
-        }
+        return dict(item)
 
-    def _trace_job(
-        self, trace_ids: list[str], job: dict[str, Any], status: str,
-        before: dict[str, Any] | None = None, after: dict[str, Any] | None = None,
-        *, error: str = "",
-    ) -> None:
-        if not self.traces:
-            return
-        payload = {
-            "job_id": job.get("job_id"), "job_type": job.get("job_type"),
-            "memory_type": job.get("memory_type"), "memory_id": job.get("memory_id"),
-            "summary_generated": bool(
-                after and after.get("summary")
-                and after.get("summary") != (before or {}).get("summary")
-            ),
-            "summary": (after or {}).get("summary") if after else None,
-            "memory_status": (after or {}).get("status"), "error": error,
-        }
-        for turn_id in trace_ids:
-            try:
-                self.traces.append(turn_id, "async_derivation", status, payload)
-            except Exception:
-                logger.exception("Could not record derivation trace turn_id=%s job_id=%s", turn_id, job.get("job_id"))
+    def _distill_input(self, job: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        memory_type = str(job.get("memory_type") or "")
+        memory_id = str(job.get("memory_id") or "")
+        payload = job.get("payload") or {}
+        if memory_type == "segment":
+            segment = self.storage.get_segment(memory_id) or {}
+            delta = self.storage.list_unupdated_qas(segment) if segment else []
+            should = bool(delta) and (
+                bool(payload.get("force_summary"))
+                or len(delta) >= self.manager.segment_summary_qa_threshold
+            )
+            return should, {"segment": segment, "qa_items": delta}
+        if memory_type == "experience":
+            experience = self.storage.get_experience(memory_id) or {}
+            segments = self.storage.list_segments_by_experience_ids([memory_id])
+            child_revision = sum(max(0, int(item.get("summary_version") or 0)) for item in segments)
+            pending = max(0, child_revision - int(experience.get("last_summarized_child_revision") or 0))
+            delta = [
+                item for item in self.storage.list_unupdated_segments(experience)
+                if int(item.get("summary_version") or 0) > 0
+            ]
+            should = pending >= self.manager.experience_summary_segment_threshold
+            return should, {"experience": experience, "segments": delta, "all_segments": segments}
+        return False, {}
 
     def _derive(self, job: dict[str, Any], now: str) -> None:
         job_type = str(job["job_type"])
         memory_id = str(job["memory_id"])
         payload = job.get("payload") or {}
-
-        # Drain jobs created by the previous split-task design through the new
-        # aggregate handlers instead of failing an in-place upgrade.
-        if job_type in {"sync_segment", "summarize_segment"}:
-            payload = {
-                **payload,
-                "force_summary": (
-                    bool(payload.get("force_summary"))
-                    or job_type == "summarize_segment"
-                ),
-            }
-            job_type = "update_segment"
-        elif job_type in {"sync_experience", "summarize_experience"}:
-            payload = {
-                **payload,
-                "force_summary": (
-                    bool(payload.get("force_summary"))
-                    or job_type == "summarize_experience"
-                ),
-            }
-            job_type = "update_experience"
 
         if job_type == "update_segment":
             segment = self.storage.get_segment(memory_id)

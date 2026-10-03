@@ -539,11 +539,18 @@ class MemoryManager:
         target_version: int,
         timestamp: str,
         payload: dict[str, Any] | None = None,
-    ) -> None:
-        trace_ids = getattr(self, "trace_turn_ids", [])
-        if trace_ids:
-            payload = {**(payload or {}), "trace_turn_ids": list(trace_ids)}
-        self.storage.enqueue_memory_job(
+    ) -> str:
+        payload = {**(payload or {})}
+        chat_ids = list(getattr(self, "trace_chat_ids", []) or [])
+        add_ids = list(getattr(self, "trace_add_ids", []) or [])
+        if chat_ids:
+            payload["trace_chat_ids"] = chat_ids
+        if add_ids:
+            payload["trace_add_ids"] = add_ids
+        parent_segment_update_id = getattr(self, "trace_parent_segment_update_id", None)
+        if parent_segment_update_id:
+            payload["parent_segment_update_id"] = str(parent_segment_update_id)
+        return self.storage.enqueue_memory_job(
             job_id=self._new_id("job"),
             job_type=job_type,
             memory_type=memory_type,

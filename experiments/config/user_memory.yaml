@@ -11,6 +11,8 @@ experiment:
   max_top_k: 100
   # Search fails instead of scoring partially derived Segment/Experience data.
   outbox_settle_timeout_seconds: 3600
+  require_evidence: false
+  retrieval_topic_source: llm
 
 paths:
   # Safety fallback; dataset runs override these with a hashed dataset directory.

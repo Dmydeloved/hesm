@@ -14,7 +14,7 @@ from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from core.config import PROJECT_ROOT, config_path
+from core.config import PROJECT_ROOT, config_path, config_section
 from core.logging_config import configure_logging
 from core.session import SessionManager
 from core.storage import MemoryStorage
@@ -369,10 +369,14 @@ class MemoryAddRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     timestamp: str | None = None
     state_key: str = Field(default="default", min_length=1, max_length=200)
+    user_id: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class RetrievalRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2_000)
+    state_key: str = Field(default="default", min_length=1, max_length=200)
+    session_id: str | None = Field(default=None, min_length=1, max_length=200)
+    user_id: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class StatusRequest(BaseModel):
@@ -389,28 +393,25 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = Field(default_factory=list, max_length=20)
     state_key: str = Field(default="web_chat", min_length=1, max_length=200)
     session_id: str | None = Field(default=None, min_length=1, max_length=200)
+    user_id: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 app = FastAPI(title="HESM Memory Console API", version="3.0.0")
 
 # 管理接口会在 HESMService 惰性创建之前访问数据库，因此启动时先补齐完整记忆表结构。
-database_initializer = MemoryStorage(DATABASE_PATH)
-database_initializer.close()
+database_initializer = MemoryStorage(
+    DATABASE_PATH,
+    default_user_id=str(config_section("identity").get("default_user_id") or "default"),
+)
 repository = MemoryRepository(DATABASE_PATH)
 session_manager = SessionManager(DATABASE_PATH)
 trace_repository = TraceRepository(DATABASE_PATH)
-session_manager.import_legacy_chat_turns()
-session_manager.remove_chat_traces_from_qa_tools()
 _service: HESMService | None = None
 _service_lock = Lock()
 
 
 class SessionCreateRequest(BaseModel):
     title: str = Field(default="新会话", max_length=120)
-
-
-class SessionRenameRequest(BaseModel):
-    title: str = Field(min_length=1, max_length=120)
 
 
 @app.middleware("http")
@@ -475,20 +476,27 @@ def get_session(session_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(error)) from error
 
 
-@app.get("/api/sessions/{session_id}/traces/{turn_id}")
-def get_turn_trace(session_id: str, turn_id: str) -> dict[str, Any]:
-    trace = trace_repository.get(session_id, turn_id)
+@app.get("/api/sessions/{session_id}/topic-extractions")
+def get_topic_extraction_history(
+    session_id: str,
+    user_id: str | None = Query(default=None, min_length=1, max_length=200),
+) -> dict[str, Any]:
+    return database_initializer.get_topic_extraction_history(session_id, user_id)
+
+
+@app.get("/api/chats/{chat_id}/trajectory")
+def get_chat_trajectory(
+    chat_id: str,
+    session_id: str = Query(..., min_length=1),
+    user_id: str | None = Query(default=None, min_length=1, max_length=200),
+) -> dict[str, Any]:
+    trace = trace_repository.get(session_id, chat_id)
     if trace is None:
         raise HTTPException(status_code=404, detail="对话轨迹不存在")
+    trace["topic_extraction_history"] = database_initializer.get_topic_extraction_history(
+        session_id, user_id
+    )["records"]
     return trace
-
-
-@app.patch("/api/sessions/{session_id}")
-def rename_session(session_id: str, request: SessionRenameRequest) -> dict[str, Any]:
-    try:
-        return session_manager.rename(session_id, request.title)
-    except KeyError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -499,26 +507,21 @@ def archive_session(session_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(error)) from error
 
 
-# Backward-compatible aliases keep already-open v4 pages from producing 404s.
-@app.get("/api/chat/sessions", deprecated=True)
-def legacy_chat_sessions(limit: int = Query(default=50, ge=1, le=100)) -> dict[str, Any]:
-    items = session_manager.list(limit=limit)
-    return {"items": [
-        {**item, "state_key": item["session_id"], "last_answer": item["preview"]}
-        for item in items
-    ]}
-
-
-@app.get("/api/chat/history", deprecated=True)
-def legacy_chat_history(
-    state_key: str = Query(default="web_chat", min_length=1, max_length=200),
-    limit: int = Query(default=50, ge=1, le=100),
+@app.get("/api/operations")
+def list_operations(
+    type: str = Query(default="", max_length=32),
+    status: str = Query(default="", max_length=32),
+    limit: int = Query(default=100, ge=1, le=500),
 ) -> dict[str, Any]:
-    session = session_manager.get(state_key, required=False)
-    if session is None:
-        return {"state_key": state_key, "messages": [], "turns": []}
-    messages = session["messages"][-limit * 2:]
-    return {"state_key": state_key, "messages": messages, "turns": []}
+    return {"items": trace_repository.list_operations(operation_type=type, status=status, limit=limit)}
+
+
+@app.get("/api/operations/{operation_type}/{operation_id}")
+def operation_detail(operation_type: str, operation_id: str) -> dict[str, Any]:
+    operation = trace_repository.get_operation(operation_type, operation_id)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="操作轨迹不存在")
+    return operation
 
 
 @app.get("/api/{level}")
@@ -542,7 +545,16 @@ def list_memories(
 def memory_detail(
     level: Literal["experience", "segment", "qa"], memory_id: str
 ) -> dict[str, Any]:
-    return repository.detail(level, memory_id)
+    item = repository.detail(level, memory_id)
+    if level == "experience":
+        item["distillation_history"] = trace_repository.list_memory_updates(
+            "experience", memory_id
+        )
+    elif level == "segment":
+        item["distillation_history"] = trace_repository.list_memory_updates(
+            level, memory_id
+        )
+    return item
 
 
 @app.patch("/api/{level}/{memory_id}/status")
@@ -607,6 +619,7 @@ def close_service() -> None:
     if _service is not None:
         _service.close()
         _service = None
+    database_initializer.close()
 
 
 app.mount("/", NoCacheStaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

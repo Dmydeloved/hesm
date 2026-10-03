@@ -2,445 +2,259 @@
   "use strict";
 
   const $ = (selector) => document.querySelector(selector);
-  const escapeHtml = (value) => String(value ?? "")
+  const esc = (value) => String(value ?? "")
     .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;").replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
-  const currentSessionStorageKey = "hesm.currentChatSession";
+  const storageKey = "hesm.currentChatSession";
   const state = {
-    history: [], running: false, result: null, timer: null, traceTimer: null,
-    selectedTurnId: null,
-    stateKey: localStorage.getItem(currentSessionStorageKey) || "web_chat",
+    sessionId: localStorage.getItem(storageKey) || "web_chat",
+    history: [], running: false, selectedChatId: "", poll: null,
+    liveTimer: null, chatStartedAt: null, activeStage: "", stageStartedAt: null,
   };
-  const elements = {
-    health: $("#health"), form: $("#chat-form"), input: $("#message"),
-    send: $("#send"), messages: $("#messages"), empty: $("#trace-empty"),
-    trace: $("#trace"), total: $("#total-time"), topic: $("#topic-result"),
-    retrieval: $("#retrieval-result"), promptText: $("#prompt-text"),
-    store: $("#store-result"), model: $("#model-name"), asyncResult: $("#async-result"),
-    toast: $("#toast"),
-    sessionList: $("#session-list"), sessionTitle: $("#current-session-title"),
+  const el = {
+    health: $("#health"), form: $("#chat-form"), input: $("#message"), send: $("#send"),
+    messages: $("#messages"), empty: $("#trace-empty"), trace: $("#trace"),
+    total: $("#total-time"), topic: $("#topic-result"), retrieval: $("#retrieval-result"),
+    prompt: $("#prompt-text"), store: $("#store-result"), model: $("#model-name"),
+    async: $("#async-result"), sessions: $("#session-list"), title: $("#current-session-title"),
   };
 
-  function milliseconds(value) {
+  const ms = (value) => {
     const number = Number(value || 0);
     return number >= 1000 ? `${(number / 1000).toFixed(2)} s` : `${number.toFixed(number >= 100 ? 0 : 1)} ms`;
-  }
-
-  function showToast(message) {
-    elements.toast.textContent = message;
-    elements.toast.classList.add("show");
-    clearTimeout(showToast.timer);
-    showToast.timer = setTimeout(() => elements.toast.classList.remove("show"), 1800);
-  }
-
-  function setHealth(ok, label) {
-    elements.health.className = `health ${ok ? "ready" : "error"}`;
-    elements.health.querySelector("span").textContent = label;
-  }
-
+  };
   async function request(url, options) {
     const response = await fetch(url, options);
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
     return payload;
   }
-
-  async function checkHealth() {
-    try {
-      const data = await request("/api/health");
-      setHealth(data.status !== "degraded", data.status === "ready" ? "对话服务就绪" : "记忆库为空");
-    } catch (_) {
-      setHealth(false, "请启动 WebServer");
-    }
+  function toast(message) {
+    const node = $("#toast");
+    if (!node) return;
+    node.textContent = message; node.classList.add("show");
+    clearTimeout(toast.timer); toast.timer = setTimeout(() => node.classList.remove("show"), 1800);
   }
-
-  function avatar(role) {
-    return role === "user" ? '<span class="user-avatar">我</span>' : '<span class="assistant-avatar">H</span>';
+  function setHealth(ok, text) {
+    el.health.className = `health ${ok ? "ready" : "error"}`;
+    el.health.querySelector("span").textContent = text;
   }
-
-  function addMessage(role, content, meta = "", id = "", turnId = "") {
+  function avatar(role) { return role === "user" ? '<span class="user-avatar">我</span>' : '<span class="assistant-avatar">H</span>'; }
+  function addMessage(role, content, meta = "", chatId = "") {
     const node = document.createElement("article");
     node.className = `message ${role}`;
-    if (id) node.id = id;
-    if (turnId) {
-      node.dataset.turnId = turnId;
-      node.title = "点击查看本轮对话轨迹";
-      node.tabIndex = 0;
-    }
-    node.innerHTML = `${avatar(role)}<div><strong>${role === "user" ? "你" : "HESM Assistant"}</strong><p class="message-content">${escapeHtml(content)}</p>${meta ? `<div class="message-meta">${meta}</div>` : ""}</div>`;
-    elements.messages.appendChild(node);
-    elements.messages.scrollTop = elements.messages.scrollHeight;
-    return node;
+    if (chatId) { node.dataset.chatId = chatId; node.tabIndex = 0; node.title = "点击查看本轮轨迹"; }
+    node.innerHTML = `${avatar(role)}<div><strong>${role === "user" ? "你" : "HESM Assistant"}</strong><p class="message-content">${esc(content)}</p>${meta ? `<div class="message-meta">${meta}</div>` : ""}</div>`;
+    el.messages.appendChild(node); el.messages.scrollTop = el.messages.scrollHeight; return node;
   }
-
   function resetMessages(copy) {
-    elements.messages.innerHTML = `<div class="welcome-message"><span class="assistant-avatar">H</span><div><strong>HESM Assistant</strong><p>${escapeHtml(copy)}</p></div></div>`;
+    el.messages.innerHTML = `<div class="welcome-message"><span class="assistant-avatar">H</span><div><strong>HESM Assistant</strong><p>${esc(copy)}</p></div></div>`;
   }
-
-  function addTyping() {
-    const node = addMessage("assistant", "", "", "typing");
+  function typing() {
+    const node = addMessage("assistant", "");
     node.querySelector(".message-content").className = "message-content typing";
     node.querySelector(".message-content").innerHTML = "<i></i><i></i><i></i>";
     return node;
   }
-
-  function setStep(step, status) {
+  function step(step, status = "") {
     const order = ["extract", "retrieve", "prompt", "generate", "store"];
     const index = order.indexOf(step);
     document.querySelectorAll(".trace-step").forEach((node, position) => {
-      const completed = status === "done" || status === "completed";
-      node.classList.toggle("active", status !== "failed" && !completed && position === index);
-      node.classList.toggle("done", status === "done" || position < index || (completed && position === index));
+      node.classList.toggle("active", status !== "failed" && status !== "completed" && position === index);
+      node.classList.toggle("done", status === "done" || position < index || (status === "completed" && position === index));
       node.classList.toggle("failed", status === "failed" && position === index);
     });
   }
-
-  function setStepTime(step, value) {
-    const node = document.querySelector(`[data-step="${step}"] time`);
-    if (node) node.textContent = milliseconds(value);
+  function setTime(name, value) {
+    const node = document.querySelector(`[data-step="${name}"] time`); if (node) node.textContent = ms(value);
   }
-
+  function tickLiveTime() {
+    if (state.chatStartedAt !== null) el.total.textContent = ms(performance.now() - state.chatStartedAt);
+    if (state.activeStage && state.stageStartedAt !== null) {
+      setTime(state.activeStage, performance.now() - state.stageStartedAt);
+    }
+    document.querySelectorAll('[data-live-elapsed="true"]').forEach((node) => {
+      const started = Date.parse(node.dataset.startedAt || "");
+      if (Number.isFinite(started)) node.textContent = ms(Date.now() - started);
+    });
+  }
+  function ensureLiveTimer(totalElapsedMs = 0, trackChat = true) {
+    if (trackChat && state.chatStartedAt === null) state.chatStartedAt = performance.now() - Math.max(0, totalElapsedMs);
+    if (!state.liveTimer) state.liveTimer = setInterval(tickLiveTime, 200);
+  }
+  function stopLiveTimer() {
+    if (state.liveTimer) clearInterval(state.liveTimer);
+    state.liveTimer = null; state.chatStartedAt = null; state.activeStage = ""; state.stageStartedAt = null;
+  }
+  function captureExpandedDetails() {
+    const expanded = new Map();
+    el.trace.querySelectorAll(".topic-history").forEach((node) => { node.dataset.openKey = "topic-history"; });
+    el.trace.querySelectorAll(".retrieval-group").forEach((node, index) => { node.dataset.openKey = `retrieval-${index}`; });
+    el.trace.querySelectorAll(".async-job details").forEach((node, index) => { node.dataset.openKey = `distillation-${index}`; });
+    el.trace.querySelectorAll("details[data-open-key]").forEach((node) => expanded.set(node.dataset.openKey, node.open));
+    return expanded;
+  }
+  function restoreExpandedDetails(expanded) {
+    el.trace.querySelectorAll(".topic-history").forEach((node) => { node.dataset.openKey = "topic-history"; });
+    el.trace.querySelectorAll(".retrieval-group").forEach((node, index) => { node.dataset.openKey = `retrieval-${index}`; });
+    el.trace.querySelectorAll(".async-job details").forEach((node, index) => { node.dataset.openKey = `distillation-${index}`; });
+    el.trace.querySelectorAll("details[data-open-key]").forEach((node) => {
+      if (expanded.has(node.dataset.openKey)) node.open = expanded.get(node.dataset.openKey);
+    });
+  }
+  function resetTrace() {
+    el.empty.hidden = true; el.trace.hidden = false; el.total.textContent = "等待操作";
+    el.topic.innerHTML = "<p>暂无主题提取记录</p>";
+    el.retrieval.innerHTML = "<p>暂无检索记录</p>";
+    el.prompt.textContent = "暂无 Prompt 记录";
+    el.store.innerHTML = "<p>暂无记忆添加记录</p>";
+    el.async.innerHTML = "<p>暂无 Segment / Experience 蒸馏记录</p>";
+    document.querySelectorAll(".trace-step time").forEach((node) => { node.textContent = "—"; });
+    document.querySelectorAll(".trace-step").forEach((node) => node.classList.remove("active", "done", "failed"));
+  }
   function startTrace() {
-    clearTimeout(state.traceTimer);
-    elements.empty.hidden = true;
-    elements.trace.hidden = false;
-    elements.total.textContent = "处理中";
-    elements.topic.innerHTML = "<p>正在分析主题与意图…</p>";
-    elements.retrieval.innerHTML = "<p>等待主题提取完成…</p>";
-    elements.promptText.textContent = "等待记忆检索完成…";
-    elements.store.innerHTML = "<p>等待模型回答完成…</p>";
-    elements.asyncResult.innerHTML = "<p>等待记忆存储完成…</p>";
-    document.querySelector(".prompt-content").open = true;
-    document.querySelectorAll(".trace-step time").forEach((item) => { item.textContent = "—"; });
-    setStep("extract");
-    clearInterval(state.timer);
+    el.empty.hidden = true; el.trace.hidden = false; el.total.textContent = "处理中";
+    el.topic.innerHTML = "<p>正在分析主题与意图…</p>";
+    el.retrieval.innerHTML = "<p>等待检索完成…</p>";
+    el.prompt.textContent = "等待 Prompt 拼接完成…"; el.store.innerHTML = "<p>等待记忆添加…</p>";
+    el.async.innerHTML = "<p>等待异步更新…</p>";
+    document.querySelectorAll(".trace-step time").forEach((node) => { node.textContent = "—"; });
+    step("extract");
   }
-
-  function renderExtraction(extraction) {
-    elements.topic.innerHTML = `<div class="topic-grid"><div><small>主题</small><strong>${escapeHtml(extraction.topic || "—")}</strong></div><div><small>核心实体</small><strong>${escapeHtml(extraction.core_entity || "—")}</strong></div><div><small>意图</small><strong>${escapeHtml(extraction.intent || "—")}</strong></div><div><small>置信度</small><strong>${Math.round(Number(extraction.confidence || 0) * 100)}%</strong></div><div><small>相关实体</small><strong>${escapeHtml((extraction.entities || []).join("、") || "—")}</strong></div></div>`;
+  function renderExtraction(value, history = []) {
+    const item = value || {};
+    const historyHtml = history.length
+      ? `<details class="topic-history"><summary>本会话主题提取历史（${history.length}）</summary>${history.map((record, index) => `<article><strong>${index + 1}. ${esc(record.created_at || "时间未知")} · ${esc(record.source || "")}</strong><p>${esc(record.user_input || "")}</p><pre>${esc(JSON.stringify(record.topic_extraction_result, null, 2))}</pre></article>`).join("")}</details>`
+      : "";
+    el.topic.innerHTML = `<div class="topic-grid"><div><small>主题</small><strong>${esc(item.topic || "—")}</strong></div><div><small>核心实体</small><strong>${esc(item.core_entity || "—")}</strong></div><div><small>意图</small><strong>${esc(item.intent || "—")}</strong></div><div><small>置信度</small><strong>${Math.round(Number(item.confidence || 0) * 100)}%</strong></div><div><small>相关实体</small><strong>${esc((item.entities || []).join("、") || "—")}</strong></div></div>${historyHtml}`;
   }
-
-  function memoryValue(value) {
-    if (value === null || value === undefined || value === "") return "—";
-    return typeof value === "object" ? JSON.stringify(value, null, 2) : String(value);
-  }
-
-  function memoryField(label, value) {
-    return `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(memoryValue(value))}</dd>`;
-  }
-
+  function field(label, value) { return `<dt>${esc(label)}</dt><dd>${esc(typeof value === "object" ? JSON.stringify(value, null, 2) : (value ?? "—"))}</dd>`; }
   function retrievalItem(type, item) {
     const id = item[`${type}_id`] || item.id || "—";
-    const fields = type === "experience"
-      ? [["ID", id], ["主题", item.topic], ["核心实体", item.core_entity], ["状态", item.status || item.state?.status], ["摘要", item.summary], ["历史经验", item.history_experience]]
-      : type === "segment"
-        ? [["ID", id], ["主题", item.topic], ["意图", item.intent], ["核心实体", item.core_entity], ["状态", item.status], ["摘要", item.summary]]
-        : [["ID", id], ["Source ID", item.source_id], ["时间", item.timestamp], ["主题", item.topic], ["意图", item.intent], ["用户输入", item.user_input], ["助手输出", item.assistant_output]];
-    const title = type === "experience" ? item.topic || id : type === "segment" ? item.intent || item.topic || id : item.user_input || item.intent || id;
-    return `<article class="retrieval-item"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(id)}</small><dl>${fields.map(([label, value]) => memoryField(label, value)).join("")}</dl></article>`;
+    const fields = type === "experience" ? [["ID", id], ["主题", item.topic], ["核心实体", item.core_entity], ["状态", item.status], ["摘要", item.summary]] : type === "segment" ? [["ID", id], ["主题", item.topic], ["意图", item.intent], ["状态", item.status], ["摘要", item.summary]] : [["ID", id], ["时间", item.timestamp], ["用户输入", item.user_input], ["助手回答", item.assistant_output]];
+    return `<article class="retrieval-item"><strong>${esc(item.topic || item.intent || item.user_input || id)}</strong><small>${esc(id)}</small><dl>${fields.map(([label, value]) => field(label, value)).join("")}</dl></article>`;
   }
-
-  function retrievalGroup(type, label, items) {
+  function group(type, label, items) {
     const records = Array.isArray(items) ? items : [];
-    return `<details class="retrieval-group"><summary><b>${records.length}</b>${label}<span>点击查看</span></summary><div class="retrieval-items">${records.length ? records.map((item) => retrievalItem(type, item)).join("") : '<p>未检索到相关记录。</p>'}</div></details>`;
+    return `<details class="retrieval-group"><summary><b>${records.length}</b>${label}<span>点击查看</span></summary><div class="retrieval-items">${records.length ? records.map((item) => retrievalItem(type, item)).join("") : "<p>未检索到相关记录。</p>"}</div></details>`;
   }
-
-  function renderRetrieval(retrieval) {
-    elements.retrieval.innerHTML = `<div class="retrieval-counts">${retrievalGroup("experience", "Experience", retrieval.experiences)}${retrievalGroup("segment", "Segment", retrieval.segments)}${retrievalGroup("qa", "QA", retrieval.qas)}</div>`;
+  function renderRetrieval(value) {
+    const data = value || {};
+    el.retrieval.innerHTML = `${group("experience", "Experience", data.experiences)}${group("segment", "Segment", data.segments)}${group("qa", "QA", data.qas)}`;
   }
-
-  function renderStored(stored) {
-    elements.store.innerHTML = `<div class="store-path"><code title="${escapeHtml(stored.experience_id)}">${escapeHtml(stored.experience_id || "—")}</code><i>→</i><code title="${escapeHtml(stored.segment_id)}">${escapeHtml(stored.segment_id || "—")}</code><i>→</i><code title="${escapeHtml(stored.qa_id)}">${escapeHtml(stored.qa_id || "—")}</code></div>`;
+  function renderStored(item) {
+    const value = item || {};
+    el.store.innerHTML = `<div class="store-path"><code>${esc(value.experience_id || "—")}</code><i>→</i><code>${esc(value.segment_id || "—")}</code><i>→</i><code>${esc(value.qa_id || "—")}</code></div>`;
   }
-
-  function updateTraceEvent(event) {
-    if (event.event === "stage_started") {
-      setStep(event.stage);
-      if (event.stage === "extract") elements.topic.innerHTML = `<p>正在读取最近 ${event.history_turn_count || 0} 轮会话历史并分析主题…</p>`;
-      if (event.stage === "retrieve") elements.retrieval.innerHTML = "<p>正在按主题、核心实体和意图检索 HESM 记忆…</p>";
-      if (event.stage === "prompt") elements.promptText.textContent = "正在拼接 HESM 检索内容和当前问题…";
-      if (event.stage === "store") elements.store.innerHTML = "<p>正在写入 QA、Segment 与 Experience…</p>";
-      return;
-    }
-    if (event.event !== "stage_completed") return;
-    setStep(event.stage, "completed");
-    setStepTime(event.stage, event.timing_ms);
-    if (event.stage === "extract") renderExtraction(event.extraction || {});
-    if (event.stage === "retrieve") renderRetrieval(event.retrieval || {});
-    if (event.stage === "prompt") {
-      elements.promptText.textContent = event.prompt || "";
-    }
-    if (event.stage === "generate") {
-      elements.model.textContent = event.model || "Answer model";
-    }
-    if (event.stage === "store") renderStored(event.stored?.memories?.[0] || {});
+  function renderUpdates(trace) {
+    const updates = [...(trace.segment_updates || []), ...(trace.experience_updates || [])];
+    const outbox = trace.outbox || [];
+    const pending = outbox.filter((job) => ["pending", "processing"].includes(job.status)).length;
+    const html = updates.map((item) => {
+      const target = item.segment_id || item.experience_id || "";
+      const kind = item.segment_id ? "Segment 蒸馏" : "Experience 蒸馏";
+      return `<div class="async-job"><strong>${esc(kind)}</strong><span>${esc(item.status)} · ${esc(target)} · ${ms(item.elapsed_ms)}</span>${item.error_message ? `<p>${esc(item.error_message)}</p>` : ""}<details><summary>查看完整蒸馏轨迹</summary><pre>${esc(JSON.stringify({old: item.old_segment || item.old_experience, input: item.distill_input, prompt: item.prompt_text, output: item.output_text, new: item.new_segment || item.new_experience}, null, 2))}</pre></details></div>`;
+    }).join("");
+    el.async.innerHTML = `<p>${updates.length ? `已记录 ${updates.length} 条蒸馏，${pending} 个任务处理中` : "暂无蒸馏记录"}</p>${html}`;
+    el.async.querySelectorAll(".async-job").forEach((node, index) => {
+      const item = updates[index];
+      if (item?.status !== "running") return;
+      const label = node.querySelector("span");
+      const startedAt = item.started_at || item.created_at || "";
+      const started = Date.parse(startedAt);
+      const time = document.createElement("time");
+      time.dataset.liveElapsed = "true";
+      time.dataset.startedAt = startedAt;
+      time.textContent = ms(Number.isFinite(started) ? Date.now() - started : item.elapsed_ms);
+      label.textContent = `${item.status} · ${item.segment_id || item.experience_id || ""} · `;
+      label.appendChild(time);
+    });
+    const node = document.querySelector('[data-step="async"]'); if (node) node.classList.toggle("done", updates.length > 0 && pending === 0);
+    return pending;
   }
-
-  function renderTrace(result) {
-    clearInterval(state.timer);
+  function renderResult(result) {
     const timing = result.timing || {};
-    const extraction = result.extraction || {};
-    const retrieval = result.retrieval || {};
-    const stored = result.stored?.memories?.[0] || {};
-    elements.total.textContent = milliseconds(timing.chat_total_ms);
-    renderExtraction(extraction);
-    renderRetrieval(retrieval);
-    elements.promptText.textContent = result.prompt || "";
-    elements.model.textContent = result.model || "Answer model";
-    renderStored(stored);
-    const values = {
-      extract: timing.topic_extraction_ms, retrieve: timing.retrieval_ms,
-      prompt: timing.prompt_assembly_ms, generate: timing.generation_ms,
-      store: timing.storage_ms,
-    };
-    Object.entries(values).forEach(([key, value]) => {
-      document.querySelector(`[data-step="${key}"] time`).textContent = milliseconds(value);
-    });
-    setStep("store", "done");
+    state.chatStartedAt = null; state.activeStage = ""; state.stageStartedAt = null;
+    el.total.textContent = ms(timing.chat_total_ms); renderExtraction(result.extraction); renderRetrieval(result.retrieval); el.prompt.textContent = result.prompt || ""; el.model.textContent = result.model || "Answer model"; renderStored(result.stored?.memories?.[0]);
+    Object.entries({extract: timing.topic_extraction_ms, retrieve: timing.retrieval_ms, prompt: timing.prompt_assembly_ms, generate: timing.generation_ms, store: timing.storage_ms}).forEach(([key, value]) => setTime(key, value));
+    step("store", "done");
   }
-
-  function renderAsyncTrace(trace) {
-    const jobs = trace.jobs || [];
-    const events = (trace.events || []).filter((event) => event.stage === "async_derivation");
-    const pending = jobs.filter((job) => job.status === "pending" || job.status === "processing");
-    const historyJobs = new Map(events.map((event) => [event.payload?.job_id, {
-      job_id: event.payload?.job_id, job_type: event.payload?.job_type,
-      memory_id: event.payload?.memory_id, status: event.status,
-      last_error: event.payload?.error,
-    }]));
-    for (const job of jobs) historyJobs.set(job.job_id, job);
-    const labels = {
-      update_segment: "Segment 更新 / 总结", update_experience: "Experience 更新 / 总结",
-      embed_segment: "Segment 向量", embed_experience: "Experience 向量",
-      create_experience_route_vector: "Experience 路由向量",
-      recall_experience_history: "历史经验召回",
-    };
-    const jobRows = [...historyJobs.values()].map((job) => `<div class="async-job"><strong>${escapeHtml(labels[job.job_type] || job.job_type)}</strong><span>${escapeHtml(job.status)} · ${escapeHtml(job.memory_id)}</span>${job.last_error ? `<p>${escapeHtml(job.last_error)}</p>` : ""}</div>`).join("");
-    const summaries = events.filter((event) => event.payload?.summary_generated).map((event) => `<details class="async-summary"><summary>${escapeHtml(event.payload.memory_type)} 总结 · ${escapeHtml(event.payload.memory_id)}</summary><pre>${escapeHtml(JSON.stringify(event.payload.summary || {}, null, 2))}</pre></details>`).join("");
-    const failures = events.filter((event) => event.status === "failed").map((event) => `<p>任务 ${escapeHtml(event.payload?.job_id)} 失败：${escapeHtml(event.payload?.error || "未知错误")}</p>`).join("");
-    elements.asyncResult.innerHTML = `<p>${historyJobs.size ? `关联 ${historyJobs.size} 个任务，${pending.length} 个进行中` : "本轮暂无异步任务"}</p>${jobRows}${summaries}${failures}`;
-    document.querySelector('[data-step="async"]').classList.toggle("done", historyJobs.size > 0 && pending.length === 0);
-    return pending.length;
-  }
-
-  async function showTurnTrace(turnId) {
-    if (!turnId) return;
-    state.selectedTurnId = turnId;
-    clearTimeout(state.traceTimer);
+  async function showTrajectory(chatId) {
+    if (!chatId) return; state.selectedChatId = chatId; clearTimeout(state.poll);
     try {
-      const trace = await request(`/api/sessions/${encodeURIComponent(state.stateKey)}/traces/${encodeURIComponent(turnId)}`);
-      if (state.selectedTurnId !== turnId) return;
-      const final = [...trace.events].reverse().find((event) => event.stage === "final");
-      if (final?.payload?.result) {
-        startTrace();
-        renderTrace(final.payload.result);
+      const trace = await request(`/api/chats/${encodeURIComponent(chatId)}/trajectory?session_id=${encodeURIComponent(state.sessionId)}`);
+      if (state.selectedChatId !== chatId) return;
+      const expanded = captureExpandedDetails();
+      startTrace(); el.prompt.textContent = trace.chat?.prompt_text || "暂无已保存的 Prompt（旧记录可能没有该字段）"; const retriever = trace.retriever || {}; const add = trace.add || {};
+      renderExtraction(retriever.topic_extract, trace.topic_extraction_history || []); renderRetrieval(retriever); renderStored({experience_id: add.experience_id, segment_id: add.segment_id, qa_id: (add.qa_ids || [])[0]});
+      const savedTimings = trace.chat?.timing || {};
+      Object.entries({extract: savedTimings.topic_extraction_ms, retrieve: savedTimings.retrieval_ms, prompt: savedTimings.prompt_assembly_ms, generate: savedTimings.generation_ms, store: savedTimings.storage_ms}).forEach(([key, value]) => { if (value !== undefined) setTime(key, value); });
+      const chatIsRunning = trace.chat?.status === "running";
+      const pending = renderUpdates(trace);
+      const asyncWork = pending > 0 || (trace.outbox || []).some((job) => ["pending", "processing"].includes(job.status));
+      const createdAt = Date.parse(trace.chat?.created_at || "");
+      const elapsed = chatIsRunning && Number.isFinite(createdAt) ? Date.now() - createdAt : Number(trace.chat?.elapsed_ms || 0);
+      el.total.textContent = ms(elapsed);
+      restoreExpandedDetails(expanded);
+      if (chatIsRunning || asyncWork) {
+        ensureLiveTimer(chatIsRunning ? elapsed : 0, chatIsRunning);
+        state.poll = setTimeout(() => showTrajectory(chatId), 1500);
       } else {
-        startTrace();
-        for (const event of trace.events) {
-          if (event.payload?.event === "stage_completed") updateTraceEvent(event.payload);
-        }
-        elements.total.textContent = trace.status === "failed" ? "执行失败" : "处理中";
+        stopLiveTimer();
       }
-      const pending = renderAsyncTrace(trace);
-      if (pending || trace.status === "running") {
-        state.traceTimer = setTimeout(() => showTurnTrace(turnId), 2000);
-      }
-    } catch (error) {
-      if (state.selectedTurnId !== turnId) return;
-      elements.asyncResult.innerHTML = `<p>轨迹加载失败：${escapeHtml(error.message)}</p>`;
-    }
+    } catch (error) { el.async.innerHTML = `<p>轨迹加载失败：${esc(error.message)}</p>`; }
   }
-
-  async function streamRequest(url, body, onEvent) {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) {
-      const payload = await response.json().catch(() => ({}));
-      throw new Error(payload.detail || `HTTP ${response.status}`);
-    }
-    if (!response.body) throw new Error("当前浏览器不支持流式响应");
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let finalResult = null;
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        const event = JSON.parse(line);
-        if (event.event === "error") throw new Error(event.message || "对话执行失败");
-        onEvent(event);
-        if (event.event === "final") finalResult = event.result;
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim()) {
-      const event = JSON.parse(buffer);
-      if (event.event === "error") throw new Error(event.message || "对话执行失败");
-      onEvent(event);
-      if (event.event === "final") finalResult = event.result;
-    }
-    if (!finalResult) throw new Error("服务端未返回最终回答");
-    return finalResult;
+  function updateEvent(event) {
+    if (event.event === "stage_started") { state.activeStage = event.stage; state.stageStartedAt = performance.now(); setTime(event.stage, 0); step(event.stage); return; }
+    if (event.event !== "stage_completed") return;
+    step(event.stage, "completed"); setTime(event.stage, event.timing_ms);
+    if (state.activeStage === event.stage) { state.activeStage = ""; state.stageStartedAt = null; }
+    if (event.stage === "extract") renderExtraction(event.extraction);
+    if (event.stage === "retrieve") renderRetrieval(event.retrieval);
+    if (event.stage === "prompt") el.prompt.textContent = event.prompt || "";
+    if (event.stage === "generate") el.model.textContent = event.model || "Answer model";
+    if (event.stage === "store") renderStored(event.stored?.memories?.[0]);
   }
-
-  function cacheCurrentHistory() {
-    localStorage.setItem(currentSessionStorageKey, state.stateKey);
-    localStorage.setItem(`hesm.chat.${state.stateKey}`, JSON.stringify(state.history));
+  async function stream(url, body, onEvent) {
+    const response = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || `HTTP ${response.status}`);
+    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let result = null;
+    while (true) { const {value, done} = await reader.read(); if (done) break; buffer += decoder.decode(value, {stream: true}); const lines = buffer.split("\n"); buffer = lines.pop() || ""; for (const line of lines) { if (!line.trim()) continue; const event = JSON.parse(line); if (event.event === "error") throw new Error(event.message); onEvent(event); if (event.event === "final") result = event.result; } }
+    if (buffer.trim()) { const event = JSON.parse(buffer); if (event.event === "error") throw new Error(event.message); onEvent(event); if (event.event === "final") result = event.result; }
+    if (!result) throw new Error("服务端未返回最终结果"); return result;
   }
-
   async function loadSessions() {
-    try {
-      const sessions = (await request("/api/sessions")).items || [];
-      elements.sessionList.innerHTML = sessions.length ? sessions.map((item) => `<button class="session-item ${item.session_id === state.stateKey ? "active" : ""}" data-session-id="${escapeHtml(item.session_id)}"><strong>${escapeHtml(item.title || "未命名会话")}</strong><span>${escapeHtml(item.preview || "暂无消息")}</span><small>${item.turn_count || 0} 轮 · ${escapeHtml((item.updated_at || "").replace("T", " ").slice(0, 16))}</small><i class="session-delete" data-delete-session="${escapeHtml(item.session_id)}" title="归档会话">×</i></button>`).join("") : '<p class="session-loading">暂无历史会话，点击 ＋ 新建。</p>';
-    } catch (error) {
-      elements.sessionList.innerHTML = `<p class="session-loading">加载失败：${escapeHtml(error.message)}</p>`;
-    }
+    const sessions = (await request("/api/sessions")).items || [];
+    el.sessions.innerHTML = sessions.length ? sessions.map((item) => `<button class="session-item ${item.session_id === state.sessionId ? "active" : ""}" data-session-id="${esc(item.session_id)}"><strong>${esc(item.title || "智能对话")}</strong><span>${esc(item.preview || "暂无消息")}</span><small>${item.turn_count || 0} 轮 · ${esc((item.update_at || "").replace("T", " ").slice(0, 16))}</small><i class="session-delete" data-delete-session="${esc(item.session_id)}" title="归档会话">×</i></button>`).join("") : "<p class='session-loading'>暂无历史会话。</p>";
   }
-
-  async function loadHistory(stateKey, notify = false) {
-    state.selectedTurnId = null;
-    clearTimeout(state.traceTimer);
-    elements.trace.hidden = true;
-    elements.empty.hidden = false;
-    state.stateKey = stateKey;
-    localStorage.setItem(currentSessionStorageKey, stateKey);
-    let history = [];
-    try {
-      const session = await request(`/api/sessions/${encodeURIComponent(stateKey)}`);
-      history = session.messages || [];
-      elements.sessionTitle.textContent = session.title || "智能对话";
-    } catch (_) {
-      try { history = JSON.parse(localStorage.getItem(`hesm.chat.${stateKey}`) || "[]"); } catch (_) { history = []; }
-    }
-    state.history = history.slice(-100);
-    resetMessages(history.length ? "已恢复该会话的历史记录。" : "新会话已开始。长期记忆仍然保留，我会在每轮回答前进行检索。");
-    for (let index = 0; index < state.history.length; index += 2) {
-      const user = state.history[index];
-      const assistant = state.history[index + 1];
-      const turnId = user?.metadata?.turn_id || assistant?.metadata?.turn_id || "";
-      if (user?.role === "user") addMessage("user", user.content, "", "", turnId);
-      if (assistant?.role === "assistant") addMessage("assistant", assistant.content, '<span class="stored-chip">历史记录</span>', "", turnId);
-    }
-    cacheCurrentHistory();
+  async function loadHistory(sessionId) {
+    state.sessionId = sessionId; localStorage.setItem(storageKey, sessionId); state.selectedChatId = ""; clearTimeout(state.poll); resetTrace();
+    const session = await request(`/api/sessions/${encodeURIComponent(sessionId)}`); state.history = session.messages || []; el.title.textContent = session.title || "智能对话";
+    resetMessages(state.history.length ? "已恢复该会话的历史记录。" : "新会话已开始。每轮回答后都会沉淀为 HESM 记忆。");
+    let latestChatId = "";
+    for (let index = 0; index < state.history.length; index += 2) { const user = state.history[index]; const assistant = state.history[index + 1]; const chatId = user?.metadata?.chat_id || assistant?.metadata?.chat_id || ""; if (chatId) latestChatId = chatId; if (user?.role === "user") addMessage("user", user.content, "", chatId); if (assistant?.role === "assistant") addMessage("assistant", assistant.content, '<span class="stored-chip">历史记录</span>', chatId); }
     await loadSessions();
-    if (notify) showToast(`已恢复 ${Math.floor(state.history.length / 2)} 轮历史对话`);
+    if (latestChatId) await showTrajectory(latestChatId);
   }
-
+  async function createSession() {
+    if (state.running) return; const session = await request("/api/sessions", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({title: ""})}); await loadHistory(session.session_id); toast("已创建新会话");
+  }
   async function send(message) {
-    if (state.running) return;
-    state.running = true;
-    elements.send.disabled = true;
-    elements.send.querySelector("span").textContent = "处理中";
-    const userNode = addMessage("user", message);
-    const typing = addTyping();
-    startTrace();
+    if (state.running) return; state.running = true; el.send.disabled = true; const userNode = addMessage("user", message); const pending = typing(); startTrace(); ensureLiveTimer();
     try {
-      const payload = await streamRequest("/api/chat/stream", {
-        message,
-        session_id: state.stateKey,
-      }, (event) => {
-        if (event.event === "start" && event.turn_id) {
-          userNode.dataset.turnId = event.turn_id;
-          userNode.title = "点击查看本轮对话轨迹";
-          userNode.tabIndex = 0;
-        }
-        updateTraceEvent(event);
-      });
-      typing.remove();
-      addMessage("assistant", payload.answer, `<span class="stored-chip">已存入 HESM</span><span>${milliseconds(payload.timing?.chat_total_ms)}</span>`, "", payload.turn_id);
-      state.history.push({ role: "user", content: message, metadata: { turn_id: payload.turn_id } }, { role: "assistant", content: payload.answer, metadata: { turn_id: payload.turn_id } });
-      state.history = state.history.slice(-100);
-      cacheCurrentHistory();
-      state.result = payload;
-      renderTrace(payload);
-      state.selectedTurnId = payload.turn_id;
-      showTurnTrace(payload.turn_id);
-      await loadSessions();
-      setHealth(true, "对话服务就绪");
-    } catch (error) {
-      clearInterval(state.timer);
-      typing.remove();
-      addMessage("assistant", `本轮处理失败：${error.message || String(error)}`);
-      setStep("generate", "failed");
-      elements.total.textContent = "执行失败";
-      showToast("对话执行失败，本轮未写入历史");
-    } finally {
-      state.running = false;
-      elements.send.disabled = false;
-      elements.send.querySelector("span").textContent = "发送";
-      elements.input.focus();
-    }
+      const result = await stream("/api/chat/stream", {message, session_id: state.sessionId}, (event) => { if (event.event === "start" && event.chat_id) { userNode.dataset.chatId = event.chat_id; userNode.tabIndex = 0; } updateEvent(event); });
+      pending.remove(); addMessage("assistant", result.answer, `<span class="stored-chip">已保存</span><span>${ms(result.timing?.chat_total_ms)}</span>`, result.chat_id); state.result = result; renderResult(result); state.selectedChatId = result.chat_id; showTrajectory(result.chat_id); await loadSessions(); setHealth(true, "对话服务就绪");
+    } catch (error) { pending.remove(); addMessage("assistant", `本轮处理失败：${error.message}`); step("generate", "failed"); el.total.textContent = "执行失败"; toast("本轮处理失败"); }
+    finally { if (state.chatStartedAt !== null) stopLiveTimer(); state.running = false; el.send.disabled = false; el.input.focus(); }
   }
-
-  elements.form.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const message = elements.input.value.trim();
-    if (!message) return;
-    elements.input.value = "";
-    send(message);
-  });
-  elements.messages.addEventListener("click", (event) => {
-    const item = event.target.closest(".message[data-turn-id]");
-    if (item && !state.running) showTurnTrace(item.dataset.turnId);
-  });
-  elements.messages.addEventListener("keydown", (event) => {
-    if (event.key !== "Enter" && event.key !== " ") return;
-    const item = event.target.closest(".message[data-turn-id]");
-    if (item && !state.running) {
-      event.preventDefault();
-      showTurnTrace(item.dataset.turnId);
-    }
-  });
-  elements.input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      elements.form.requestSubmit();
-    }
-  });
-  elements.sessionList.addEventListener("click", async (event) => {
-    const remove = event.target.closest("[data-delete-session]");
-    if (remove) {
-      event.stopPropagation();
-      if (state.running) return;
-      await request(`/api/sessions/${encodeURIComponent(remove.dataset.deleteSession)}`, { method: "DELETE" });
-      if (remove.dataset.deleteSession === state.stateKey) await createNewSession();
-      else await loadSessions();
-      showToast("会话已归档");
-      return;
-    }
-    const item = event.target.closest("[data-session-id]");
-    if (item && !state.running) loadHistory(item.dataset.sessionId, true);
-  });
-
-  async function createNewSession() {
-    if (state.running) return;
-    const session = await request("/api/sessions", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: "新会话" }),
-    });
-    state.result = null;
-    elements.trace.hidden = true;
-    elements.empty.hidden = false;
-    elements.total.textContent = "等待输入";
-    await loadHistory(session.session_id);
-    showToast("已创建并保存新会话");
-  }
-  $("#new-chat").addEventListener("click", createNewSession);
-  checkHealth();
-  request("/api/sessions")
-    .then((data) => {
-      const exists = (data.items || []).some((item) => item.session_id === state.stateKey);
-      return exists ? loadHistory(state.stateKey) : createNewSession();
-    })
-    .catch(() => createNewSession());
-  elements.input.focus();
+  el.form.addEventListener("submit", (event) => { event.preventDefault(); const message = el.input.value.trim(); if (!message) return; el.input.value = ""; send(message); });
+  el.input.addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); el.form.requestSubmit(); } });
+  el.messages.addEventListener("click", (event) => { const node = event.target.closest("[data-chat-id]"); if (node && !state.running) showTrajectory(node.dataset.chatId); });
+  el.messages.addEventListener("keydown", (event) => { if (!["Enter", " "].includes(event.key)) return; const node = event.target.closest("[data-chat-id]"); if (node && !state.running) { event.preventDefault(); showTrajectory(node.dataset.chatId); } });
+  el.sessions.addEventListener("click", async (event) => { const remove = event.target.closest("[data-delete-session]"); if (remove) { event.stopPropagation(); await request(`/api/sessions/${encodeURIComponent(remove.dataset.deleteSession)}`, {method: "DELETE"}); if (remove.dataset.deleteSession === state.sessionId) await createSession(); else await loadSessions(); return; } const item = event.target.closest("[data-session-id]"); if (item && !state.running) loadHistory(item.dataset.sessionId); });
+  $("#new-chat").addEventListener("click", createSession);
+  request("/api/health").then((data) => setHealth(data.status !== "degraded", data.status === "ready" ? "对话服务就绪" : "记忆库为空")).catch(() => setHealth(false, "WebServer 未连接"));
+  request("/api/sessions").then((data) => (data.items || []).some((item) => item.session_id === state.sessionId) ? loadHistory(state.sessionId) : createSession()).catch(createSession);
+  el.input.focus();
 })();

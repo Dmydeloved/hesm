@@ -1,0 +1,63 @@
+# HESM ablation: use ingestion-time topic/entity records selected by evidence.
+# Keep this as a separate storage profile from the normal user-memory run.
+schema_version: 2
+experiment:
+  profile: native_hesm_evidence_topic_lookup
+  data_root: ../.runtime/evidence_topic_retrieval
+  host: 127.0.0.1
+  port: 8767
+  api_token: "${HESM_EVAL_TOKEN}"
+  max_top_k: 100
+  outbox_settle_timeout_seconds: 3600
+  require_evidence: false
+  retrieval_topic_source: evidence_topic_lookup
+
+paths:
+  memory_db: experiments/.runtime/evidence_topic_retrieval/default/hesm.sqlite3
+  chroma: experiments/.runtime/evidence_topic_retrieval/default/chroma
+
+_llm_connection: &llm_connection
+  api_key: "${HESM_EVAL_MEMORY_API_KEY}"
+  base_url: "${HESM_EVAL_MEMORY_BASE_URL}"
+  max_retries: 3
+  retry_delay: 2.0
+
+_llm_profiles:
+  strong: &strong_llm
+    <<: *llm_connection
+    model: gpt-4.1-mini-2025-04-14
+  nano: &nano_llm
+    <<: *llm_connection
+    model: gpt-4.1-mini-2025-04-14
+
+topic_extraction: *strong_llm
+embedding: &embedding_defaults
+  api_key: "${HESM_EVAL_EMBEDDING_API_KEY}"
+  model: text-embedding-v4
+  base_url: "${HESM_EVAL_EMBEDDING_BASE_URL}"
+  max_input_tokens: 8192
+  chunk_tokens: 7800
+
+retrieval:
+  experience_vector_recall_limit: 12
+  experience_relational_recall_limit: 12
+  experience_similarity_threshold: 0.82
+  experience_route_margin: 0.05
+  qa_candidate_limit: 40
+  qa_similarity_threshold: 0.45
+
+summarization: *strong_llm
+chat: *nano_llm
+memory_management:
+  segment_qa_threshold: 5
+  experience_segment_threshold: 2
+  experience_similarity_threshold: 0.82
+  min_segment_qas: 2
+  async_derivation: true
+  async_poll_interval: 0.5
+  async_batch_size: 8
+  async_max_retries: 3
+api:
+  top_experience: 1
+  top_segment: 2
+  top_qa: 4

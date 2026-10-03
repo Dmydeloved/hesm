@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>HESM · 操作轨迹</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1">
+  <link rel="stylesheet" href="/styles.css?v=7">
+  <link rel="stylesheet" href="/operations.css?v=2">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/index.html"><span class="brand-icon">H</span><span>HESM<small>Hierarchical Experience State Memory</small></span></a>
+    <nav>
+      <a href="/index.html">数据管理</a>
+      <a href="/retrieval.html">检索分析</a>
+      <a href="/chat.html">智能对话</a>
+      <a class="active" href="/operations.html">操作轨迹</a>
+    </nav>
+    <div id="health" class="health"><i></i><span>正在连接</span></div>
+  </header>
+  <main class="operations-shell">
+    <section class="operations-list">
+      <header>
+        <div>
+          <p class="eyebrow">OPERATION TRAJECTORY</p>
+          <h1>操作轨迹 <span id="live-indicator" class="live-indicator">LIVE</span></h1>
+          <p class="operation-hint">操作会自动记录并刷新，不需要先点击某条对话。</p>
+        </div>
+        <button id="refresh" class="button">刷新</button>
+      </header>
+      <div class="filters">
+        <select id="type">
+          <option value="">全部操作</option>
+          <option value="chat">Chat</option>
+          <option value="retriever">Retriever</option>
+          <option value="add">Add</option>
+          <option value="segment_update">Segment 蒸馏</option>
+          <option value="experience_update">Experience 蒸馏</option>
+        </select>
+        <select id="status">
+          <option value="">全部状态</option>
+          <option value="completed">完成</option>
+          <option value="running">处理中</option>
+          <option value="pending">等待中</option>
+          <option value="skipped">跳过</option>
+          <option value="failed">失败</option>
+        </select>
+        <span id="operation-count" class="operation-count">0 条记录</span>
+      </div>
+      <div id="items" class="operation-items"><p class="empty">正在加载操作轨迹…</p></div>
+    </section>
+    <aside class="operation-detail">
+      <header>
+        <div><p class="eyebrow">TRACE DETAIL</p><h2>操作详情</h2></div>
+        <span id="detail-kind">—</span>
+      </header>
+      <div id="detail" class="detail-body"><p class="empty">操作记录会自动出现在左侧，最新记录会自动展开。</p></div>
+    </aside>
+  </main>
+  <script src="/operations.js?v=2"></script>
+</body>
+</html>

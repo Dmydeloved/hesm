@@ -15,6 +15,7 @@ class FakeHESMService:
         self.storage_root = Path(storage_root)
         self.retriever_class = retriever_class
         self.added = []
+        self.retrieved = []
         self.closed = False
         self.instances.append(self)
 
@@ -34,6 +35,7 @@ class FakeHESMService:
         }
 
     def retrieve(self, **kwargs):
+        self.retrieved.append(kwargs)
         return {
             "context": f"native context from {self.storage_root.name}",
             "route_status": "runtime",
@@ -43,6 +45,9 @@ class FakeHESMService:
             "experiences": [{"experience_id": "exp_1"}],
             "segments": [{"segment_id": "seg_1"}],
             "qas": [{"qa_id": "qa_1"}],
+            "topic_extraction_source": (
+                "evidence_topic_lookup" if kwargs.get("topic_result") else "llm"
+            ),
         }
 
     def close(self):
@@ -162,6 +167,65 @@ def test_search_uses_only_requested_user_store_and_records_status(monkeypatch, t
     rows = request_rows(backend)
     assert [row["operation"] for row in rows] == ["search", "search"]
     assert all(row["status"] == "success" for row in rows)
+    assert [row["result_count"] for row in rows] == [1, 1]
+
+
+def test_evidence_lookup_replaces_query_extraction_and_is_user_scoped(
+    monkeypatch, tmp_path
+):
+    backend = make_backend(monkeypatch, tmp_path)
+    backend.settings["retrieval_topic_source"] = "evidence_topic_lookup"
+    extraction = {
+        "topic": "exact topic",
+        "core_entity": "exact entity",
+        "intent": "query",
+        "entities": ["exact entity", "alias"],
+    }
+    backend.add(
+        "user-a",
+        [{"content": "source turn", "evidence": ["D1:3"]}],
+        "session-a",
+    )
+    service = FakeHESMService.instances[0]
+    # The fake's normal add extraction is what the lookup must return.
+    result = backend.search(
+        "user-a", "unrelated wording", evidence=["D1:3", "D1:4"]
+    )
+
+    assert result["topic_extraction_source"] == "evidence_topic_lookup"
+    assert service.retrieved[0]["topic_result"][0]["topic"] == "source turn"
+    assert service.retrieved[0]["topic_result"][0]["core_entity"] == "entity-1"
+    assert len(service.retrieved[0]["topic_result"]) == 1
+    assert service.retrieved[0]["question"] == "unrelated wording"
+    # Evidence lookup is user-scoped; an absent record falls back to LLM.
+    backend.search("user-b", "unrelated wording", evidence=["D1:3"])
+    assert FakeHESMService.instances[1].retrieved[0]["topic_result"] is None
+
+
+def test_evidence_lookup_without_evidence_falls_back_to_llm(monkeypatch, tmp_path):
+    backend = make_backend(monkeypatch, tmp_path)
+    backend.settings["retrieval_topic_source"] = "evidence_topic_lookup"
+
+    result = backend.search("user-a", "question", evidence=[])
+
+    assert result["topic_extraction_source"] == "llm"
+    assert FakeHESMService.instances[0].retrieved[0]["topic_result"] is None
+    assert request_rows(backend)[0]["status"] == "success"
+
+
+def test_evidence_lookup_errors_fall_back_to_llm(monkeypatch, tmp_path):
+    backend = make_backend(monkeypatch, tmp_path)
+    backend.settings["retrieval_topic_source"] = "evidence_topic_lookup"
+
+    def fail_lookup(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(backend, "_topic_results_for_evidence", fail_lookup)
+    result = backend.search("user-a", "question", evidence=["D1:3"])
+
+    assert result["topic_extraction_source"] == "llm"
+    assert FakeHESMService.instances[0].retrieved[0]["topic_result"] is None
+    assert request_rows(backend)[0]["status"] == "success"
 
 
 def test_search_rejects_failed_derivation_jobs(monkeypatch, tmp_path):

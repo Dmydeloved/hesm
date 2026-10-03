@@ -186,6 +186,7 @@ class LLMSummarizer:
             if experience_prompt_path
             else DEFAULT_EXPERIENCE_SUMMARY_PROMPT_PATH
         )
+        self.last_trace: dict[str, Any] = {}
 
     def summarize_segment(self, segment: dict[str, Any], qa_items: list[dict[str, Any]]) -> str:
         prompt = build_segment_summary_prompt(
@@ -229,6 +230,13 @@ class LLMSummarizer:
         fallback: str,
         task: str = "summary",
     ) -> str:
+        started_at = time.perf_counter()
+        self.last_trace = {
+            "prompt": prompt,
+            "output": "",
+            "model": self.model,
+            "elapsed_ms": 0.0,
+        }
         logger.info(
             "Summary LLM prompt task=%s model=%s prompt=%s",
             task,
@@ -250,6 +258,8 @@ class LLMSummarizer:
                     temperature=0.0,
                 )
                 content = (response.choices[0].message.content or "").strip()
+                self.last_trace["output"] = content
+                self.last_trace["elapsed_ms"] = round((time.perf_counter() - started_at) * 1000, 3)
                 logger.info(
                     "Summary LLM response task=%s model=%s attempt=%s content=%s",
                     task,
@@ -293,6 +303,8 @@ class LLMSummarizer:
                 last_error,
                 fallback,
             )
+            self.last_trace["output"] = fallback
+            self.last_trace["elapsed_ms"] = round((time.perf_counter() - started_at) * 1000, 3)
             return fallback
         logger.info(
             "Summary generation empty after retries; using fallback task=%s model=%s fallback=%s",
@@ -300,6 +312,8 @@ class LLMSummarizer:
             self.model,
             fallback,
         )
+        self.last_trace["output"] = fallback
+        self.last_trace["elapsed_ms"] = round((time.perf_counter() - started_at) * 1000, 3)
         return fallback
 
     def _normalized_qas(self, qa_items: list[dict[str, Any]]) -> list[dict[str, Any]]:

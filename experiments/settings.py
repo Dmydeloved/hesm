@@ -93,6 +93,14 @@ def read_settings(path: str | Path) -> dict[str, Any]:
     # The reproducibility fingerprint covers the YAML-controlled models,
     # thresholds and paths, but never derives a stored hash from credentials.
     config_sha256 = file_sha256
+    retrieval_topic_source = str(
+        experiment.get("retrieval_topic_source", "llm")
+    ).strip().lower()
+    if retrieval_topic_source not in {"llm", "evidence_topic_lookup"}:
+        raise ValueError(
+            "experiment.retrieval_topic_source must be 'llm' or "
+            "'evidence_topic_lookup'"
+        )
     result = dict(experiment)
     result.update({
         "config_path": str(target),
@@ -103,6 +111,8 @@ def read_settings(path: str | Path) -> dict[str, Any]:
         "config_fingerprint": config_sha256,
         "native_config": data,
         "max_top_k": int(experiment.get("max_top_k", 100)),
+        "require_evidence": bool(experiment.get("require_evidence", False)),
+        "retrieval_topic_source": retrieval_topic_source,
         "native_models": {
             "topic_extraction": (data.get("topic_extraction") or {}).get("model"),
             "summarization": (data.get("summarization") or {}).get("model"),

@@ -1,0 +1,6 @@
+.topic-history{margin-top:8px;border:1px solid var(--line);border-radius:8px;background:#fff}
+.topic-history>summary{padding:8px 10px;color:#6255c2;font-size:11px;font-weight:700;cursor:pointer}
+.topic-history article{margin:0 8px 8px;padding:8px;border:1px solid var(--line);border-radius:7px;background:#fafbfa}
+.topic-history article strong{font-size:10px}
+.topic-history article p{margin:5px 0;color:#53605a;font-size:10px;white-space:pre-wrap;word-break:break-word}
+.topic-history article pre{max-height:220px;overflow:auto;margin:0;padding:7px;border-radius:6px;background:#f0f3f1;font:10px/1.55 Consolas,"Microsoft YaHei",monospace;white-space:pre-wrap;word-break:break-word}
