@@ -34,10 +34,13 @@ retrieval:
   experience_vector_recall_limit: 12
   experience_relational_recall_limit: 12
   experience_similarity_threshold: 0.82
-  # Vector-route ambiguity and QA hybrid fallback (dense + SQLite fields).
+  # Vector-route ambiguity; route misses return no results.
   experience_route_margin: 0.05
-  qa_candidate_limit: 40
-  qa_similarity_threshold: 0.45
+  # Rerank QA under a matched Experience with dense vectors + SQLite FTS5 BM25.
+  experience_qa_hybrid_enabled: false
+  qa_rrf_constant: 60
+  qa_dense_candidate_limit: 30
+  qa_bm25_candidate_limit: 30
 
 summarization: *strong_llm
 
@@ -61,7 +64,6 @@ memory_management:
 
 api:
   top_experience: 1
-  # These caps apply to QA fallback candidate/result shaping only. Normal
-  # hierarchy retrieval is bounded by last_updated_segment_id/last_updated_qa_id.
+  # Maximum QA records returned by experience scoped retrieval.
   top_segment: 2
   top_qa: 4

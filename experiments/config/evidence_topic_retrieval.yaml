@@ -9,7 +9,7 @@ experiment:
   api_token: "${HESM_EVAL_TOKEN}"
   max_top_k: 100
   outbox_settle_timeout_seconds: 3600
-  require_evidence: false
+  require_evidence: true
   retrieval_topic_source: evidence_topic_lookup
 
 paths:
@@ -45,6 +45,10 @@ retrieval:
   experience_route_margin: 0.05
   qa_candidate_limit: 40
   qa_similarity_threshold: 0.45
+  experience_qa_hybrid_enabled: true
+  qa_rrf_constant: 60
+  qa_dense_candidate_limit: 30
+  qa_bm25_candidate_limit: 30
 
 summarization: *strong_llm
 chat: *nano_llm
@@ -60,4 +64,4 @@ memory_management:
 api:
   top_experience: 1
   top_segment: 2
-  top_qa: 4
+  top_qa: 5

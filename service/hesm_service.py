@@ -141,18 +141,39 @@ class HESMService:
                 manager=self.manager,
                 segment_limit=int(self.api_config.get("top_segment", 2)),
                 qa_limit=int(self.api_config.get("top_qa", 5)),
-                qa_candidate_limit=int(
-                    retrieval_config.get("qa_candidate_limit", 40)
-                ),
-                qa_similarity_threshold=float(
-                    retrieval_config.get("qa_similarity_threshold", 0.45)
-                ),
                 experience_route_margin=float(
                     retrieval_config.get("experience_route_margin", 0.05)
                 ),
+                experience_qa_hybrid_enabled=bool(
+                    retrieval_config.get("experience_qa_hybrid_enabled", False)
+                ),
+                qa_rrf_constant=int(retrieval_config.get("qa_rrf_constant", 60)),
+                qa_dense_candidate_limit=int(
+                    retrieval_config.get("qa_dense_candidate_limit", 30)
+                ),
+                qa_bm25_candidate_limit=int(
+                    retrieval_config.get("qa_bm25_candidate_limit", 30)
+                ),
             )
         else:
-            self.retriever = retriever_class(manager=self.manager)
+            self.retriever = retriever_class(
+                manager=self.manager,
+                segment_limit=int(self.api_config.get("top_segment", 2)),
+                qa_limit=int(self.api_config.get("top_qa", 5)),
+                experience_route_margin=float(
+                    retrieval_config.get("experience_route_margin", 0.05)
+                ),
+                experience_qa_hybrid_enabled=bool(
+                    retrieval_config.get("experience_qa_hybrid_enabled", False)
+                ),
+                qa_rrf_constant=int(retrieval_config.get("qa_rrf_constant", 60)),
+                qa_dense_candidate_limit=int(
+                    retrieval_config.get("qa_dense_candidate_limit", 30)
+                ),
+                qa_bm25_candidate_limit=int(
+                    retrieval_config.get("qa_bm25_candidate_limit", 30)
+                ),
+            )
         self.answerer = LLMAnswerer(
             api_key=str(chat_config.get("api_key") or ""),
             model=str(chat_config.get("model") or ""),
@@ -426,6 +447,9 @@ class HESMService:
                 "intent": str(primary.get("intent") or ""),
                 "state_key": state_key,
                 "entities": [str(item) for item in primary.get("entities") or []],
+                "target_experience_id": str(
+                    primary.get("_target_experience_id") or ""
+                ),
             }
             if isinstance(self.retriever, HybridRetriever):
                 retrieval_arguments["query_candidates"] = [

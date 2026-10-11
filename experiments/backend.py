@@ -317,20 +317,31 @@ class EvaluationBackend:
                 placeholders = ",".join("?" for _ in evidence_keys)
                 rows = connection.execute(
                     f"""
-                    SELECT source_id, topic, core_entity, intent, entities_json,
-                           confidence, reason
-                    FROM qa_memory
-                    WHERE source_id IN ({placeholders})
+                    SELECT q.source_id, e.experience_id, e.topic, e.core_entity,
+                           q.intent, q.entities_json, q.confidence, q.reason
+                    FROM qa_memory q
+                    JOIN segment_memory s ON s.segment_id = q.segment_id
+                    JOIN experience_memory e ON e.experience_id = s.experience_id
+                    WHERE q.source_id IN ({placeholders})
+                      AND q.status = 'open' AND s.status != 'deleted'
+                      AND e.status != 'deleted'
                     """,
                     tuple(f"evidence:{key}" for key in evidence_keys),
                 ).fetchall()
             for row in rows:
                 source_id = str(row["source_id"] or "")
+                entities = json.loads(row["entities_json"] or "[]")
+                if not isinstance(entities, list):
+                    entities = []
+                core_entity = str(row["core_entity"] or "").strip()
+                if core_entity and core_entity not in entities:
+                    entities.insert(0, core_entity)
                 native_by_key[source_id.removeprefix("evidence:")] = {
                     "topic": row["topic"],
-                    "core_entity": row["core_entity"],
+                    "core_entity": core_entity,
                     "intent": row["intent"],
-                    "entities": json.loads(row["entities_json"] or "[]"),
+                    "entities": entities,
+                    "_target_experience_id": row["experience_id"],
                     "confidence": row["confidence"],
                     "reasoning": row["reason"],
                 }

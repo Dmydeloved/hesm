@@ -129,6 +129,20 @@ CREATE INDEX IF NOT EXISTS idx_memory_outbox_status_created
 ON memory_outbox(status, created_at);
 """
 
+QA_FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS qa_fts USING fts5(
+    qa_id UNINDEXED,
+    segment_id UNINDEXED,
+    user_input,
+    assistant_output,
+    topic,
+    intent,
+    core_entity,
+    entities,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+"""
+
 
 JSON_FIELDS = {
     "tools_json",
@@ -201,6 +215,7 @@ class MemoryStorage:
             self._ensure_runtime_state_columns()
             self._ensure_memory_columns()
             self._drop_legacy_qa_search_index()
+            self._ensure_qa_fts_index()
             self._normalize_stored_timestamps()
             self.connection.commit()
         logger.info("结构化记忆库已初始化 db=%s", self.db_path.resolve())
@@ -468,6 +483,46 @@ class MemoryStorage:
     def _drop_legacy_qa_search_index(self) -> None:
         """Remove the retired full-text virtual table from existing databases."""
         self.connection.execute("DROP TABLE IF EXISTS qa_memory_fts")
+
+    def _ensure_qa_fts_index(self) -> None:
+        """Create and backfill the QA full-text index, with transactional triggers."""
+        try:
+            self.connection.executescript(QA_FTS_SCHEMA)
+            self.connection.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS qa_fts_insert AFTER INSERT ON qa_memory BEGIN
+                    INSERT INTO qa_fts(qa_id, segment_id, user_input, assistant_output,
+                                       topic, intent, core_entity, entities)
+                    VALUES (new.qa_id, new.segment_id, new.user_input, new.assistant_output,
+                            new.topic, new.intent, new.core_entity, new.entities_json);
+                END;
+                CREATE TRIGGER IF NOT EXISTS qa_fts_delete AFTER DELETE ON qa_memory BEGIN
+                    DELETE FROM qa_fts WHERE qa_id = old.qa_id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS qa_fts_update AFTER UPDATE OF qa_id, segment_id,
+                    user_input, assistant_output, topic, intent, core_entity, entities_json
+                    ON qa_memory BEGIN
+                    DELETE FROM qa_fts WHERE qa_id = old.qa_id;
+                    INSERT INTO qa_fts(qa_id, segment_id, user_input, assistant_output,
+                                       topic, intent, core_entity, entities)
+                    VALUES (new.qa_id, new.segment_id, new.user_input, new.assistant_output,
+                            new.topic, new.intent, new.core_entity, new.entities_json);
+                END;
+                """
+            )
+            # Rebuilding on startup is idempotent and also repairs indexes left by older runs.
+            self.connection.execute("DELETE FROM qa_fts")
+            self.connection.execute(
+                """
+                INSERT INTO qa_fts(qa_id, segment_id, user_input, assistant_output,
+                                   topic, intent, core_entity, entities)
+                SELECT qa_id, segment_id, user_input, assistant_output,
+                       topic, intent, core_entity, entities_json FROM qa_memory
+                """
+            )
+        except sqlite3.OperationalError:
+            # SQLite builds without FTS5 remain usable; the retriever will fall back.
+            logger.warning("SQLite FTS5 is unavailable; QA BM25 retrieval is disabled", exc_info=True)
 
     def _normalize_stored_timestamps(self) -> None:
         """将已有记忆及会话中的时间统一迁移为标准格式。"""
@@ -1660,6 +1715,36 @@ class MemoryStorage:
             """,
             (*score_parameters, *parameters, max(1, int(limit))),
         ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def search_qas_bm25(
+        self, *, experience_id: str, query: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """Search QA text with FTS5 BM25, scoped to one live Experience."""
+        query = str(query or "").strip()
+        if not query:
+            return []
+        # Quote user text so FTS operators and punctuation cannot alter the query.
+        match_query = '"' + query.replace('"', '""') + '"'
+        try:
+            rows = self.connection.execute(
+                """
+                SELECT q.*, bm25(qa_fts, 0, 0, 1.0, 1.2, 0.35, 0.25, 0.35, 0.2) AS bm25_score
+                FROM qa_fts
+                JOIN qa_memory q ON q.qa_id = qa_fts.qa_id
+                JOIN segment_memory s ON s.segment_id = q.segment_id
+                WHERE qa_fts MATCH ? AND s.experience_id = ?
+                  AND q.status = 'open' AND s.status != 'deleted'
+                ORDER BY bm25_score ASC, q.timestamp DESC, q.qa_id
+                LIMIT ?
+                """,
+                (match_query, str(experience_id), max(1, int(limit))),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower() or "fts5" in str(exc).lower():
+                logger.warning("QA FTS5 search unavailable: %s", exc)
+                return []
+            raise
         return [self._row_to_dict(row) for row in rows]
 
     def get_experiences(self, experience_ids: list[str]) -> list[dict[str, Any]]:
