@@ -13,14 +13,14 @@ SQLite 需要支持 FTS5 才能启用 QA 混合全文检索；核心记忆读写
 
 ## 2. 安装运行依赖
 
-在项目根目录创建隔离环境并安装服务依赖：
+依赖版本已固定在项目根目录的 requirements.txt 中。在项目根目录创建隔离环境并按清单安装：
 
 ```powershell
 # Windows PowerShell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install fastapi uvicorn pyyaml openai chromadb
+python -m pip install -r requirements.txt
 ```
 
 ```bash
@@ -28,10 +28,10 @@ python -m pip install fastapi uvicorn pyyaml openai chromadb
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install fastapi uvicorn pyyaml openai chromadb
+python -m pip install -r requirements.txt
 ```
 
-若需要精确复现环境，应在验证部署后将实际依赖版本固定到部署环境的依赖清单中。可选的 `tiktoken` 用于更精确的文本分块计数；未安装时程序使用保守的字节长度估算。
+依赖清单已包含 tiktoken，用于文本分块计数。清单中的依赖项若与目标操作系统不兼容，应先调整该项或使用对应平台的依赖清单，再执行安装。
 
 ## 3. 准备独立配置
 

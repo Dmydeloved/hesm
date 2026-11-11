@@ -9,7 +9,7 @@ from pathlib import Path
 from threading import Lock, RLock
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -361,39 +361,39 @@ class MemoryRepository:
 
 
 class MemoryAddRequest(BaseModel):
-    user_input: str = Field(min_length=1, max_length=20_000)
-    source_id: str | None = Field(default=None, max_length=500)
-    assistant_output: str = Field(default="", max_length=20_000)
-    context: str = Field(default="", max_length=50_000)
-    topic_result: dict[str, Any] | list[dict[str, Any]] | None = None
-    tools: list[dict[str, Any]] | None = None
-    timestamp: str | None = None
-    state_key: str = Field(default="default", min_length=1, max_length=200)
-    user_id: str | None = Field(default=None, min_length=1, max_length=200)
+    user_input: str = Field(min_length=1, max_length=20_000, description="本次交互的用户原始输入；必填，写入 QA 证据。")
+    source_id: str | None = Field(default=None, max_length=500, description="上游系统的来源记录 ID，用于关联外部数据；可选。")
+    assistant_output: str = Field(default="", max_length=20_000, description="本次交互对应的助手回复；没有回复时可留空。")
+    context: str = Field(default="", max_length=50_000, description="供主题、意图和实体抽取使用的补充上下文；可选。")
+    topic_result: dict[str, Any] | list[dict[str, Any]] | None = Field(default=None, description="已抽取的主题结果；提供时跳过模型抽取，支持单条或多条结果。")
+    tools: list[dict[str, Any]] | None = Field(default=None, description="本轮相关的工具调用或工具结果列表；可选，作为 QA 附加证据保存。")
+    timestamp: str | None = Field(default=None, description="交互发生时间；可选，支持可解析的时间字符串，缺省时使用当前时间。")
+    state_key: str = Field(default="default", min_length=1, max_length=200, description="记忆路由状态键；相同键会复用当前 Experience/Segment 指针。")
+    user_id: str | None = Field(default=None, min_length=1, max_length=200, description="用户标识；用于区分主题抽取历史，缺省时使用默认用户。")
 
 
 class RetrievalRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=2_000)
-    state_key: str = Field(default="default", min_length=1, max_length=200)
-    session_id: str | None = Field(default=None, min_length=1, max_length=200)
-    user_id: str | None = Field(default=None, min_length=1, max_length=200)
+    question: str = Field(min_length=1, max_length=2_000, description="当前检索问题；用于抽取查询主题并查找相关记忆。")
+    state_key: str = Field(default="default", min_length=1, max_length=200, description="记忆路由状态键；用于优先检查该上下文当前指向的 Experience。")
+    session_id: str | None = Field(default=None, min_length=1, max_length=200, description="会话标识；用于保存检索主题抽取历史，缺省时沿用 state_key。")
+    user_id: str | None = Field(default=None, min_length=1, max_length=200, description="用户标识；用于隔离主题抽取历史，缺省时使用默认用户。")
 
 
 class StatusRequest(BaseModel):
-    status: str = Field(min_length=1, max_length=32)
+    status: str = Field(min_length=1, max_length=32, description="目标记忆状态；Experience/Segment 支持 open、completed、deleted，QA 支持 open、deleted。")
 
 
 class ChatMessage(BaseModel):
-    role: Literal["user", "assistant"]
-    content: str = Field(min_length=1, max_length=20_000)
+    role: Literal["user", "assistant"] = Field(description="历史消息角色，只允许 user 或 assistant。")
+    content: str = Field(min_length=1, max_length=20_000, description="该轮历史消息的文本内容。")
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=20_000)
-    history: list[ChatMessage] = Field(default_factory=list, max_length=20)
-    state_key: str = Field(default="web_chat", min_length=1, max_length=200)
-    session_id: str | None = Field(default=None, min_length=1, max_length=200)
-    user_id: str | None = Field(default=None, min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=20_000, description="当前用户输入；服务将检索记忆、生成回答并将本轮交互写入记忆。")
+    history: list[ChatMessage] = Field(default_factory=list, max_length=20, description="客户端提供的历史消息；仅在服务端尚无该会话历史时作为抽取上下文补充，最多 20 条。")
+    state_key: str = Field(default="web_chat", min_length=1, max_length=200, description="记忆路由状态键；未提供 session_id 时也作为会话标识。")
+    session_id: str | None = Field(default=None, min_length=1, max_length=200, description="聊天会话标识；用于恢复历史并关联 Chat/Retriever/Add 操作轨迹。")
+    user_id: str | None = Field(default=None, min_length=1, max_length=200, description="用户标识；用于读取和保存该用户的主题抽取历史。")
 
 
 app = FastAPI(title="HESM Memory Console API", version="3.0.0")
@@ -411,7 +411,7 @@ _service_lock = Lock()
 
 
 class SessionCreateRequest(BaseModel):
-    title: str = Field(default="新会话", max_length=120)
+    title: str = Field(default="新会话", max_length=120, description="新会话标题；缺省为“新会话”。")
 
 
 @app.middleware("http")
@@ -459,7 +459,7 @@ def stats() -> dict[str, Any]:
 
 
 @app.get("/api/sessions")
-def list_sessions(limit: int = Query(default=50, ge=1, le=100)) -> dict[str, Any]:
+def list_sessions(limit: int = Query(default=50, ge=1, le=100, description="最多返回的会话数量。")) -> dict[str, Any]:
     return {"items": session_manager.list(limit=limit)}
 
 
@@ -469,7 +469,7 @@ def create_session(request: SessionCreateRequest) -> dict[str, Any]:
 
 
 @app.get("/api/sessions/{session_id}")
-def get_session(session_id: str) -> dict[str, Any]:
+def get_session(session_id: str = ApiPath(description="要读取的会话 ID。")) -> dict[str, Any]:
     try:
         return session_manager.get(session_id)
     except KeyError as error:
@@ -478,17 +478,17 @@ def get_session(session_id: str) -> dict[str, Any]:
 
 @app.get("/api/sessions/{session_id}/topic-extractions")
 def get_topic_extraction_history(
-    session_id: str,
-    user_id: str | None = Query(default=None, min_length=1, max_length=200),
+    session_id: str = ApiPath(description="要查询主题抽取历史的会话 ID。"),
+    user_id: str | None = Query(default=None, min_length=1, max_length=200, description="用户标识；缺省时查询默认用户的历史。"),
 ) -> dict[str, Any]:
     return database_initializer.get_topic_extraction_history(session_id, user_id)
 
 
 @app.get("/api/chats/{chat_id}/trajectory")
 def get_chat_trajectory(
-    chat_id: str,
-    session_id: str = Query(..., min_length=1),
-    user_id: str | None = Query(default=None, min_length=1, max_length=200),
+    chat_id: str = ApiPath(description="要查询的聊天操作 ID。"),
+    session_id: str = Query(..., min_length=1, description="该聊天所属的会话 ID，用于限定轨迹查询范围。"),
+    user_id: str | None = Query(default=None, min_length=1, max_length=200, description="用户标识；用于附带对应用户的主题抽取历史。"),
 ) -> dict[str, Any]:
     trace = trace_repository.get(session_id, chat_id)
     if trace is None:
@@ -500,7 +500,7 @@ def get_chat_trajectory(
 
 
 @app.delete("/api/sessions/{session_id}")
-def archive_session(session_id: str) -> dict[str, Any]:
+def archive_session(session_id: str = ApiPath(description="要归档的会话 ID。")) -> dict[str, Any]:
     try:
         return session_manager.archive(session_id)
     except KeyError as error:
@@ -509,15 +509,18 @@ def archive_session(session_id: str) -> dict[str, Any]:
 
 @app.get("/api/operations")
 def list_operations(
-    type: str = Query(default="", max_length=32),
-    status: str = Query(default="", max_length=32),
-    limit: int = Query(default=100, ge=1, le=500),
+    type: str = Query(default="", max_length=32, description="按操作类型筛选，例如 chat、retriever、add、segment_update 或 experience_update；留空表示不限类型。"),
+    status: str = Query(default="", max_length=32, description="按操作状态筛选；留空表示不限状态。"),
+    limit: int = Query(default=100, ge=1, le=500, description="最多返回的操作记录数。"),
 ) -> dict[str, Any]:
     return {"items": trace_repository.list_operations(operation_type=type, status=status, limit=limit)}
 
 
 @app.get("/api/operations/{operation_type}/{operation_id}")
-def operation_detail(operation_type: str, operation_id: str) -> dict[str, Any]:
+def operation_detail(
+    operation_type: str = ApiPath(description="操作类型，例如 chat、retriever、add、segment_update 或 experience_update。"),
+    operation_id: str = ApiPath(description="对应类型下的操作记录 ID。"),
+) -> dict[str, Any]:
     operation = trace_repository.get_operation(operation_type, operation_id)
     if operation is None:
         raise HTTPException(status_code=404, detail="操作轨迹不存在")
@@ -526,13 +529,13 @@ def operation_detail(operation_type: str, operation_id: str) -> dict[str, Any]:
 
 @app.get("/api/{level}")
 def list_memories(
-    level: Literal["experience", "segment", "qa"],
-    q: str = Query(default="", max_length=500),
-    status: str = Query(default="", max_length=32),
-    parent_id: str = Query(default="", max_length=200),
-    experience_id: str = Query(default="", max_length=200),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=30, ge=1, le=100),
+    level: Literal["experience", "segment", "qa"] = ApiPath(description="记忆层级：experience、segment 或 qa。"),
+    q: str = Query(default="", max_length=500, description="按 ID、主题、实体、意图、摘要或交互文本进行模糊搜索。"),
+    status: str = Query(default="", max_length=32, description="按记忆状态筛选；留空表示不限状态。"),
+    parent_id: str = Query(default="", max_length=200, description="父级记忆 ID；查询 Segment 时填写 Experience ID，查询 QA 时填写 Segment ID。"),
+    experience_id: str = Query(default="", max_length=200, description="仅查询指定 Experience 下的 QA；仅 level=qa 时有效。"),
+    page: int = Query(default=1, ge=1, description="页码，从 1 开始。"),
+    page_size: int = Query(default=30, ge=1, le=100, description="每页返回的记录数，最大 100。"),
 ) -> dict[str, Any]:
     return repository.list_memories(
         level, search=q, status=status, parent_id=parent_id,
@@ -543,7 +546,8 @@ def list_memories(
 
 @app.get("/api/{level}/{memory_id}")
 def memory_detail(
-    level: Literal["experience", "segment", "qa"], memory_id: str
+    level: Literal["experience", "segment", "qa"] = ApiPath(description="记忆层级：experience、segment 或 qa。"),
+    memory_id: str = ApiPath(description="该层级下的记忆记录 ID。"),
 ) -> dict[str, Any]:
     item = repository.detail(level, memory_id)
     if level == "experience":
@@ -559,9 +563,9 @@ def memory_detail(
 
 @app.patch("/api/{level}/{memory_id}/status")
 def update_status(
-    level: Literal["experience", "segment", "qa"],
-    memory_id: str,
-    request: StatusRequest,
+    level: Literal["experience", "segment", "qa"] = ApiPath(description="记忆层级：experience、segment 或 qa。"),
+    memory_id: str = ApiPath(description="需要修改状态的记忆记录 ID。"),
+    request: StatusRequest = Body(..., description="状态更新请求，包含目标状态。"),
 ) -> dict[str, Any]:
     return repository.set_status(level, memory_id, request.status)
 
