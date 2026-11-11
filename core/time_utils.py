@@ -1,3 +1,5 @@
+"""统一解析、规范化并格式化 HESM 中保存的时间戳。"""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -15,7 +17,7 @@ def format_timestamp(value: str | datetime | None = None) -> str:
         moment = value
     else:
         text = str(value).strip()
-        # Python 的 fromisoformat 不直接识别所有版本中的 Z 后缀。
+        # 不同 Python 版本对 fromisoformat 的 Z 后缀支持不一致，因此先规范时区标记。
         if text.endswith("Z"):
             text = f"{text[:-1]}+00:00"
         try:

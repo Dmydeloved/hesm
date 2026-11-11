@@ -1,3 +1,5 @@
+"""调用语言模型抽取交互中的主题、意图与核心实体。"""
+
 from __future__ import annotations
 
 import json
@@ -139,7 +141,7 @@ def add_result_metadata(topic_result: TopicResult, user_input: str) -> TopicResu
 
 
 class TopicExtractor:
-    """OpenAI-compatible topic extractor."""
+    """通过 OpenAI 兼容接口抽取主题信息。"""
 
     def __init__(
         self,

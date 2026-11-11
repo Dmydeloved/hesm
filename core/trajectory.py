@@ -1,4 +1,4 @@
-"""Durable Chat/Retriever/Add and memory distillation trajectories."""
+"""持久化保存 Chat、Retriever、Add 与记忆蒸馏操作轨迹。"""
 
 from __future__ import annotations
 
@@ -156,7 +156,7 @@ def _loads(value: Any, default: Any) -> Any:
 
 
 class TraceRepository:
-    """Repository for the normalized trajectory model."""
+    """规范化操作轨迹模型的仓储。"""
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
@@ -406,7 +406,7 @@ class TraceRepository:
         return rows[: max(1, int(limit))]
 
     def list_memory_updates(self, memory_type: str, memory_id: str) -> list[dict[str, Any]]:
-        """Return every distillation attempt for one memory, oldest first."""
+        """按时间从早到晚返回指定记忆对象的全部蒸馏尝试。"""
         targets = {
             "segment": ("segment_update", "segment_id"),
             "experience": ("experience_update", "experience_id"),
@@ -424,7 +424,7 @@ class TraceRepository:
         return [self._decode_row(row) for row in rows]
 
     def list_experience_distillation_history(self, experience_id: str) -> list[dict[str, Any]]:
-        """Return Experience and descendant Segment attempts in one timeline."""
+        """在同一时间线上返回 Experience 及其子 Segment 的蒸馏尝试。"""
         with self._connect() as connection:
             segment_ids = [
                 str(row["segment_id"])

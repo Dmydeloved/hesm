@@ -1,3 +1,5 @@
+"""负责 Experience、Segment、QA 的分层路由、写入和更新。"""
+
 from __future__ import annotations
 
 import json
@@ -49,8 +51,7 @@ class MemoryManager:
         # 语义路由阈值。
         self.experience_similarity_threshold = experience_similarity_threshold
         self.experience_route_margin = max(0.0, float(experience_route_margin))
-        # Kept as a compatibility attribute; Segment routing no longer merges
-        # unrelated intents merely to reach a minimum QA count.
+        # 保留旧配置兼容性；Segment 路由不会为了达到 QA 数量而合并无关意图。
         self.min_segment_qas = min_segment_qas
         self.segment_similarity_threshold = float(segment_similarity_threshold)
         self.segment_route_margin = max(0.0, float(segment_route_margin))
@@ -106,8 +107,7 @@ class MemoryManager:
                 timestamp=timestamp,
             )
 
-            # Route across a small window of open Segments.  A low QA count is
-            # never used as permission to mix an incompatible intent.
+            # 只在近期开放的 Segment 中路由；QA 数量不足不能成为混合不兼容意图的理由。
             action = "append_segment"
             routed_segment = self._find_segment_for_intent(
                 current_experience["experience_id"],
@@ -117,6 +117,7 @@ class MemoryManager:
             )
             if routed_segment is None:
                 if current_segment and current_segment.get("status") == "open":
+                    # 当前活动阶段与新意图不兼容：先排队摘要并关闭旧阶段，再建立新阶段承接 QA。
                     old_qa_count = self.storage.count_qas_by_segment(
                         current_segment["segment_id"]
                     )
@@ -168,6 +169,7 @@ class MemoryManager:
                         },
                     )
                 current_segment = routed_segment
+            # 当前指针与新 QA 在同一事务中更新，后续请求不会读到半成品路由状态。
             self.storage.upsert_runtime_state(
                 state_key=state_key,
                 current_experience_id=current_experience["experience_id"],
@@ -192,6 +194,7 @@ class MemoryManager:
                 "confidence": confidence,
                 "reason": reasoning,
             }
+            # QA 原文及其向量同步写入；Segment/Experience 摘要与父级向量则由 outbox 派生。
             self.storage.insert_qa(qa)
             self.upsert_qa_vector(qa["qa_id"])
             logger.info(
@@ -254,6 +257,7 @@ class MemoryManager:
             query,
         )
         runtime = self.storage.get_runtime_state(state_key)
+        # runtime_state 只是当前指针缓存；先验证父子关系，再决定是否可沿用。
         current_experience = self.storage.get_experience(
             runtime["current_experience_id"] if runtime else None
         )
@@ -284,7 +288,7 @@ class MemoryManager:
             )
             current_segment = None
 
-        # 当前 Experience 不可复用时，依次尝试关系库、路由向量和新建流程。
+        # 主题或实体变化时关闭旧阶段；随后按精确关系匹配、向量路由、创建新 Experience 的顺序回退。
         if not self._same_experience(current_experience, topic, core_entity):
             logger.info(
                 "Route current experience not reusable state_key=%s current_experience_id=%s",
@@ -320,6 +324,7 @@ class MemoryManager:
                     current_experience["core_entity"],
                 )
             else:
+                # 路由向量只负责找到可复用的 Experience；最终父子归属仍由 SQLite 记录。
                 current_experience = self._find_experience_by_vector(
                     topic,
                     core_entity,
@@ -371,7 +376,7 @@ class MemoryManager:
         intent: str = "",
         timestamp: str | None = None,
     ) -> dict[str, Any]:
-        """Create the minimal Experience and enqueue its one-time derivations."""
+        """创建最小 Experience，并将一次性派生任务加入队列。"""
         topic = str(topic or "").strip()
         core_entity = str(core_entity or "").strip()
         query = str(query or "").strip()
@@ -396,6 +401,7 @@ class MemoryManager:
             "last_updated_segment_at": None,
             "history_experience": {},
         }
+        # 先持久化最小父记录，摘要和历史经验通过 outbox 异步补齐。
         self.storage.insert_experience(experience)
         self._enqueue_job(
             "recall_experience_history",
@@ -479,7 +485,7 @@ class MemoryManager:
         return segment
 
     def upsert_experience_content_vector(self, experience_id: str) -> None:
-        """Update the Experience content vector only."""
+        """仅更新 Experience 内容向量。"""
         experience = self.storage.get_experience(experience_id)
         if not experience:
             raise ValueError(f"Unknown experience_id: {experience_id}")
@@ -502,7 +508,7 @@ class MemoryManager:
         experience_id: str,
         creation_snapshot: dict[str, Any],
     ) -> None:
-        """Create an idempotent route vector from immutable creation fields."""
+        """根据不可变创建字段创建幂等的路由向量。"""
         experience = {
             "experience_id": experience_id,
             "topic": str(creation_snapshot.get("topic") or ""),
@@ -528,7 +534,7 @@ class MemoryManager:
         logger.debug("Experience 路由向量已创建 id=%s", experience_id)
 
     def upsert_experience_vector(self, experience_id: str) -> None:
-        """Compatibility helper for the mutable Experience content vector."""
+        """兼容旧调用方的 Experience 可变内容向量辅助方法。"""
         self.upsert_experience_content_vector(experience_id)
 
     def _enqueue_job(
@@ -623,13 +629,13 @@ class MemoryManager:
 
     @staticmethod
     def _normalize_route_text(value: Any) -> str:
-        """Normalize harmless formatting differences in route identities."""
+        """规范化路由标识中的无影响格式差异。"""
         return "".join(str(value or "").casefold().split())
 
     def _find_experience_by_vector(
         self, topic: str, core_entity: str, query: str = ""
     ) -> dict[str, Any] | None:
-        """Route through the dedicated topic+core_entity Experience vectors."""
+        """通过专用的主题与核心实体 Experience 向量执行路由。"""
         query_text = f"主题：{topic}\n核心实体：{core_entity}"
         try:
             query_embedding = self.embedder.embed(query_text)
@@ -691,7 +697,7 @@ class MemoryManager:
         preferred: dict[str, Any] | None = None,
         query: str = "",
     ) -> dict[str, Any] | None:
-        """Select one reusable Segment from a bounded recent intent history."""
+        """从有限范围的近期意图历史中选择可复用的 Segment。"""
         candidates: list[dict[str, Any]] = []
         seen: set[str] = set()
         list_candidates = getattr(
@@ -732,6 +738,7 @@ class MemoryManager:
             getattr(self, "segment_similarity_threshold", 0.8)
         )
         route_margin = float(getattr(self, "segment_route_margin", 0.1))
+        # 相似度不足时宁可开启新阶段，避免把不同目标的交互压进同一摘要。
         if not ranked or ranked[0][1] < similarity_threshold:
             return None
         if (
@@ -752,7 +759,7 @@ class MemoryManager:
         candidates: list[tuple[dict[str, Any], float]],
         query: str,
     ) -> dict[str, Any]:
-        """Resolve a close top-two route by goal, then by update recency."""
+        """候选分数接近时先按目标匹配度、再按更新时间确定路由。"""
         top_two = [item[0] for item in candidates[:2]]
         goals = [self._summary_goal(item) for item in top_two]
         if len(top_two) == 1:
@@ -795,7 +802,7 @@ class MemoryManager:
         return dot / (left_norm * right_norm) if left_norm and right_norm else 0.0
 
     def _should_cut_segment(self, segment: dict[str, Any], intent: str) -> bool:
-        """Compatibility helper using the stricter semantic boundary rule."""
+        """使用更严格语义边界规则的兼容辅助方法。"""
         if segment.get("status") != "open":
             return True
         return not (

@@ -1,4 +1,4 @@
-"""Export a read-only HESM SQLite snapshot for the static frontend."""
+"""导出供静态前端读取的 HESM SQLite 只读快照。"""
 
 from __future__ import annotations
 

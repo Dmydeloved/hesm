@@ -1,3 +1,5 @@
+"""定义文本向量编码器，并生成各层记忆使用的向量文档。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -19,11 +21,11 @@ DEFAULT_CHUNK_TOKENS = 7800
 
 class TextEmbedder(Protocol):
     def embed(self, text: str) -> list[float]:
-        """Encode one text into a vector."""
+        """将一段文本编码为向量。"""
 
 
 class BailianEmbedder:
-    """Alibaba Bailian embedding client using its OpenAI-compatible endpoint."""
+    """通过 OpenAI 兼容接口调用阿里云百炼向量模型。"""
 
     def __init__(
         self,
@@ -96,14 +98,13 @@ class BailianEmbedder:
 
 
 def embedding_token_count(text: str) -> int:
-    """Count tokens with the experiment tokenizer, with a safe byte fallback."""
+    """使用可选分词器计数；不可用时按字节长度保守估算。"""
     try:
         import tiktoken
 
         return len(tiktoken.get_encoding("cl100k_base").encode(text))
     except Exception:
-        # A byte is the smallest possible tokenizer unit, so byte length is a
-        # conservative upper bound when tiktoken is unavailable.
+        # 单字节是最小分词单位；缺少 tiktoken 时按字节数估算可避免超出请求上限。
         return len(text.encode("utf-8"))
 
 
@@ -113,7 +114,7 @@ def split_embedding_text(
     max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
     chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
 ) -> tuple[list[str], int]:
-    """Return nonempty chunks that are safe for one embedding API call each."""
+    """切分出非空文本块，确保每块可在一次向量接口请求中处理。"""
     if not text or not text.strip():
         raise ValueError("Embedding text cannot be empty.")
     max_input_tokens = int(max_input_tokens)
@@ -128,8 +129,7 @@ def split_embedding_text(
         token_count = len(token_ids)
         if token_count <= max_input_tokens:
             return [text], token_count
-        # Split on Python character boundaries. Decoding arbitrary token slices
-        # can split the UTF-8 bytes of one CJK character across two chunks.
+        # 按 Python 字符边界切分，避免直接拆分 token 字节时破坏 UTF-8 中文字符。
         chunks = []
         start = 0
         while start < len(text):
@@ -148,10 +148,8 @@ def split_embedding_text(
             start = best
         return [chunk for chunk in chunks if chunk.strip()], token_count
     except Exception:
-        # tiktoken may be installed while its encoding files are unavailable
-        # (for example in an offline worker).  Falling back here keeps the
-        # configured provider request path usable and still enforces the
-        # conservative byte-based limit.
+        # 离线环境可能安装了 tiktoken 却缺少编码文件；此时回退到字节估算，
+        # 仍能使用已配置的模型服务，并继续保守限制单次请求长度。
         raw = text.encode("utf-8")
         token_count = len(raw)
         if token_count <= max_input_tokens:
@@ -189,7 +187,7 @@ def _mean_normalized(vectors: list[list[float]]) -> list[float]:
 
 
 class HashingEmbedder:
-    """Deterministic offline embedder used only by unit tests."""
+    """仅供单元测试使用的确定性离线向量编码器。"""
 
     def __init__(self, dimensions: int = 128) -> None:
         self.dimensions = dimensions
@@ -225,7 +223,7 @@ def _text_list(value: Any) -> list[str]:
 
 
 def build_experience_embedding_text(experience: dict[str, Any]) -> str:
-    """Build a bounded Experience vector document without aggregating QA entities."""
+    """构造长度受限的 Experience 向量文档，不聚合 QA 实体。"""
 
     state = experience.get("state") if isinstance(experience.get("state"), dict) else {}
     history = (
@@ -269,7 +267,7 @@ def build_experience_embedding_text(experience: dict[str, Any]) -> str:
 
 
 def build_segment_embedding_text(segment: dict[str, Any]) -> str:
-    """Build a Segment vector document from intent, summary and recent questions."""
+    """根据意图、摘要和近期问题构造 Segment 向量文档。"""
 
     recent_inputs = _text_list(segment.get("recent_qa_inputs"))[-3:]
     return "\n".join(
@@ -285,7 +283,7 @@ def build_segment_embedding_text(segment: dict[str, Any]) -> str:
 
 
 def build_qa_embedding_text(qa: dict[str, Any]) -> str:
-    """Build a QA vector document containing the original evidence text."""
+    """构造包含原始交互证据文本的 QA 向量文档。"""
 
     answer_excerpt = str(qa.get("assistant_output") or "")[:500]
     return "\n".join(

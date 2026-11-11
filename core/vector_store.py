@@ -1,3 +1,5 @@
+"""维护 Chroma 向量集合，并提供离线读取回退逻辑。"""
+
 from __future__ import annotations
 
 import json
@@ -419,7 +421,7 @@ class _PersistentReadOnlyCollection(_PersistentQueueBackedCollection):
                 return
             record_size = len(raw_vectors) // total_elements
             vector_size = dimension * 4
-            # hnswlib 依次保存零层链接、float32 向量和 uint64 标签。
+            # hnswlib 文件依次保存零层链接、float32 向量和 uint64 标签。
             vector_offset = record_size - vector_size - 8
             if vector_offset < 0 or record_size * total_elements != len(raw_vectors):
                 raise ValueError("Unsupported persisted HNSW level-0 layout")

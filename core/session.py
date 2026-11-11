@@ -1,4 +1,4 @@
-"""Chat-session navigation over the normalized chat trajectory table."""
+"""基于规范化聊天轨迹表管理会话导航信息。"""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def _loads(value: Any, fallback: Any) -> Any:
 
 
 class SessionManager:
-    """Manage session metadata; messages live in the chat table."""
+    """管理会话元数据；具体消息保存在 chat 表中。"""
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)

@@ -78,7 +78,7 @@ def build_context_text(
 
 
 def build_history_context(history_experience: Any) -> str:
-    """Compatibility formatter for an Experience's stored historical context."""
+    """格式化 Experience 保存的历史上下文，兼容旧版字段结构。"""
     if isinstance(history_experience, (dict, list)):
         text = json.dumps(history_experience, ensure_ascii=False)
     else:
@@ -114,7 +114,7 @@ class HybridRetriever:
         self.qa_bm25_candidate_limit = max(self.qa_limit, int(qa_bm25_candidate_limit))
 
     def _retrieve_experience_qas(self, experience: dict[str, Any], query: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Fuse experience-scoped dense and FTS5 QA rankings with reciprocal rank fusion."""
+        """使用倒数排名融合合并 Experience 范围内的向量与 FTS5 QA 排名。"""
         experience_id = str(experience.get("experience_id") or "")
         ranked_ids: dict[str, dict[str, Any]] = {}
         try:
@@ -137,6 +137,7 @@ class HybridRetriever:
             ranked_ids[qa_id]["dense_rank"] = rank
             ranked_ids[qa_id]["dense_similarity"] = float(item.get("similarity") or 0.0)
 
+        # FTS5 与向量检索各自可能漏掉同义表达；分别取候选，再用 RRF 合并名次而不混用原始分值。
         try:
             bm25 = self.storage.search_qas_bm25(
                 experience_id=experience_id,
@@ -163,6 +164,7 @@ class HybridRetriever:
                     score += 1.0 / (self.qa_rrf_constant + int(rank))
             item["rrf_score"] = score
             scores[qa_id] = score
+        # RRF 只依赖名次，分值尺度不同的 BM25 和向量相似度因此可以共同排序。
         ordered_ids = sorted(
             scores,
             key=lambda qa_id: (scores[qa_id], str(ranked_ids[qa_id].get("dense_rank") or 10**9), qa_id),
@@ -177,6 +179,7 @@ class HybridRetriever:
             qa = qas_by_id.get(qa_id)
             if not qa or qa.get("status") != "open":
                 continue
+            # 向量索引可能短暂滞后于 SQLite；回查 QA、Segment 和 Experience 关系以剔除失效候选。
             segment = self.storage.get_segment(str(qa.get("segment_id") or ""))
             if (
                 segment
@@ -217,6 +220,7 @@ class HybridRetriever:
         current = self.storage.get_experience(
             runtime.get("current_experience_id") if runtime else None
         )
+        # 路由优先复用当前指针，再查精确关系记录；这两步不需要向量服务。
         if self.manager._same_experience(current, topic, core_entity):
             return current, "runtime", 1.0, ""
 
@@ -230,6 +234,7 @@ class HybridRetriever:
 
         current, confidence = candidates[0]
         threshold = float(self.manager.experience_similarity_threshold)
+        # 向量只给出候选，低置信度或前两名过近都不直接视为命中。
         if confidence <= threshold:
             return None, "no_route", confidence, "low_confidence"
         if len(candidates) > 1:
@@ -299,7 +304,7 @@ class HybridRetriever:
         query_candidates: list[dict[str, Any]] | None = None,
         target_experience_id: str = "",
     ) -> dict[str, Any]:
-        """Retrieve within a routed Experience; route misses return empty results."""
+        """在路由到的 Experience 内检索；路由未命中时返回空结果。"""
         topic = str(topic or "").strip()
         core_entity = str(core_entity or "").strip()
         query = str(query or "").strip()
@@ -325,6 +330,7 @@ class HybridRetriever:
                 route_source = "evidence_experience"
                 route_confidence = 1.0
                 fallback_reason = ""
+        # 普通问题按主题/实体路由；指定目标仅用于有证据的检索调用，并跳过模糊路由。
         for route_topic, route_entity in (() if experience else route_variants):
             routed, source, confidence, reason = self._route_existing(
                 state_key=state_key,
@@ -342,6 +348,7 @@ class HybridRetriever:
                 core_entity = route_entity
                 break
         if experience is None:
+            # Retriever 是只读链路：路由未命中时返回空树，不创建“猜测出来”的 Experience。
             return {
                 "route_status": route_source,
                 "route_confidence": route_confidence,
@@ -355,6 +362,7 @@ class HybridRetriever:
             }
 
         if hasattr(self.storage, "list_unupdated_segments"):
+            # 优先取尚未被父级 Experience 摘要吸收的阶段，避免上下文只剩旧摘要。
             latest_segments = self.storage.list_unupdated_segments(experience)
         else:
             latest_segments = self.storage.list_latest_segments(
@@ -393,6 +401,7 @@ class HybridRetriever:
         qa_matches: list[dict[str, Any]] = []
         retrieval_channels: list[str] = []
         if self.experience_qa_hybrid_enabled:
+            # 开启混合检索后，QA 排名决定最终证据集；再由这些 QA 反查对应 Segment。
             qas, qa_matches = self._retrieve_experience_qas(experience, query)
             segment_map: dict[str, dict[str, Any]] = {}
             for qa in qas:

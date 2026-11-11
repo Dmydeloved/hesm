@@ -1,3 +1,5 @@
+"""实现 HESM SQLite schema、迁移、关系查询和异步任务队列。"""
+
 from __future__ import annotations
 
 import json
@@ -221,7 +223,7 @@ class MemoryStorage:
         logger.info("结构化记忆库已初始化 db=%s", self.db_path.resolve())
 
     def _reset_legacy_trajectory_schema(self) -> None:
-        """Drop retired operational data while preserving memory tables."""
+        """清理已停用的操作数据，同时保留记忆表。"""
         tables = {
             str(row["name"])
             for row in self.connection.execute(
@@ -234,9 +236,8 @@ class MemoryStorage:
         }
         if not tables:
             return
-        # The normalized update tables are durable operation history. Their
-        # presence means this database has reached the current trajectory
-        # model, so never run the legacy cleanup over them (or their parents).
+        # 规范化更新表保存持久操作历史。若这些表已存在，说明数据库已升级到
+        # 当前轨迹结构，因此不能再对其或关联父表执行旧版清理。
         if {"segment_update", "experience_update"} & tables:
             return
         legacy = bool(
@@ -284,7 +285,7 @@ class MemoryStorage:
         return parsed if isinstance(parsed, list) else []
 
     def _clear_legacy_qa_tools(self) -> None:
-        """Remove retired chat trace markers from retained QA records."""
+        """从保留的 QA 记录中移除已停用的聊天轨迹标记。"""
         if not self.connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='qa_memory'"
         ).fetchone():
@@ -481,11 +482,11 @@ class MemoryStorage:
             )
 
     def _drop_legacy_qa_search_index(self) -> None:
-        """Remove the retired full-text virtual table from existing databases."""
+        """从已有数据库中移除已停用的全文检索虚拟表。"""
         self.connection.execute("DROP TABLE IF EXISTS qa_memory_fts")
 
     def _ensure_qa_fts_index(self) -> None:
-        """Create and backfill the QA full-text index, with transactional triggers."""
+        """创建并回填 QA 全文索引，同时在事务中安装触发器。"""
         try:
             self.connection.executescript(QA_FTS_SCHEMA)
             self.connection.executescript(
@@ -510,7 +511,7 @@ class MemoryStorage:
                 END;
                 """
             )
-            # Rebuilding on startup is idempotent and also repairs indexes left by older runs.
+            # 启动时重建具有幂等性，也可修复旧进程遗留的不完整索引。
             self.connection.execute("DELETE FROM qa_fts")
             self.connection.execute(
                 """
@@ -521,7 +522,7 @@ class MemoryStorage:
                 """
             )
         except sqlite3.OperationalError:
-            # SQLite builds without FTS5 remain usable; the retriever will fall back.
+            # 未启用 FTS5 的 SQLite 仍可使用；检索器会自动退回其他排序方式。
             logger.warning("SQLite FTS5 is unavailable; QA BM25 retrieval is disabled", exc_info=True)
 
     def _normalize_stored_timestamps(self) -> None:
@@ -584,7 +585,7 @@ class MemoryStorage:
         error_message: str = "",
         model: str = "",
     ) -> dict[str, Any]:
-        """Append one topic extraction event to its session/user history row."""
+        """向会话与用户对应的主题抽取历史追加一条记录。"""
         session = str(session_id or "default").strip() or "default"
         user = self.resolve_user_id(user_id)
         now = format_timestamp()
@@ -848,7 +849,7 @@ class MemoryStorage:
         timestamp: str,
         payload: dict[str, Any] | None = None,
     ) -> str:
-        """Persist or coalesce one asynchronous derived-memory job."""
+        """持久化异步记忆派生任务，并合并同一目标的重复任务。"""
         now = format_timestamp(timestamp)
         incoming_payload = dict(payload or {})
         existing = self.connection.execute(
@@ -912,7 +913,7 @@ class MemoryStorage:
         previous: dict[str, Any],
         incoming: dict[str, Any],
     ) -> dict[str, Any]:
-        """Merge coalesced update intent without losing force/status signals."""
+        """合并重复任务的更新意图，同时保留强制执行和状态信号。"""
         merged = {**previous, **incoming}
         for key in ("trace_chat_ids", "trace_add_ids"):
             merged[key] = list(dict.fromkeys(
@@ -942,7 +943,7 @@ class MemoryStorage:
         return merged
 
     def recover_processing_memory_jobs(self) -> int:
-        """Return interrupted jobs to the pending queue after a restart."""
+        """重启后将中断的任务重新放回待处理队列。"""
         cursor = self.connection.execute(
             """
             UPDATE memory_outbox
@@ -973,7 +974,7 @@ class MemoryStorage:
         return jobs
 
     def get_memory_job(self, job_id: str) -> dict[str, Any] | None:
-        """Reload the latest coalesced job state after it has been claimed."""
+        """任务认领后重新读取最新的合并任务状态。"""
         row = self.connection.execute(
             "SELECT * FROM memory_outbox WHERE job_id = ?",
             (job_id,),
@@ -994,7 +995,7 @@ class MemoryStorage:
         memory_type: str,
         memory_id: str,
     ) -> bool:
-        """Return whether an outstanding coalesced job intends to close memory."""
+        """判断尚未完成的合并任务是否要求关闭目标记忆。"""
         row = self.connection.execute(
             """
             SELECT payload_json FROM memory_outbox
@@ -1126,7 +1127,7 @@ class MemoryStorage:
         return [self._row_to_dict(row) for row in rows]
 
     def count_qas_by_segment(self, segment_id: str) -> int:
-        """Count live QA rows without relying on the async Segment projection."""
+        """统计有效 QA 记录数，不依赖异步更新的 Segment 计数。"""
         row = self.connection.execute(
             "SELECT COUNT(*) AS count FROM qa_memory "
             "WHERE segment_id = ? AND status = 'open'",
@@ -1135,7 +1136,7 @@ class MemoryStorage:
         return int(row["count"] if row else 0)
 
     def list_qas_by_segment(self, segment_id: str) -> list[dict[str, Any]]:
-        """Load live QA evidence directly from the normalized relation."""
+        """直接从规范化关系表读取有效 QA 证据。"""
         rows = self.connection.execute(
             """
             SELECT * FROM qa_memory
@@ -1147,7 +1148,7 @@ class MemoryStorage:
         return [self._row_to_dict(row) for row in rows]
 
     def list_unupdated_qas(self, segment: dict[str, Any]) -> list[dict[str, Any]]:
-        """Return QA rows that have not yet been folded into this Segment."""
+        """返回尚未汇总到此 Segment 的 QA 记录。"""
         segment_id = str(segment.get("segment_id") or "")
         marker_id = str(segment.get("last_updated_qa_id") or "")
         if marker_id:
@@ -1273,7 +1274,7 @@ class MemoryStorage:
         )
 
     def update_segment_activity(self, segment: dict[str, Any]) -> None:
-        """Update request-owned Segment fields while preserving derived summary fields."""
+        """更新请求负责的 Segment 字段，同时保留派生摘要字段。"""
         self.connection.execute(
             """
             UPDATE segment_memory SET
@@ -1300,7 +1301,7 @@ class MemoryStorage:
         summarized_qa_count: int | None = None,
         last_updated_qa_id: str | None = None,
     ) -> None:
-        """Apply one aggregate Segment update from normalized QA evidence."""
+        """根据规范化 QA 证据应用一次聚合 Segment 更新。"""
         qa_rows = self.connection.execute(
             """
             SELECT qa_id, timestamp FROM qa_memory
@@ -1375,7 +1376,7 @@ class MemoryStorage:
         status: str,
         updated_at: str,
     ) -> None:
-        """Update derived Segment fields without overwriting concurrently added QA ids."""
+        """更新派生 Segment 字段，同时保留并发新增的 QA ID。"""
         summary_payload = self._segment_summary_payload(summary)
         summarized_ids = [
             str(row["qa_id"])
@@ -1438,7 +1439,7 @@ class MemoryStorage:
         experience_id: str,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
-        """Return recent reusable Segment candidates for write routing."""
+        """返回近期可复用的 Segment 候选项，供写入路由使用。"""
         rows = self.connection.execute(
             """
             SELECT * FROM segment_memory
@@ -1455,7 +1456,7 @@ class MemoryStorage:
         experience_id: str,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
-        """Return recent non-deleted Segments, including switched-away history."""
+        """返回近期未删除的 Segment，包括已切换离开的历史阶段。"""
         rows = self.connection.execute(
             """
             SELECT * FROM segment_memory
@@ -1472,7 +1473,7 @@ class MemoryStorage:
         experience_id: str,
         intent: str,
     ) -> dict[str, Any] | None:
-        """Find the latest historical Segment with the same normalized intent."""
+        """查找规范化意图相同的最近历史 Segment。"""
         row = self.connection.execute(
             """
             SELECT * FROM segment_memory
@@ -1510,7 +1511,7 @@ class MemoryStorage:
     def find_active_experience(
         self, topic: str, core_entity: str
     ) -> dict[str, Any] | None:
-        """Return the latest in-progress Experience with an exact identity match."""
+        """返回身份字段完全匹配的最新进行中 Experience。"""
         row = self.connection.execute(
             """
             SELECT * FROM experience_memory
@@ -1575,7 +1576,7 @@ class MemoryStorage:
         core_entity: str,
         limit: int,
     ) -> list[dict[str, Any]]:
-        """Recall Experience rows by topic/core_entity only."""
+        """仅按主题和核心实体召回 Experience 记录。"""
         topic = str(topic or "").strip()
         core_entity = str(core_entity or "").strip()
         conditions: list[str] = []
@@ -1613,7 +1614,7 @@ class MemoryStorage:
         core_entity: str,
         limit: int,
     ) -> list[dict[str, Any]]:
-        """Recall completed Experiences matching topic, entity, or both."""
+        """召回主题、实体或两者匹配的已完成 Experience。"""
         topic = str(topic or "").strip()
         core_entity = str(core_entity or "").strip()
         conditions: list[str] = []
@@ -1658,7 +1659,7 @@ class MemoryStorage:
         intent: str = "",
         keywords: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Recall QA rows by keywords already stored in structured SQLite fields."""
+        """按 SQLite 结构化字段中已有的关键词召回 QA 记录。"""
         conditions: list[str] = []
         parameters: list[Any] = []
         score_parts: list[str] = []
@@ -1689,7 +1690,7 @@ class MemoryStorage:
             score_parameters.append(intent)
         if normalized_entities:
             placeholders = ", ".join("?" for _ in normalized_entities)
-            # JSON1 membership avoids substring matches in serialized entity data.
+            # 使用 JSON1 数组成员判断，避免在序列化实体数据中发生子串误匹配。
             entity_match = (
                 "EXISTS ("
                 "SELECT 1 FROM json_each("
@@ -1720,11 +1721,11 @@ class MemoryStorage:
     def search_qas_bm25(
         self, *, experience_id: str, query: str, limit: int
     ) -> list[dict[str, Any]]:
-        """Search QA text with FTS5 BM25, scoped to one live Experience."""
+        """在指定的有效 Experience 范围内使用 FTS5 BM25 搜索 QA 文本。"""
         query = str(query or "").strip()
         if not query:
             return []
-        # Quote user text so FTS operators and punctuation cannot alter the query.
+        # 将用户文本作为字面内容查询，避免 FTS 运算符和标点改变查询语义。
         match_query = '"' + query.replace('"', '""') + '"'
         try:
             rows = self.connection.execute(
@@ -1758,7 +1759,7 @@ class MemoryStorage:
         return [self._row_to_dict(row) for row in rows]
 
     def count_segments_by_experience(self, experience_id: str) -> int:
-        """Count live Segment rows without relying on async Experience fields."""
+        """统计有效 Segment 记录数，不依赖异步更新的 Experience 字段。"""
         row = self.connection.execute(
             "SELECT COUNT(*) AS count FROM segment_memory "
             "WHERE experience_id = ? AND status != 'deleted'",
@@ -1862,7 +1863,7 @@ class MemoryStorage:
         )
 
     def update_experience_activity(self, experience: dict[str, Any]) -> None:
-        """Update hierarchy links while preserving async summary/history fields."""
+        """更新层级关系，同时保留异步摘要和历史经验字段。"""
         self.connection.execute(
             """
             UPDATE experience_memory SET
@@ -1893,7 +1894,7 @@ class MemoryStorage:
         last_updated_segment_id: str | None = None,
         last_updated_segment_at: str | None = None,
     ) -> None:
-        """Apply one aggregate Experience update from normalized Segment data."""
+        """根据规范化 Segment 数据应用一次聚合 Experience 更新。"""
         segment_rows = self.connection.execute(
             """
             SELECT segment_id, intent, updated_at FROM segment_memory
@@ -2000,7 +2001,7 @@ class MemoryStorage:
         status: str,
         updated_at: str,
     ) -> None:
-        """Update derived Experience fields without overwriting live hierarchy links."""
+        """更新派生 Experience 字段，同时保留当前层级关系。"""
         summary_payload = self._experience_summary_payload(summary)
         self.connection.execute(
             """
@@ -2034,7 +2035,7 @@ class MemoryStorage:
         history_experience: dict[str, Any] | str,
         updated_at: str,
     ) -> None:
-        """Update recalled history without overwriting concurrent Experience changes."""
+        """更新召回的历史信息，同时保留并发产生的 Experience 修改。"""
         self.connection.execute(
             """
             UPDATE experience_memory SET
@@ -2069,7 +2070,7 @@ class MemoryStorage:
     def list_unupdated_segments(
         self, experience: dict[str, Any]
     ) -> list[dict[str, Any]]:
-        """Return Segments newer than the Experience's last update boundary."""
+        """返回更新时间晚于 Experience 上次更新边界的 Segment。"""
         experience_id = str(experience.get("experience_id") or "")
         marker_id = str(experience.get("last_updated_segment_id") or "")
         marker_at = str(experience.get("last_updated_segment_at") or "")

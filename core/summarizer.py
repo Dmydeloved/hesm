@@ -23,12 +23,12 @@ logger = logging.getLogger(__name__)
 
 class SummarizerProtocol(Protocol):
     def summarize_segment(self, segment: dict[str, Any], qa_items: list[dict[str, Any]]) -> str:
-        """Summarize one segment from its QA evidence."""
+        """根据 QA 证据生成一个 Segment 摘要。"""
 
     def summarize_experience(
         self, experience: dict[str, Any], segments: list[dict[str, Any]]
     ) -> str:
-        """Summarize one experience from its segment evidence."""
+        """根据 Segment 证据生成一个 Experience 摘要。"""
 
 
 def strip_markdown_code_fence(content: str) -> str:
@@ -121,7 +121,7 @@ class TemplateSummarizer:
 
 
 class LLMSummarizer:
-    """OpenAI-compatible summarizer for Segment and Experience memory."""
+    """通过 OpenAI 兼容接口生成 Segment 与 Experience 摘要。"""
 
     def __init__(
         self,

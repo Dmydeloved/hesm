@@ -1,4 +1,4 @@
-"""HESM web server: live memory management, retrieval and static frontend."""
+"""提供 HESM 记忆管理、检索、对话接口及静态前端服务。"""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ CHROMA_PATH = config_path("paths", "chroma")
 
 
 class NoCacheStaticFiles(StaticFiles):
-    """Always return current development assets instead of conditional 304s."""
+    """始终返回当前静态资源，避免条件请求误用旧版 304 缓存。"""
 
     def is_not_modified(self, response_headers: Any, request_headers: Any) -> bool:
         return False
@@ -46,7 +46,7 @@ def _json(value: Any, fallback: Any) -> Any:
 
 
 class MemoryRepository:
-    """Small web-facing repository that keeps management operations auditable."""
+    """面向 Web 管理接口的小型仓储，并保留可审计的操作轨迹。"""
 
     TABLES = {
         "experience": ("experience_memory", "experience_id"),
@@ -286,7 +286,7 @@ class MemoryRepository:
         return self.detail(level, memory_id)
 
     def chat_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Return persisted chat sessions, newest first."""
+        """按时间倒序返回已持久化的聊天会话。"""
         self._ensure_database()
         sessions: dict[str, dict[str, Any]] = {}
         with self._connect() as connection:
@@ -318,7 +318,7 @@ class MemoryRepository:
         return list(sessions.values())[:limit]
 
     def chat_history(self, state_key: str, limit: int = 50) -> dict[str, Any]:
-        """Restore user/assistant messages from chat turns persisted in QA memory."""
+        """从 QA 记忆中保存的聊天轮次恢复用户与助手消息。"""
         self._ensure_database()
         matched: list[dict[str, Any]] = []
         with self._connect() as connection:

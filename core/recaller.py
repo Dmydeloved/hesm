@@ -1,4 +1,4 @@
-"""Historical Experience recall independent from active-memory retrieval."""
+"""独立于当前记忆检索流程召回可复用的历史 Experience。"""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class ExperienceRecaller:
-    """Recall and compress historical Experiences from SQLite and Chroma."""
+    """从 SQLite 和 Chroma 召回并压缩历史 Experience。"""
 
     def __init__(
         self,
@@ -37,7 +37,7 @@ class ExperienceRecaller:
         query: str,
         intent: str = "",
     ) -> dict[str, Any]:
-        """Compress deduplicated SQL/Chroma Experience summaries with an LLM."""
+        """使用语言模型压缩去重后的 SQL/Chroma Experience 摘要。"""
         started_at = time.perf_counter()
         topic = str(topic or "").strip()
         core_entity = str(core_entity or "").strip()

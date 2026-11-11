@@ -1,4 +1,4 @@
-"""Public HESM application service for memory ingestion and retrieval."""
+"""封装 HESM 记忆写入、检索、对话与后台派生任务。"""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 class HESMService:
-    """Own all production HESM components behind two public operations."""
+    """组装并管理生产 HESM 服务所需的全部组件。"""
 
     def __init__(
         self,
@@ -185,8 +185,8 @@ class HESMService:
         self._worker_storage: MemoryStorage | None = None
         self.derivation_worker: MemoryDerivationWorker | None = None
         if bool(management_config.get("async_derivation", True)):
-            # The worker owns a separate SQLite connection and lock so slow LLM/
-            # embedding calls never block the request-side critical section.
+            # 后台 worker 使用独立 SQLite 连接和锁，避免缓慢的模型调用
+            # 长时间占用请求侧的临界区。
             self._worker_storage = MemoryStorage(
                 database_path,
                 check_same_thread=False,
@@ -259,7 +259,7 @@ class HESMService:
         user_id: str | None = None,
         record_topic_history: bool = True,
     ) -> dict[str, Any]:
-        """Extract and persist one interaction into hierarchical memory."""
+        """抽取一条交互的信息并写入分层记忆。"""
         text = str(user_input).strip()
         if not text:
             raise ValueError("user_input must not be empty")
@@ -273,12 +273,14 @@ class HESMService:
             user_input=text,
             assistant_output=str(assistant_output or ""),
         )
+        # 先创建 Add 轨迹，再执行抽取和写入；后续派生任务都能回链到这次用户操作。
         started_at = time.perf_counter()
         extraction_ms = 0.0
         try:
             with self._lock:
                 extracted = topic_result
                 if extracted is None:
+                    # 普通 Add 在这里抽取主题；聊天链路传入已有抽取结果，避免同一输入重复调用模型。
                     extraction_started_at = time.perf_counter()
                     extracted = self.extractor.extract(
                         user_input=text,
@@ -293,6 +295,8 @@ class HESMService:
                 topic_results = extracted if isinstance(extracted, list) else [extracted]
                 if not topic_results or not all(isinstance(item, dict) for item in topic_results):
                     raise ValueError("Topic extraction returned no valid records")
+                # 多个候选分别落成 QA，但共享同一条 Add 轨迹以保留一次操作的完整归属。
+                # Chat 已在抽取阶段记过历史，因此通过 record_topic_history=False 避免重复追加。
                 if record_topic_history:
                     self.storage.append_topic_extraction_history(
                         session_id=state_key,
@@ -308,6 +312,7 @@ class HESMService:
                     state_key,
                     json.dumps(topic_results, ensure_ascii=False),
                 )
+                # 将 Chat/Add ID 传入 MemoryManager，供 QA、outbox 和蒸馏轨迹建立关联。
                 self.manager.trace_chat_ids = [chat_id] if chat_id else []
                 self.manager.trace_add_ids = [add_identifier]
                 try:
@@ -324,9 +329,11 @@ class HESMService:
                         for item in topic_results
                     ]
                 finally:
+                    # 这些关联 ID 是本次调用的临时上下文，必须清空以免污染下一条写入。
                     self.manager.trace_chat_ids = []
                     self.manager.trace_add_ids = []
                 self.storage.commit()
+            # 提交后再读取合并后的任务 ID；同目标的多条派生请求可能已合并为一个 outbox 项。
             job_ids = []
             for memory in memories:
                 job_id = self.storage.get_memory_job_id(
@@ -364,6 +371,7 @@ class HESMService:
             )
             raise
         if self.derivation_worker is not None:
+            # 只在数据库事务成功提交后唤醒 worker，避免它读到未提交的记忆状态。
             self.derivation_worker.notify()
         logger.info(
             "Add memory completed state_key=%s memory_count=%s memories=%s",
@@ -404,6 +412,7 @@ class HESMService:
         retriever_id = self.traces.start_retriever(text)
         try:
             if topic_result is None:
+                # 查询时抽取检索特征，但不会写入 QA 或创建 Experience。
                 extraction_started_at = time.perf_counter()
                 extracted = self.extractor.extract(
                     user_input=text,
@@ -423,6 +432,7 @@ class HESMService:
             candidates = extracted if isinstance(extracted, list) else [extracted]
             if not candidates or not all(isinstance(item, dict) for item in candidates):
                 raise ValueError("Topic extraction returned no valid query")
+            # 保存抽取历史用于后续会话消歧；检索本身仍由只读 Retriever 执行。
             self.storage.append_topic_extraction_history(
                 session_id=session_identifier,
                 user_id=user_id,
@@ -452,6 +462,7 @@ class HESMService:
                 ),
             }
             if isinstance(self.retriever, HybridRetriever):
+                # 主候选用于审计与兼容入口；HybridRetriever 还可比较其他抽取候选的路由结果。
                 retrieval_arguments["query_candidates"] = [
                     item for item in candidates if isinstance(item, dict)
                 ]
@@ -484,6 +495,7 @@ class HESMService:
                 status="completed",
             )
         except Exception as error:
+            # 失败轨迹保留已完成的抽取信息和错误原因，便于区分模型失败与检索失败。
             self.traces.update_retriever(retriever_id, status="failed", error_message=str(error), elapsed_ms=round((time.perf_counter() - started_at) * 1000, 3))
             raise
         total_ms = round((time.perf_counter() - started_at) * 1000, 3)
@@ -514,7 +526,7 @@ class HESMService:
         session_id: str | None = None,
         user_id: str | None = None,
     ) -> dict[str, Any]:
-        """Retrieve memory, answer the user, then persist the complete turn."""
+        """检索相关记忆、生成回答，并持久化完整对话轮次。"""
         final_result: dict[str, Any] | None = None
         for event in self.chat_events(
             message=message,
@@ -538,9 +550,10 @@ class HESMService:
         session_id: str | None = None,
         user_id: str | None = None,
     ) -> Iterator[dict[str, Any]]:
-        """Persist each emitted milestone so a turn can be opened again later."""
+        """持久化每个处理里程碑，便于之后重新查看整轮对话。"""
         identifier = str(session_id or state_key or "web_chat")
         user_identifier = self.storage.resolve_user_id(user_id)
+        # 一开始便分配 Chat、Retriever、Add 三个相互关联的轨迹 ID，后续阶段逐步补齐各自结果。
         trajectory = self.traces.start(identifier, str(message).strip())
         chat_id = trajectory["chat_id"]
         finished = False
@@ -554,6 +567,7 @@ class HESMService:
                 event = {**event, "chat_id": chat_id}
                 if event.get("event") == "final":
                     result = event.get("result") or {}
+                    # 只有完整结果生成后才标记完成；下游断开会在 finally 中记为中断。
                     self.traces.finish_chat(
                         chat_id,
                         status="completed",
@@ -570,6 +584,7 @@ class HESMService:
             raise
         finally:
             if not finished:
+                # 流式客户端可能在任一阶段关闭连接，此时生成器结束但 Chat 尚未完成。
                 self.traces.finish_chat(chat_id, status="interrupted")
 
     def _chat_events_impl(
@@ -584,7 +599,7 @@ class HESMService:
         retriever_id: str,
         add_id: str,
     ) -> Iterator[dict[str, Any]]:
-        """Yield real chat processing milestones as each backend stage completes."""
+        """在各后端阶段完成时实时产出聊天处理里程碑。"""
         text = str(message).strip()
         if not text:
             raise ValueError("message must not be empty")
@@ -596,6 +611,7 @@ class HESMService:
             text,
         )
         session = self.sessions.ensure(session_identifier)
+        # 优先使用服务端已持久化的会话历史；仅在服务端没有历史时才补入客户端传来的 history。
         recent_turns = self._recent_session_turns(
             session.get("messages") or [], {}, limit=5
         )
@@ -616,6 +632,7 @@ class HESMService:
             "session_id": session_identifier,
             "history_turn_count": len(recent_turns),
         }
+        # 从抽取到写回在同一把锁内串行执行，避免共享 SQLite 连接和运行时指针交错。
         with self._lock:
             yield {
                 "event": "stage_started",
@@ -638,6 +655,7 @@ class HESMService:
             if not candidates or not isinstance(candidates[0], dict):
                 raise ValueError("Topic extraction returned no valid query")
             primary = candidates[0]
+            # 同一轮只用主候选完成路由，并把全部候选写入抽取历史供后续上下文参考。
             self.storage.append_topic_extraction_history(
                 session_id=session_identifier,
                 user_id=user_id,
@@ -722,6 +740,7 @@ class HESMService:
 
             yield {"event": "stage_started", "stage": "prompt"}
             prompt_started_at = time.perf_counter()
+            # Prompt 只组合当前问题与检索得到的 HESM 上下文；历史对话已在抽取阶段用于生成路由特征。
             prompt = build_chat_prompt(
                 question=text,
                 memory_context=retrieval_result.get("context") or "",
@@ -775,6 +794,7 @@ class HESMService:
 
             yield {"event": "stage_started", "stage": "store"}
             storage_started_at = time.perf_counter()
+            # 把检索阶段的抽取结果原样传给 Add，确保回答和记忆写入使用相同的主题、意图与实体标签。
             stored = self.add_memory(
                 user_input=text,
                 assistant_output=answer,
@@ -804,6 +824,7 @@ class HESMService:
             }
 
         total_ms = round((time.perf_counter() - total_started_at) * 1000, 3)
+        # 响应组装耗时按总时长扣除抽取与检索；生成、Prompt 和写入耗时单独返回。
         retrieval_result["timing"] = {
             **retrieval_result.get("timing", {}),
             "response_assembly_ms": round(
@@ -873,7 +894,7 @@ class HESMService:
         *,
         additional_context: str = "",
     ) -> str:
-        """Build extraction context from the dedicated five-turn history."""
+        """根据专用的最近五轮历史构造主题抽取上下文。"""
         session = self.sessions.get(state_key, required=False) or {}
         recent = self._recent_session_turns(session.get("messages") or [], {}, limit=5)
         payload: dict[str, Any] = {"recent_chat_history": recent}
@@ -888,7 +909,7 @@ class HESMService:
         *,
         limit: int = 5,
     ) -> list[dict[str, str]]:
-        """Return the most recent user/assistant turns from a saved session."""
+        """从已保存的会话中返回最近的用户与助手轮次。"""
         turns: list[dict[str, str]] = []
         pending: dict[str, str] | None = None
         for message in messages:

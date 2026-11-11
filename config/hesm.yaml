@@ -1,4 +1,4 @@
-# paths:
+# 默认路径示例：
 #   memory_db: memory/hesm.sqlite3
 #   chroma: memory/chroma
 
@@ -30,13 +30,13 @@ embedding: &embedding_defaults
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 
 retrieval:
-  # Completed-Experience recall only: SQLite relation path + Chroma path.
+  # 仅召回已完成的 Experience：结合 SQLite 关系路径与 Chroma 向量路径。
   experience_vector_recall_limit: 12
   experience_relational_recall_limit: 12
   experience_similarity_threshold: 0.82
-  # Vector-route ambiguity; route misses return no results.
+  # 用于识别向量路由歧义；未命中时返回空结果。
   experience_route_margin: 0.05
-  # Rerank QA under a matched Experience with dense vectors + SQLite FTS5 BM25.
+  # 在匹配的 Experience 内结合稠密向量与 SQLite FTS5 BM25 重排 QA。
   experience_qa_hybrid_enabled: false
   qa_rrf_constant: 60
   qa_dense_candidate_limit: 30
@@ -49,14 +49,14 @@ chat: *nano_llm
 
 memory_management:
   segment_qa_threshold: 5
-  # Summarize Experience after this many not-yet-consumed Segment updates.
+  # 累积达到此数量的未消费 Segment 更新后，生成 Experience 摘要。
   experience_segment_threshold: 2
   experience_similarity_threshold: 0.82
-  # Segment write routing uses semantic consistency, not a minimum-size bypass.
+  # Segment 写入按语义一致性路由，不因记录数量不足而绕过判断。
   segment_similarity_threshold: 0.8
   segment_route_margin: 0.1
   segment_route_window: 5
-  # QA vectors stay synchronous; aggregate parent updates and vectors use outbox.
+  # QA 向量仍同步写入；父级摘要更新和向量写入通过 outbox 异步处理。
   async_derivation: true
   async_poll_interval: 0.5
   async_batch_size: 8
@@ -64,6 +64,6 @@ memory_management:
 
 api:
   top_experience: 1
-  # Maximum QA records returned by experience scoped retrieval.
+  # Experience 范围检索最多返回的 QA 记录数。
   top_segment: 2
   top_qa: 4

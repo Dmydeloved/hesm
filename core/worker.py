@@ -1,4 +1,4 @@
-"""Persistent background processing for summaries and parent-memory vectors."""
+"""在后台持久处理摘要、历史召回和父级记忆向量任务。"""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryDerivationWorker:
-    """Drain idempotent outbox jobs without extending request latency."""
+    """幂等消费 outbox 任务，避免派生计算延长请求响应时间。"""
 
     def __init__(
         self,
@@ -71,7 +71,7 @@ class MemoryDerivationWorker:
             self._wake.clear()
 
     def drain_once(self) -> int:
-        """Process one snapshot of pending jobs and return the attempted count."""
+        """处理一批待执行任务，并返回本轮尝试处理的任务数。"""
         with self.lock:
             jobs = self.storage.list_pending_memory_jobs(self.batch_size)
         for job in jobs:
@@ -124,8 +124,7 @@ class MemoryDerivationWorker:
                         elapsed_ms=float(trace.get("elapsed_ms") or 0) if should_distill else 0,
                         status="completed" if should_distill else "skipped",
                         skip_reason="threshold_not_reached" if not should_distill else "",
-                        # Keep the trace update in the same SQLite transaction as
-                        # the derived memory changes and outbox completion.
+                        # 轨迹状态、派生记忆和 outbox 完成标记在同一 SQLite 事务中提交。
                         connection=self.storage.connection,
                     )
                 self.storage.mark_memory_job_completed(
@@ -144,8 +143,7 @@ class MemoryDerivationWorker:
                     max_retries=self.max_retries,
                 )
                 self.storage.commit()
-            # If preparation failed before start_update(), still persist a
-            # failed operation row for this claimed Segment/Experience update.
+            # 若任务在 start_update() 前失败，也要保存阶段或经验更新的失败轨迹。
             if (
                 claimed
                 and is_update

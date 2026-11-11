@@ -1,0 +1,51 @@
+# 生产配置模板：复制到仓库外部并填入真实凭据。
+identity:
+  default_user_id: default
+
+paths:
+  memory_db: memory/hesm.sqlite3
+  chroma: memory/chroma
+
+# 主题抽取与摘要共用一个 OpenAI 兼容接口配置。
+_model_provider: &model_provider
+  api_key: REPLACE_WITH_SECRET
+  base_url: https://api.openai.com/v1
+  model: REPLACE_WITH_MODEL
+  max_retries: 3
+  retry_delay: 2.0
+
+topic_extraction: *model_provider
+summarization: *model_provider
+chat: *model_provider
+
+embedding:
+  api_key: REPLACE_WITH_SECRET
+  base_url: https://api.openai.com/v1
+  model: REPLACE_WITH_EMBEDDING_MODEL
+
+retrieval:
+  experience_vector_recall_limit: 12
+  experience_relational_recall_limit: 12
+  experience_similarity_threshold: 0.82
+  experience_route_margin: 0.05
+  experience_qa_hybrid_enabled: false
+  qa_rrf_constant: 60
+  qa_dense_candidate_limit: 30
+  qa_bm25_candidate_limit: 30
+
+memory_management:
+  segment_qa_threshold: 5
+  experience_segment_threshold: 2
+  experience_similarity_threshold: 0.82
+  segment_similarity_threshold: 0.8
+  segment_route_margin: 0.1
+  segment_route_window: 5
+  async_derivation: true
+  async_poll_interval: 0.5
+  async_batch_size: 8
+  async_max_retries: 3
+
+api:
+  top_experience: 1
+  top_segment: 2
+  top_qa: 4

@@ -1,3 +1,5 @@
+"""配置带日期轮转和保留期限的 HESM 日志输出。"""
+
 from __future__ import annotations
 
 import logging
@@ -16,7 +18,7 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 class DailyFileHandler(logging.FileHandler):
-    """Write directly to a date-named file and switch files at midnight."""
+    """将日志写入按日期命名的文件，并在日期变化时切换文件。"""
 
     def __init__(
         self,
@@ -71,7 +73,7 @@ def configure_logging(
     level: int = logging.INFO,
     console: bool = True,
 ) -> Path:
-    """Configure HESM logging with daily file rotation."""
+    """配置 HESM 日志格式、控制台输出和按日轮转。"""
     target_dir = Path(log_dir).expanduser() if log_dir else DEFAULT_LOG_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     log_file = _dated_log_file(target_dir)

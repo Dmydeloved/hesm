@@ -1,4 +1,4 @@
-"""Prompt construction and OpenAI-compatible answer generation for HESM chat."""
+"""构造记忆问答提示词，并调用兼容 OpenAI 接口的回答模型。"""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ def build_chat_prompt(
     memory_context: str,
 ) -> str:
     """仅使用检索内容作为回答模型的历史上下文。"""
+    # 将长期记忆与系统规则、当前问题分区，避免把记忆文本当成可执行指令或覆盖系统规则。
     return f"""# 系统要求
 
 {SYSTEM_INSTRUCTION}
@@ -40,7 +41,7 @@ def build_chat_prompt(
 
 
 class LLMAnswerer:
-    """Generate a final response through an OpenAI-compatible chat endpoint."""
+    """调用兼容 OpenAI 的聊天接口生成最终回答。"""
 
     def __init__(
         self,
@@ -96,6 +97,7 @@ class LLMAnswerer:
                     exc_info=True,
                 )
                 if attempt < self.max_retries:
+                    # 按尝试次数递增等待，限制短暂模型服务故障带来的连续重试压力。
                     time.sleep(self.retry_delay * attempt)
         logger.error(
             "Chat answer generation failed after retries model=%s attempts=%s error=%s",
