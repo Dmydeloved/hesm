@@ -136,44 +136,19 @@ class HESMService:
             ),
             experience_recaller=self.recaller,
         )
-        if retriever_class is None:
-            self.retriever = HybridRetriever(
-                manager=self.manager,
-                segment_limit=int(self.api_config.get("top_segment", 2)),
-                qa_limit=int(self.api_config.get("top_qa", 5)),
-                experience_route_margin=float(
-                    retrieval_config.get("experience_route_margin", 0.05)
-                ),
-                experience_qa_hybrid_enabled=bool(
-                    retrieval_config.get("experience_qa_hybrid_enabled", False)
-                ),
-                qa_rrf_constant=int(retrieval_config.get("qa_rrf_constant", 60)),
-                qa_dense_candidate_limit=int(
-                    retrieval_config.get("qa_dense_candidate_limit", 30)
-                ),
-                qa_bm25_candidate_limit=int(
-                    retrieval_config.get("qa_bm25_candidate_limit", 30)
-                ),
-            )
-        else:
-            self.retriever = retriever_class(
-                manager=self.manager,
-                segment_limit=int(self.api_config.get("top_segment", 2)),
-                qa_limit=int(self.api_config.get("top_qa", 5)),
-                experience_route_margin=float(
-                    retrieval_config.get("experience_route_margin", 0.05)
-                ),
-                experience_qa_hybrid_enabled=bool(
-                    retrieval_config.get("experience_qa_hybrid_enabled", False)
-                ),
-                qa_rrf_constant=int(retrieval_config.get("qa_rrf_constant", 60)),
-                qa_dense_candidate_limit=int(
-                    retrieval_config.get("qa_dense_candidate_limit", 30)
-                ),
-                qa_bm25_candidate_limit=int(
-                    retrieval_config.get("qa_bm25_candidate_limit", 30)
-                ),
-            )
+        retriever_type = retriever_class or HybridRetriever
+        self.retriever = retriever_type(
+            manager=self.manager,
+            qa_limit=int(self.api_config.get("top_qa", 5)),
+            qa_rrf_constant=int(retrieval_config.get("qa_rrf_constant", 60)),
+            qa_dense_candidate_limit=int(retrieval_config.get("qa_dense_candidate_limit", 30)),
+            qa_bm25_candidate_limit=int(retrieval_config.get("qa_bm25_candidate_limit", 30)),
+            qa_similarity_threshold=float(retrieval_config.get("qa_similarity_threshold", 0.0)),
+            segment_candidate_limit=int(retrieval_config.get("segment_candidate_limit", 30)),
+            experience_candidate_limit=int(retrieval_config.get("experience_candidate_limit", 20)),
+            recent_qa_limit=int(retrieval_config.get("recent_qa_limit", 10)),
+            experience_qa_candidate_limit=int(retrieval_config.get("experience_qa_candidate_limit", 100)),
+        )
         self.answerer = LLMAnswerer(
             api_key=str(chat_config.get("api_key") or ""),
             model=str(chat_config.get("model") or ""),
@@ -396,13 +371,9 @@ class HESMService:
         user_id: str | None = None,
         extraction_context: str = "",
         topic_result: dict[str, Any] | list[dict[str, Any]] | None = None,
+        model: str = "default",
     ) -> dict[str, Any]:
-        """Retrieve a bounded hierarchical memory tree.
-
-        ``topic_result`` is an evaluation hook: when supplied, the stored
-        topic/entity records are used verbatim and query-time topic extraction
-        is skipped.  The retriever itself is unchanged.
-        """
+        """抽取查询特征并检索记忆，评测可直接提供已存储的抽取结果。"""
         text = str(question).strip()
         if not text:
             raise ValueError("question must not be empty")
@@ -450,25 +421,15 @@ class HESMService:
                 json.dumps(primary, ensure_ascii=False),
             )
             retrieval_started_at = time.perf_counter()
-            retrieval_arguments = {
-                "topic": str(primary.get("topic") or ""),
-                "core_entity": str(primary.get("core_entity") or ""),
-                "query": text,
-                "intent": str(primary.get("intent") or ""),
-                "state_key": state_key,
-                "entities": [str(item) for item in primary.get("entities") or []],
-                "target_experience_id": str(
-                    primary.get("_target_experience_id") or ""
-                ),
-            }
-            if isinstance(self.retriever, HybridRetriever):
-                # 主候选用于审计与兼容入口；HybridRetriever 还可比较其他抽取候选的路由结果。
-                retrieval_arguments["query_candidates"] = [
-                    item for item in candidates if isinstance(item, dict)
-                ]
             result = self.retriever.retriever(
-                **retrieval_arguments,
+                topic=str(primary.get("topic") or ""),
+                core_entity=str(primary.get("core_entity") or ""),
+                query=text,
+                intent=str(primary.get("intent") or ""),
+                entities=[str(item) for item in primary.get("entities") or []],
+                model=model,
             )
+            print(f"result:{json.dumps(result,ensure_ascii=False,indent=2)}")
             retrieval_ms = round(
                 (time.perf_counter() - retrieval_started_at) * 1000, 3
             )
@@ -694,7 +655,6 @@ class HESMService:
                 core_entity=str(primary.get("core_entity") or ""),
                 query=text,
                 intent=str(primary.get("intent") or ""),
-                state_key=session_identifier,
                 entities=[str(item) for item in primary.get("entities") or []],
             )
             timings["retrieval_ms"] = round(

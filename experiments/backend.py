@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from core.retriever import ReadOnlyHybridRetriever
+from core.retriever import HybridRetriever
 from service.hesm_service import HESMService
 
 
@@ -125,7 +125,7 @@ class EvaluationBackend:
         service = HESMService(
             config_data=self.settings["native_config"],
             storage_root=user_root,
-            retriever_class=ReadOnlyHybridRetriever,
+            retriever_class=HybridRetriever,
         )
         with self._registry_lock:
             self._services[user_hash] = service
@@ -317,7 +317,7 @@ class EvaluationBackend:
                 placeholders = ",".join("?" for _ in evidence_keys)
                 rows = connection.execute(
                     f"""
-                    SELECT q.source_id, e.experience_id, e.topic, e.core_entity,
+                    SELECT q.source_id, e.topic, e.core_entity,
                            q.intent, q.entities_json, q.confidence, q.reason
                     FROM qa_memory q
                     JOIN segment_memory s ON s.segment_id = q.segment_id
@@ -341,7 +341,6 @@ class EvaluationBackend:
                     "core_entity": core_entity,
                     "intent": row["intent"],
                     "entities": entities,
-                    "_target_experience_id": row["experience_id"],
                     "confidence": row["confidence"],
                     "reasoning": row["reason"],
                 }

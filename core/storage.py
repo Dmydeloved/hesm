@@ -6,6 +6,8 @@ import json
 import logging
 import sqlite3
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -183,7 +185,7 @@ class MemoryStorage:
         db_path: str | Path,
         *,
         read_only: bool = False,
-        check_same_thread: bool = True,
+        check_same_thread: bool = False,
         default_user_id: str = "default",
     ) -> None:
         self.db_path = Path(db_path)
@@ -193,7 +195,7 @@ class MemoryStorage:
             if not self.db_path.exists():
                 raise FileNotFoundError(f"Memory database not found: {self.db_path}")
             self.connection = sqlite3.connect(
-                f"file:{self.db_path.resolve().as_posix()}?mode=ro",
+                f"{self.db_path.resolve().as_uri()}?mode=ro",
                 uri=True,
                 check_same_thread=check_same_thread,
             )
@@ -568,6 +570,19 @@ class MemoryStorage:
 
     def close(self) -> None:
         self.connection.close()
+
+    @contextmanager
+    def retrieval_reader(self) -> Iterator[MemoryStorage]:
+        """为每条召回路径提供独立的只读连接。"""
+        if self.db_path == Path(":memory:"):
+            yield self
+            return
+        reader = MemoryStorage(self.db_path, read_only=True)
+        try:
+            reader.connection.execute("BEGIN")
+            yield reader
+        finally:
+            reader.close()
 
     def resolve_user_id(self, user_id: str | None = None) -> str:
         return str(user_id or self.default_user_id).strip() or self.default_user_id
@@ -1527,6 +1542,72 @@ class MemoryStorage:
         ).fetchone()
         return self._row_to_dict(row)
 
+    def search_experiences_by_topic_entity(
+        self, topic: str, core_entity: str, entities: list[str] | None = None, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """按主题或实体匹配有效 Experience，优先返回主题与核心实体同时匹配的记录。"""
+        topic = str(topic or "").strip()
+        core_entity = str(core_entity or "").strip()
+        entities = [str(value).strip() for value in (entities or []) if str(value).strip()]
+        clauses: list[str] = []
+        params: list[Any] = []
+        if topic:
+            clauses.append("lower(trim(topic)) = lower(trim(?))")
+            params.append(topic)
+        if core_entity:
+            clauses.append("lower(trim(core_entity)) = lower(trim(?))")
+            params.append(core_entity)
+        if entities:
+            clauses.append("lower(trim(core_entity)) IN (" + ",".join("lower(trim(?))" for _ in entities) + ")")
+            params.extend(entities)
+        if not clauses:
+            return []
+        rows = self.connection.execute(
+            f"""
+            SELECT * FROM experience_memory
+            WHERE status != 'deleted' AND ({" OR ".join(clauses)})
+            ORDER BY CASE WHEN lower(trim(topic)) = lower(?)
+                                AND lower(trim(core_entity)) = lower(?) THEN 0 ELSE 1 END,
+                     updated_at DESC, experience_id
+            LIMIT ?
+            """,
+            (*params, topic, core_entity, max(1, int(limit))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def search_segments_by_intent(self, intent: str, limit: int = 30) -> list[dict[str, Any]]:
+        """按意图标签查询有效 Segment。"""
+        intent = str(intent or "").strip()
+        if not intent:
+            return []
+        rows = self.connection.execute(
+            """
+            SELECT s.* FROM segment_memory s
+            JOIN experience_memory e ON e.experience_id = s.experience_id
+            WHERE s.status != 'deleted' AND e.status != 'deleted'
+              AND lower(trim(s.intent)) = lower(?)
+            ORDER BY s.updated_at DESC, s.segment_id
+            LIMIT ?
+            """,
+            (intent, max(1, int(limit))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def list_recent_qas(self, limit: int = 10) -> list[dict[str, Any]]:
+        """按交互时间查询最近的有效 QA。"""
+        rows = self.connection.execute(
+            """
+            SELECT q.* FROM qa_memory q
+            JOIN segment_memory s ON s.segment_id = q.segment_id
+            JOIN experience_memory e ON e.experience_id = s.experience_id
+            WHERE q.status = 'open' AND s.status != 'deleted' AND e.status != 'deleted'
+            ORDER BY q.timestamp DESC, q.qa_id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
     def find_experience_by_topic(self, topic: str) -> dict[str, Any] | None:
         """topic 精确匹配回退查询（向量检索嵌入失败时使用）。
         不依赖 core_entity，避免同一主题不同说话人造成匹配失败。
@@ -2108,17 +2189,23 @@ class MemoryStorage:
         return [self._row_to_dict(row) for row in rows]
 
     def list_qas_by_segment_ids(
-        self, segment_ids: list[str]
+        self, segment_ids: list[str], *, limit: int = -1
     ) -> list[dict[str, Any]]:
+        """批量展开有效 Segment 的 QA，优先保留较新的交互。"""
         if not segment_ids:
             return []
         placeholders = ", ".join("?" for _ in segment_ids)
         rows = self.connection.execute(
             f"""
-            SELECT * FROM qa_memory
-            WHERE segment_id IN ({placeholders}) AND status = 'open'
+            SELECT q.* FROM qa_memory q
+            JOIN segment_memory s ON s.segment_id = q.segment_id
+            JOIN experience_memory e ON e.experience_id = s.experience_id
+            WHERE q.segment_id IN ({placeholders}) AND q.status = 'open'
+              AND s.status != 'deleted' AND e.status != 'deleted'
+            ORDER BY q.timestamp DESC, q.qa_id DESC
+            LIMIT ?
             """,
-            segment_ids,
+            (*segment_ids, limit),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 

@@ -28,10 +28,12 @@ retrieval:
   experience_relational_recall_limit: 12
   experience_similarity_threshold: 0.82
   experience_route_margin: 0.05
-  experience_qa_hybrid_enabled: false
   qa_rrf_constant: 60
   qa_dense_candidate_limit: 30
   qa_bm25_candidate_limit: 30
+  segment_candidate_limit: 30
+  experience_candidate_limit: 20
+  recent_qa_limit: 10
 
 memory_management:
   segment_qa_threshold: 5

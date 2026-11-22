@@ -374,7 +374,10 @@ class MemoryAddRequest(BaseModel):
 
 class RetrievalRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2_000, description="当前检索问题；用于抽取查询主题并查找相关记忆。")
-    state_key: str = Field(default="default", min_length=1, max_length=200, description="记忆路由状态键；用于优先检查该上下文当前指向的 Experience。")
+    model: Literal["default", "no_topic", "no_intent", "no_time"] = Field(
+        default="default", description="检索模式。default 启用三路，其余模式分别关闭主题、意图或近期时间路径。"
+    )
+    state_key: str = Field(default="default", min_length=1, max_length=200, description="主题抽取使用的会话上下文键。")
     session_id: str | None = Field(default=None, min_length=1, max_length=200, description="会话标识；用于保存检索主题抽取历史，缺省时沿用 state_key。")
     user_id: str | None = Field(default=None, min_length=1, max_length=200, description="用户标识；用于隔离主题抽取历史，缺省时使用默认用户。")
 

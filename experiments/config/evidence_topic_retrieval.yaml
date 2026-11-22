@@ -45,7 +45,6 @@ retrieval:
   experience_route_margin: 0.05
   qa_candidate_limit: 40
   qa_similarity_threshold: 0.45
-  experience_qa_hybrid_enabled: true
   qa_rrf_constant: 60
   qa_dense_candidate_limit: 30
   qa_bm25_candidate_limit: 30

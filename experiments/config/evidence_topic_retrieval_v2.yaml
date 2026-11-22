@@ -1,4 +1,4 @@
-# Isolated v2 evidence-topic experiment with native-LLM fallback.
+# Isolated v2 LoCoMo experiment and storage profile.
 schema_version: 2
 experiment:
   profile: native_hesm_evidence_topic_v2
@@ -8,11 +8,8 @@ experiment:
   api_token: "${HESM_EVAL_TOKEN}"
   max_top_k: 100
   outbox_settle_timeout_seconds: 3600
-  require_evidence: true
-  # Switch to "llm" to always use HESM's native topic extractor.
-  # "evidence_topic_lookup" uses only the first evidence key and falls back
-  # to the native LLM extractor if it is empty, missing, or lookup fails.
-  retrieval_topic_source: evidence_topic_lookup
+  require_evidence: false
+  retrieval_topic_source: llm
 
 paths:
   memory_db: experiments/.runtime/evidence_topic_retrieval_v2/default/hesm.sqlite3
@@ -47,10 +44,14 @@ retrieval:
   experience_route_margin: 0.05
   qa_candidate_limit: 40
   qa_similarity_threshold: 0.45
-  experience_qa_hybrid_enabled: true
   qa_rrf_constant: 60
   qa_dense_candidate_limit: 30
   qa_bm25_candidate_limit: 30
+  # Candidate-pool limits; semantic and keyword QA search run only inside this pool.
+  experience_candidate_limit: 20
+  experience_qa_candidate_limit: 100
+  segment_candidate_limit: 30
+  recent_qa_limit: 10
 
 summarization: *strong_llm
 chat: *nano_llm
@@ -64,6 +65,6 @@ memory_management:
   async_batch_size: 8
   async_max_retries: 3
 api:
-  top_experience: 1
-  top_segment: 2
-  top_qa: 5
+  top_experience: 3
+  top_segment: 5
+  top_qa: 25

@@ -1,26 +1,25 @@
-"""检索当前 Experience 及其最近的下层记忆。"""
+"""并发召回 QA 候选，再在候选池内检索并组装上下文。"""
 
 from __future__ import annotations
 
 import json
 import logging
+import math
+import re
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from .manager import MemoryManager
 
 
 logger = logging.getLogger(__name__)
-
-
-def _experience_status(experience: dict[str, Any]) -> str:
-    if experience.get("status"):
-        return str(experience["status"])
-    state = experience.get("state")
-    return str(state.get("status") or "") if isinstance(state, dict) else ""
+_KEYWORD_PARTS = re.compile(r"[\u3400-\u9fff]+|[^\W\u3400-\u9fff]+")
+_KEYWORD_FIELDS = ("user_input", "assistant_output", "topic", "core_entity", "intent", "entities")
 
 
 def _memory_text(value: Any) -> str:
-    """把结构化记忆转换为可读且稳定的 Prompt 文本。"""
+    """把结构化记忆转换为可读的上下文文本。"""
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return str(value or "")
@@ -31,39 +30,8 @@ def build_context_text(
     segments: list[dict[str, Any]],
     qas: list[dict[str, Any]],
 ) -> str:
-    """根据一个 Experience 及其最近下层记忆构造 Prompt 上下文。"""
-    if not experiences:
-        return "【长期记忆 Experience】\n未找到相关长期记忆。"
-
-    experience = experiences[0]
-    lines = [
-        "【长期记忆 Experience】",
-        f"主题：{experience.get('topic', '')}",
-        f"核心实体：{experience.get('core_entity', '')}",
-        f"状态：{_experience_status(experience)}",
-        f"摘要：{_memory_text(experience.get('summary'))}",
-    ]
-    history = experience.get("history_experience")
-    if isinstance(history, dict) and history:
-        history = history.get("summary") or json.dumps(
-            history, ensure_ascii=False
-        )
-    if str(history or "").strip():
-        lines.append(f"历史经验：{str(history).strip()}")
-
-    lines.append("\n【最近 Segment】")
-    if not segments:
-        lines.append("无。")
-    for index, segment in enumerate(segments, 1):
-        lines.extend(
-            [
-                f"{index}. 意图：{segment.get('intent', '')}",
-                f"   摘要：{_memory_text(segment.get('summary'))}",
-                f"   更新时间：{segment.get('updated_at', '')}",
-            ]
-        )
-
-    lines.append("\n【最近 QA】")
+    """用最终入选的 QA 及其父级摘要构建上下文。"""
+    lines = ["【检索到的 QA 证据】"]
     if not qas:
         lines.append("无。")
     for index, qa in enumerate(qas, 1):
@@ -72,370 +40,297 @@ def build_context_text(
                 f"{index}. 用户：{qa.get('user_input', '')}",
                 f"   助手：{qa.get('assistant_output', '')}",
                 f"   时间：{qa.get('timestamp', '')}",
+                f"   主题/实体/意图：{qa.get('topic', '')} / {qa.get('core_entity', '')} / {qa.get('intent', '')}",
             ]
+        )
+    lines.append("\n【相关阶段背景】")
+    for segment in segments:
+        lines.append(f"- {segment.get('intent', '')}：{_memory_text(segment.get('summary'))}")
+    lines.append("\n【相关长期经历背景】")
+    for experience in experiences:
+        lines.append(
+            f"- {experience.get('topic', '')} / {experience.get('core_entity', '')}"
+            f"；状态：{experience.get('status', '')}；摘要：{_memory_text(experience.get('summary'))}"
         )
     return "\n".join(lines)
 
 
-def build_history_context(history_experience: Any) -> str:
-    """格式化 Experience 保存的历史上下文，兼容旧版字段结构。"""
-    if isinstance(history_experience, (dict, list)):
-        text = json.dumps(history_experience, ensure_ascii=False)
-    else:
-        text = str(history_experience or "").strip()
-    if not text or text in {"{}", "[]"}:
-        text = "未召回可复用的历史经验。"
-    return f"【历史经验】\n{text}"
+def _keyword_tokens(text: str, *, include_cjk_chars: bool) -> list[str]:
+    """中文使用相邻双字组合，其他文本使用空白或标点分隔的词。"""
+    tokens: list[str] = []
+    for part in _KEYWORD_PARTS.findall(text.casefold()):
+        if "\u3400" <= part[0] <= "\u9fff" and len(part) > 1:
+            tokens.extend(part[index:index + 2] for index in range(len(part) - 1))
+            if include_cjk_chars:
+                tokens.extend(part)
+        else:
+            tokens.append(part)
+    return tokens
+
+
+def _rank_keywords(query: str, pool: dict[str, dict[str, Any]], limit: int) -> list[str]:
+    """在 QA 池内计算 BM25，保留至少命中一个关键词的记录。"""
+    terms = set(_keyword_tokens(query, include_cjk_chars=False))
+    if not terms or not pool:
+        return []
+
+    documents = {}
+    document_frequencies: Counter[str] = Counter()
+    total_length = 0
+    for qa_id, qa in pool.items():
+        content = " ".join(_memory_text(qa.get(field)) for field in _KEYWORD_FIELDS)
+        tokens = _keyword_tokens(content, include_cjk_chars=True)
+        frequencies = Counter(token for token in tokens if token in terms)
+        document_frequencies.update(frequencies.keys())
+        documents[qa_id] = (len(tokens), frequencies)
+        total_length += len(tokens)
+
+    if not document_frequencies:
+        return []
+
+    average_length = total_length / len(pool)
+    inverse_frequencies = {
+        term: math.log1p((len(pool) - count + 0.5) / (count + 0.5))
+        for term, count in document_frequencies.items()
+    }
+    k1, b = 1.2, 0.75
+    scores = {}
+    for qa_id, (length, frequencies) in documents.items():
+        if not frequencies:
+            continue
+        length_factor = k1 * (1 - b + b * length / average_length)
+        scores[qa_id] = sum(
+            inverse_frequencies[term] * count * (k1 + 1) / (count + length_factor)
+            for term, count in frequencies.items()
+        )
+
+    return sorted(scores, key=lambda qa_id: (-scores[qa_id], qa_id))[:limit]
 
 
 class HybridRetriever:
-    """只读检索已有记忆；检索阶段绝不创建或更新 Experience。"""
+    """从主题、意图和近期时间三条路径只读检索记忆。"""
 
     def __init__(
         self,
         manager: MemoryManager,
         *,
-        segment_limit: int = 2,
         qa_limit: int = 5,
-        experience_route_margin: float = 0.05,
-        experience_qa_hybrid_enabled: bool = False,
         qa_rrf_constant: int = 60,
         qa_dense_candidate_limit: int = 30,
         qa_bm25_candidate_limit: int = 30,
+        qa_similarity_threshold: float = 0.0,
+        segment_candidate_limit: int = 30,
+        experience_candidate_limit: int = 20,
+        recent_qa_limit: int = 10,
+        experience_qa_candidate_limit: int = 100,
     ) -> None:
         self.manager = manager
         self.storage = manager.storage
-        self.segment_limit = max(1, int(segment_limit))
         self.qa_limit = max(1, int(qa_limit))
-        self.experience_route_margin = max(0.0, float(experience_route_margin))
-        self.experience_qa_hybrid_enabled = bool(experience_qa_hybrid_enabled)
         self.qa_rrf_constant = max(1, int(qa_rrf_constant))
-        self.qa_dense_candidate_limit = max(self.qa_limit, int(qa_dense_candidate_limit))
-        self.qa_bm25_candidate_limit = max(self.qa_limit, int(qa_bm25_candidate_limit))
-
-    def _retrieve_experience_qas(self, experience: dict[str, Any], query: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """使用倒数排名融合合并 Experience 范围内的向量与 FTS5 QA 排名。"""
-        experience_id = str(experience.get("experience_id") or "")
-        ranked_ids: dict[str, dict[str, Any]] = {}
-        try:
-            embedding = self.manager.embedder.embed(query)
-            dense = self.manager.vector_store.query(
-                embedding,
-                memory_type="qa",
-                top_k=self.qa_dense_candidate_limit,
-                metadata_filter={"experience_id": experience_id},
-            )
-        except Exception:
-            logger.warning("Experience-scoped QA vector retrieval failed", exc_info=True)
-            dense = []
-        for rank, item in enumerate(dense, 1):
-            metadata = item.get("metadata") or {}
-            qa_id = str(metadata.get("qa_id") or metadata.get("memory_id") or "")
-            if not qa_id:
-                continue
-            ranked_ids.setdefault(qa_id, {"dense_rank": None, "bm25_rank": None})
-            ranked_ids[qa_id]["dense_rank"] = rank
-            ranked_ids[qa_id]["dense_similarity"] = float(item.get("similarity") or 0.0)
-
-        # FTS5 与向量检索各自可能漏掉同义表达；分别取候选，再用 RRF 合并名次而不混用原始分值。
-        try:
-            bm25 = self.storage.search_qas_bm25(
-                experience_id=experience_id,
-                query=query,
-                limit=self.qa_bm25_candidate_limit,
-            )
-        except Exception:
-            logger.warning("Experience-scoped QA BM25 retrieval failed", exc_info=True)
-            bm25 = []
-        for rank, qa in enumerate(bm25, 1):
-            qa_id = str(qa.get("qa_id") or "")
-            if not qa_id:
-                continue
-            ranked_ids.setdefault(qa_id, {"dense_rank": None, "bm25_rank": None})
-            ranked_ids[qa_id]["bm25_rank"] = rank
-            ranked_ids[qa_id]["bm25_score"] = float(qa.get("bm25_score") or 0.0)
-
-        scores: dict[str, float] = {}
-        for qa_id, item in ranked_ids.items():
-            score = 0.0
-            for rank_key in ("dense_rank", "bm25_rank"):
-                rank = item.get(rank_key)
-                if rank is not None:
-                    score += 1.0 / (self.qa_rrf_constant + int(rank))
-            item["rrf_score"] = score
-            scores[qa_id] = score
-        # RRF 只依赖名次，分值尺度不同的 BM25 和向量相似度因此可以共同排序。
-        ordered_ids = sorted(
-            scores,
-            key=lambda qa_id: (scores[qa_id], str(ranked_ids[qa_id].get("dense_rank") or 10**9), qa_id),
-            reverse=True,
-        )
-        qas_by_id = {
-            str(qa.get("qa_id") or ""): qa
-            for qa in self.storage.get_qas(ordered_ids)
-        }
-        valid_ids = []
-        for qa_id in ordered_ids:
-            qa = qas_by_id.get(qa_id)
-            if not qa or qa.get("status") != "open":
-                continue
-            # 向量索引可能短暂滞后于 SQLite；回查 QA、Segment 和 Experience 关系以剔除失效候选。
-            segment = self.storage.get_segment(str(qa.get("segment_id") or ""))
-            if (
-                segment
-                and segment.get("status") != "deleted"
-                and str(segment.get("experience_id") or "") == experience_id
-            ):
-                valid_ids.append(qa_id)
-        ordered_ids = valid_ids[: self.qa_limit]
-        qas = [qas_by_id[qa_id] for qa_id in ordered_ids]
-        matches = [
-            {
-                "qa_id": qa_id,
-                "experience_id": experience_id,
-                "dense_rank": ranked_ids[qa_id].get("dense_rank"),
-                "bm25_rank": ranked_ids[qa_id].get("bm25_rank"),
-                "dense_similarity": round(float(ranked_ids[qa_id].get("dense_similarity") or 0.0), 6),
-                "bm25_score": ranked_ids[qa_id].get("bm25_score"),
-                "rrf_score": round(scores[qa_id], 8),
-                "channels": [
-                    name for name, key in (("vector", "dense_rank"), ("bm25", "bm25_rank"))
-                    if ranked_ids[qa_id].get(key) is not None
-                ],
-            }
-            for qa_id in ordered_ids
-        ]
-        return qas, matches
-
-    def _route_existing(
-        self,
-        *,
-        state_key: str,
-        topic: str,
-        core_entity: str,
-        query: str = "",
-    ) -> tuple[dict[str, Any] | None, str, float, str]:
-        """按 runtime、SQLite、路由向量的顺序查找已有 Experience。"""
-        runtime = self.storage.get_runtime_state(state_key)
-        current = self.storage.get_experience(
-            runtime.get("current_experience_id") if runtime else None
-        )
-        # 路由优先复用当前指针，再查精确关系记录；这两步不需要向量服务。
-        if self.manager._same_experience(current, topic, core_entity):
-            return current, "runtime", 1.0, ""
-
-        current = self.storage.find_active_experience(topic, core_entity)
-        if current:
-            return current, "sqlite", 1.0, ""
-
-        candidates = self._experience_vector_candidates(topic, core_entity)
-        if not candidates:
-            return None, "no_route", 0.0, "no_vector_candidate"
-
-        current, confidence = candidates[0]
-        threshold = float(self.manager.experience_similarity_threshold)
-        # 向量只给出候选，低置信度或前两名过近都不直接视为命中。
-        if confidence <= threshold:
-            return None, "no_route", confidence, "low_confidence"
-        if len(candidates) > 1:
-            margin = confidence - candidates[1][1]
-            if margin < self.experience_route_margin:
-                selector = getattr(self.manager, "_select_ambiguous_by_goal", None)
-                if selector is None:
-                    current = max(
-                        (item[0] for item in candidates[:2]),
-                        key=lambda item: (
-                            str(item.get("updated_at") or ""),
-                            str(item.get("created_at") or ""),
-                        ),
-                    )
-                else:
-                    current = selector(candidates[:2], query)
-                confidence = next(
-                    score for candidate, score in candidates[:2]
-                    if candidate.get("experience_id") == current.get("experience_id")
-                )
-        return current, "vector", confidence, ""
-
-    def _experience_vector_candidates(
-        self,
-        topic: str,
-        core_entity: str,
-    ) -> list[tuple[dict[str, Any], float]]:
-        query_text = f"主题：{topic}\n核心实体：{core_entity}"
-        try:
-            embedding = self.manager.embedder.embed(query_text)
-            items = self.manager.vector_store.query(
-                embedding,
-                memory_type="experience_route",
-                top_k=5,
-                metadata_filter=None,
-            )
-        except Exception:
-            logger.warning("Experience vector routing failed", exc_info=True)
-            return []
-
-        candidates: list[tuple[dict[str, Any], float]] = []
-        seen: set[str] = set()
-        for item in items:
-            metadata = item.get("metadata") or {}
-            experience_id = str(
-                metadata.get("experience_id")
-                or metadata.get("memory_id")
-                or ""
-            )
-            if not experience_id or experience_id in seen:
-                continue
-            experience = self.storage.get_experience(experience_id)
-            if not experience or experience.get("status") != "open":
-                continue
-            seen.add(experience_id)
-            candidates.append((experience, float(item.get("similarity") or 0.0)))
-        return candidates
+        self.qa_dense_candidate_limit = max(1, int(qa_dense_candidate_limit))
+        self.qa_bm25_candidate_limit = max(1, int(qa_bm25_candidate_limit))
+        self.qa_similarity_threshold = float(qa_similarity_threshold)
+        self.segment_candidate_limit = max(1, int(segment_candidate_limit))
+        self.experience_candidate_limit = max(1, int(experience_candidate_limit))
+        self.recent_qa_limit = max(1, int(recent_qa_limit))
+        self.experience_qa_candidate_limit = max(1, int(experience_qa_candidate_limit))
 
     def retriever(
         self,
         topic: str,
         core_entity: str,
         query: str,
-        intent: str = "",
-        state_key: str = "default",
-        entities: list[str] | None = None,
-        query_candidates: list[dict[str, Any]] | None = None,
-        target_experience_id: str = "",
+        intent: str,
+        entities: list[str] | None,
+        model: str = "default",
     ) -> dict[str, Any]:
-        """在路由到的 Experience 内检索；路由未命中时返回空结果。"""
-        topic = str(topic or "").strip()
-        core_entity = str(core_entity or "").strip()
-        query = str(query or "").strip()
-        intent = str(intent or "").strip() or "查询"
-        if not topic or not core_entity or not query:
-            raise ValueError("topic, core_entity and query must not be empty")
-        route_variants = [(topic, core_entity)]
-        for candidate in query_candidates or []:
-            key = (
-                str(candidate.get("topic") or "").strip(),
-                str(candidate.get("core_entity") or "").strip(),
+        """合并启用路径的 QA，再按关键词和语义名次融合并构建上下文。"""
+        query = query.strip()
+        if not query:
+            raise ValueError("query must not be empty")
+        model = model.strip().lower()
+        if model not in {"default", "no_topic", "no_intent", "no_time"}:
+            raise ValueError("model must be default, no_topic, no_intent, or no_time")
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            topic_future = (
+                executor.submit(self._recall_topic, topic, core_entity, entities)
+                if model != "no_topic" else None
             )
-            if key[0] and key[1] and key not in route_variants:
-                route_variants.append(key)
-        experience = None
-        route_source = "no_route"
-        route_confidence = 0.0
-        fallback_reason = "no_vector_candidate"
-        if target_experience_id:
-            targeted = self.storage.get_experience(str(target_experience_id))
-            if targeted and targeted.get("status") != "deleted":
-                experience = targeted
-                route_source = "evidence_experience"
-                route_confidence = 1.0
-                fallback_reason = ""
-        # 普通问题按主题/实体路由；指定目标仅用于有证据的检索调用，并跳过模糊路由。
-        for route_topic, route_entity in (() if experience else route_variants):
-            routed, source, confidence, reason = self._route_existing(
-                state_key=state_key,
-                topic=route_topic,
-                core_entity=route_entity,
-                query=query,
+            intent_future = (
+                executor.submit(self._recall_intent, intent, query)
+                if model != "no_intent" else None
             )
-            if confidence > route_confidence:
-                route_confidence = confidence
-                fallback_reason = reason
-            if routed is not None:
-                experience = routed
-                route_source = source
-                topic = route_topic
-                core_entity = route_entity
-                break
-        if experience is None:
-            # Retriever 是只读链路：路由未命中时返回空树，不创建“猜测出来”的 Experience。
-            return {
-                "route_status": route_source,
-                "route_confidence": route_confidence,
-                "fallback_reason": fallback_reason,
-                "experiences": [],
-                "segments": [],
-                "qas": [],
-                "history_experience": {},
-                "history_recall": {},
-                "context": "",
+            time_future = (
+                executor.submit(self._recall_recent)
+                if model != "no_time" else None
+            )
+            experience_ids, topic_qas = topic_future.result() if topic_future else ([], [])
+            segment_ids, intent_qas = intent_future.result() if intent_future else ([], [])
+            recent_qas = time_future.result() if time_future else []
+
+        candidate_ids = list(dict.fromkeys(
+            qa["qa_id"]
+            for route in (topic_qas, intent_qas, recent_qas)
+            for qa in route
+        ))
+        with self.storage.retrieval_reader() as reader:
+            candidates = {
+                qa["qa_id"]: qa for qa in reader.get_qas(candidate_ids)
+                if qa["status"] == "open"
             }
+            candidate_segment_ids = list(dict.fromkeys(qa["segment_id"] for qa in candidates.values()))
+            segments = {
+                row["segment_id"]: row
+                for row in reader.get_segments(candidate_segment_ids)
+                if row["status"] != "deleted"
+            }
+            candidate_experience_ids = list(dict.fromkeys(
+                segment["experience_id"] for segment in segments.values()
+            ))
+            experiences = {
+                row["experience_id"]: row
+                for row in reader.get_experiences(candidate_experience_ids)
+                if row["status"] != "deleted"
+            }
+        pool = {}
+        for qa_id in candidate_ids:
+            qa = candidates.get(qa_id)
+            if qa is None:
+                continue
+            segment = segments.get(qa["segment_id"])
+            if segment and segment["experience_id"] in experiences:
+                pool[qa_id] = qa
 
-        if hasattr(self.storage, "list_unupdated_segments"):
-            # 优先取尚未被父级 Experience 摘要吸收的阶段，避免上下文只剩旧摘要。
-            latest_segments = self.storage.list_unupdated_segments(experience)
-        else:
-            latest_segments = self.storage.list_latest_segments(
-                str(experience["experience_id"]),
-                self.segment_limit,
-            )
-        segments = sorted(
-            latest_segments,
-            key=lambda item: (
-                str(item.get("updated_at") or ""),
-                str(item.get("created_at") or ""),
-                str(item.get("segment_id") or ""),
-            ),
-        )
+        keyword_ids = _rank_keywords(query, pool, self.qa_bm25_candidate_limit)
+        semantic_ids = self._rank_semantic(query, pool)
+        final_qas = self._fuse_qas(pool, keyword_ids, semantic_ids)
+        final_segments = [
+            segments[segment_id]
+            for segment_id in dict.fromkeys(qa["segment_id"] for qa in final_qas)
+        ]
+        final_experiences = [
+            experiences[experience_id]
+            for experience_id in dict.fromkeys(segment["experience_id"] for segment in final_segments)
+        ]
 
-        if segments and hasattr(self.storage, "list_unupdated_qas"):
-            latest_qas = []
-            seen_qa_ids: set[str] = set()
-            for segment in segments:
-                for qa in self.storage.list_unupdated_qas(segment):
-                    qa_id = str(qa.get("qa_id") or "")
-                    if qa_id and qa_id not in seen_qa_ids:
-                        seen_qa_ids.add(qa_id)
-                        latest_qas.append(qa)
-        else:
-            segment_ids = [str(segment["segment_id"]) for segment in segments]
-            latest_qas = self.storage.list_latest_qas(segment_ids, self.qa_limit)
-        qas = sorted(
-            latest_qas,
-            key=lambda item: (
-                str(item.get("timestamp") or ""),
-                str(item.get("qa_id") or ""),
-            ),
-        )
-
-        qa_matches: list[dict[str, Any]] = []
-        retrieval_channels: list[str] = []
-        if self.experience_qa_hybrid_enabled:
-            # 开启混合检索后，QA 排名决定最终证据集；再由这些 QA 反查对应 Segment。
-            qas, qa_matches = self._retrieve_experience_qas(experience, query)
-            segment_map: dict[str, dict[str, Any]] = {}
-            for qa in qas:
-                segment_id = str(qa.get("segment_id") or "")
-                if segment_id and segment_id not in segment_map:
-                    segment = self.storage.get_segment(segment_id)
-                    if segment:
-                        segment_map[segment_id] = segment
-            segments = list(segment_map.values())
-            retrieval_channels = sorted(
-                {channel for match in qa_matches for channel in match["channels"]}
-            )
-
-        experiences = [experience]
         return {
-            "route_status": route_source,
-            "route_confidence": route_confidence,
-            "fallback_reason": "",
-            "experiences": experiences,
-            "segments": segments,
-            "qas": qas,
-            **({"qa_matches": qa_matches, "retrieval_channels": retrieval_channels} if self.experience_qa_hybrid_enabled else {}),
-            "history_experience": experience.get("history_experience") or {},
-            "context": build_context_text(experiences, segments, qas),
+            "model": model,
+            "experiences": final_experiences,
+            "segments": final_segments,
+            "qas": final_qas,
+            "context": build_context_text(final_experiences, final_segments, final_qas),
+            "debug": {
+                "topic_experience_ids": experience_ids,
+                "intent_segment_ids": segment_ids,
+                "recent_qa_ids": [qa["qa_id"] for qa in recent_qas],
+                "candidate_qa_ids": list(pool),
+                "candidate_qa_pool": list(pool.values()),
+                "keyword_qa_ids": keyword_ids,
+                "semantic_qa_ids": semantic_ids,
+            },
         }
 
+    def _recall_topic(
+        self, topic: str, core_entity: str, entities: list[str] | None
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        with self.storage.retrieval_reader() as reader:
+            experiences = reader.search_experiences_by_topic_entity(
+                topic, core_entity, entities, self.experience_candidate_limit
+            )
+            experience_ids = [row["experience_id"] for row in experiences]
+            segments = reader.list_segments_by_experience_ids(experience_ids)
+            qas = reader.list_qas_by_segment_ids(
+                [row["segment_id"] for row in segments],
+                limit=self.experience_qa_candidate_limit,
+            )
+        return experience_ids, qas
 
-class ReadOnlyHybridRetriever(HybridRetriever):
-    """兼容旧调用名；所有 HybridRetriever 现在都保证只读。"""
+    def _recall_intent(self, intent: str, query: str) -> tuple[list[str], list[dict[str, Any]]]:
+        """合并意图标签与输入语义命中的 Segment，再展开 QA。"""
+        intent = intent.strip()
+        semantic_query = f"意图：{intent}\n用户输入：{query}" if intent else query
+        semantic_ids = []
+        try:
+            hits = self.manager.vector_store.query(
+                self.manager.embedder.embed(semantic_query),
+                memory_type="segment",
+                top_k=self.segment_candidate_limit,
+                metadata_filter={"status": ["open", "completed"]},
+            )
+            for hit in hits:
+                segment_id = (hit.get("metadata") or {}).get("segment_id")
+                if segment_id and hit["similarity"] > 0:
+                    semantic_ids.append(segment_id)
+        except Exception:
+            logger.warning("意图路径 Segment 语义检索失败", exc_info=True)
 
+        semantic_ids = list(dict.fromkeys(semantic_ids))
+        with self.storage.retrieval_reader() as reader:
+            exact_matches = reader.search_segments_by_intent(intent, self.segment_candidate_limit)
+            semantic_matches = reader.get_segments(semantic_ids)
+            experience_ids = list(dict.fromkeys(segment["experience_id"] for segment in semantic_matches))
+            valid_experiences = {
+                row["experience_id"] for row in reader.get_experiences(experience_ids)
+                if row["status"] != "deleted"
+            }
+            valid_semantic_ids = {
+                segment["segment_id"] for segment in semantic_matches
+                if segment["status"] != "deleted" and segment["experience_id"] in valid_experiences
+            }
+            segment_ids = list(dict.fromkeys([
+                *(segment["segment_id"] for segment in exact_matches),
+                *(segment_id for segment_id in semantic_ids if segment_id in valid_semantic_ids),
+            ]))
+            return segment_ids, reader.list_qas_by_segment_ids(segment_ids)
 
-__all__ = [
-    "HybridRetriever",
-    "ReadOnlyHybridRetriever",
-    "build_context_text",
-    "build_history_context",
-]
+    def _recall_recent(self) -> list[dict[str, Any]]:
+        with self.storage.retrieval_reader() as reader:
+            return reader.list_recent_qas(self.recent_qa_limit)
+
+    def _rank_semantic(self, query: str, pool: dict[str, dict[str, Any]]) -> list[str]:
+        if not pool:
+            return []
+        try:
+            hits = self.manager.vector_store.query(
+                self.manager.embedder.embed(query),
+                memory_type="qa",
+                top_k=min(self.qa_dense_candidate_limit, len(pool)),
+                metadata_filter={"qa_id": list(pool)},
+            )
+        except Exception:
+            logger.warning("候选 QA 语义检索失败", exc_info=True)
+            return []
+        return list(dict.fromkeys(
+            hit["metadata"]["qa_id"]
+            for hit in hits
+            if (hit.get("metadata") or {}).get("qa_id") in pool
+            and hit["similarity"] > self.qa_similarity_threshold
+        ))
+
+    def _fuse_qas(
+        self,
+        pool: dict[str, dict[str, Any]],
+        keyword_ids: list[str],
+        semantic_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        ranks: dict[str, dict[str, int]] = {}
+        for channel, ids in (("keyword", keyword_ids), ("semantic", semantic_ids)):
+            for rank, qa_id in enumerate(ids, start=1):
+                ranks.setdefault(qa_id, {})[channel] = rank
+        scores = {
+            qa_id: sum(1 / (self.qa_rrf_constant + rank) for rank in channels.values())
+            for qa_id, channels in ranks.items()
+        }
+        ordered = sorted(ranks, key=lambda qa_id: (-scores[qa_id], min(ranks[qa_id].values()), qa_id))
+        return [
+            {
+                **pool[qa_id],
+                "retrieval": {
+                    "channels": ranks[qa_id],
+                    "rrf_score": round(scores[qa_id], 8),
+                },
+            }
+            for qa_id in ordered[:self.qa_limit]
+        ]

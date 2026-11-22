@@ -10,7 +10,7 @@ paths:
 
 # Production HESM provider settings. This file is never read by experiments.
 _llm_connection: &llm_connection
-  api_key: "sk-IXbHAW109t16ciajF2B5Bd4e75E34a0a8112DbAa2dF828Fa"
+  api_key: "sk-h7dGzRrZuibbqS0nC0000805925d42FdAdB6C1EfB25137A1"
   base_url: https://api.gpt.ge/v1/
   max_retries: 3
   retry_delay: 2.0
@@ -30,17 +30,18 @@ embedding: &embedding_defaults
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 
 retrieval:
-  # 仅召回已完成的 Experience：结合 SQLite 关系路径与 Chroma 向量路径。
+  # 多路 QA 召回与 RRF 融合候选上限。
   experience_vector_recall_limit: 12
   experience_relational_recall_limit: 12
   experience_similarity_threshold: 0.82
-  # 用于识别向量路由歧义；未命中时返回空结果。
   experience_route_margin: 0.05
-  # 在匹配的 Experience 内结合稠密向量与 SQLite FTS5 BM25 重排 QA。
-  experience_qa_hybrid_enabled: false
   qa_rrf_constant: 60
   qa_dense_candidate_limit: 30
   qa_bm25_candidate_limit: 30
+  segment_candidate_limit: 30
+  experience_candidate_limit: 20
+  experience_qa_candidate_limit: 100
+  recent_qa_limit: 10
 
 summarization: *strong_llm
 
@@ -64,6 +65,6 @@ memory_management:
 
 api:
   top_experience: 1
-  # Experience 范围检索最多返回的 QA 记录数。
   top_segment: 2
+  # 候选池融合之后最多返回的 QA 记录数。
   top_qa: 4
